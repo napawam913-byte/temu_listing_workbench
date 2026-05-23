@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Temu Workbench 1688 Capture",
+  "description": "Capture the current 1688 offer page into the local Temu listing workbench.",
+  "version": "0.1.0",
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "采集到工作台"
+  },
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": [
+    "*://*.1688.com/*",
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8000/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["*://*.1688.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

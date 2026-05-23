@@ -1,0 +1,239 @@
+import { Button, Image, InputNumber, Popconfirm, Space, Table, Tag, Tooltip } from 'antd';
+import type { ColumnsType, TableRowSelection } from 'antd/es/table/interface';
+import { useEffect, useState } from 'react';
+import type { Product } from '../types/product';
+
+type Props = {
+  products: Product[];
+  total: number;
+  currentPage: number;
+  pageSize: number;
+  selectedRowKeys: React.Key[];
+  onSelectedRowKeysChange: (keys: React.Key[]) => void;
+  onPageChange: (page: number, pageSize: number) => void;
+  onView: (product: Product) => void;
+  onDelete: (product: Product) => void;
+};
+
+function currency(value: number) {
+  return `¥${value.toFixed(2)}`;
+}
+
+function compactMoney(value: number) {
+  if (value >= 10000) return `$${(value / 1000).toFixed(1)}k`;
+  return `$${value.toLocaleString()}`;
+}
+
+function ProductThumb({
+  alt,
+  src,
+  tone,
+}: {
+  alt: string;
+  src?: string;
+  tone: Product['imageTone'];
+}) {
+  const [broken, setBroken] = useState(false);
+
+  useEffect(() => {
+    setBroken(false);
+  }, [src]);
+
+  return (
+    <div className={`product-thumb product-thumb-${tone}`}>
+      {src && !broken ? (
+        <Image
+          alt={alt}
+          height={46}
+          loading="lazy"
+          preview={{ mask: '预览' }}
+          referrerPolicy="no-referrer"
+          src={src}
+          width={46}
+          onError={() => setBroken(true)}
+        />
+      ) : (
+        <span>图</span>
+      )}
+    </div>
+  );
+}
+
+function ProductTitleBlock({
+  product,
+  onView,
+}: {
+  product: Product;
+  onView: (product: Product) => void;
+}) {
+  const visibleTitle = product.titleEn || product.title;
+
+  return (
+    <div className="product-title-stack">
+      <Tooltip
+        placement="topLeft"
+        title={<div className="product-title-tooltip">{product.title}</div>}
+      >
+        <button className="product-title-link" type="button" onClick={() => onView(product)}>
+          {visibleTitle}
+        </button>
+      </Tooltip>
+      <div className="product-title-tags">
+        <Tag color="orange">全托管</Tag>
+        <Tag color="magenta">{product.reviewCount.toLocaleString()} 条评论</Tag>
+      </div>
+      <div className="product-title-meta">上架：{product.listedAt || '-'}</div>
+    </div>
+  );
+}
+
+export function ProductTable({
+  products,
+  total,
+  currentPage,
+  pageSize,
+  selectedRowKeys,
+  onSelectedRowKeysChange,
+  onPageChange,
+  onView,
+  onDelete,
+}: Props) {
+  const [pageSizeDraft, setPageSizeDraft] = useState<number | null>(10);
+
+  useEffect(() => {
+    setPageSizeDraft(pageSize);
+  }, [pageSize]);
+
+  const commitPageSize = () => {
+    const nextPageSize = pageSizeDraft ?? pageSize;
+    const normalizedPageSize = Math.max(1, Math.min(100, Math.floor(nextPageSize)));
+    setPageSizeDraft(normalizedPageSize);
+    onPageChange(1, normalizedPageSize);
+  };
+
+  const rowSelection: TableRowSelection<Product> = {
+    columnWidth: 36,
+    selectedRowKeys,
+    onChange: onSelectedRowKeysChange,
+  };
+
+  const columns: ColumnsType<Product> = [
+    {
+      title: '商品',
+      dataIndex: 'title',
+      width: '41%',
+      render: (_, product) => (
+        <div className="product-cell">
+          <ProductThumb alt={product.titleEn || product.title} src={product.mainImageUrl} tone={product.imageTone} />
+          <ProductTitleBlock product={product} onView={onView} />
+        </div>
+      ),
+    },
+    {
+      title: '类目',
+      dataIndex: 'category',
+      width: '12%',
+      render: (value: string) => <span className="table-wrap-text">{value}</span>,
+    },
+    {
+      title: '价格',
+      dataIndex: 'price',
+      width: '8%',
+      render: currency,
+    },
+    {
+      title: '销量',
+      dataIndex: 'sales',
+      width: '8%',
+      render: (value: number) => value.toLocaleString(),
+    },
+    {
+      title: 'GMV',
+      dataIndex: 'gmv',
+      width: '8%',
+      render: compactMoney,
+    },
+    {
+      title: '评论数',
+      dataIndex: 'reviewCount',
+      width: '8%',
+      render: (value: number) => value.toLocaleString(),
+    },
+    {
+      title: '上架时间',
+      dataIndex: 'listedAt',
+      width: '9%',
+    },
+    {
+      title: '操作',
+      key: 'action',
+      width: '6%',
+      render: (_, product) => (
+        <div className="table-actions">
+          <Button type="link" onClick={() => onView(product)}>
+            查看
+          </Button>
+          <Button
+            disabled={!product.sourceUrl}
+            type="link"
+            onClick={() => {
+              if (!product.sourceUrl) return;
+              window.open(product.sourceUrl, '_blank', 'noopener,noreferrer');
+            }}
+          >
+            访问
+          </Button>
+          <Popconfirm
+            title="确认删除该商品？"
+            description="删除后商品会从当前列表中隐藏。"
+            okText="删除"
+            cancelText="取消"
+            onConfirm={() => onDelete(product)}
+          >
+            <Button danger type="link">
+              删除
+            </Button>
+          </Popconfirm>
+        </div>
+      ),
+    },
+  ];
+
+  return (
+    <Table<Product>
+      columns={columns}
+      dataSource={products}
+      pagination={{
+        current: currentPage,
+        pageSize,
+        total,
+        showSizeChanger: false,
+        showTotal: (total) => (
+          <Space className="page-helper" size={8}>
+            <span>共 {total} 条</span>
+            <span>每页</span>
+            <InputNumber
+              aria-label="每页显示商品数"
+              className="page-size-input"
+              controls={false}
+              max={100}
+              min={1}
+              precision={0}
+              size="small"
+              value={pageSizeDraft}
+              onBlur={commitPageSize}
+              onChange={(value) => setPageSizeDraft(value)}
+              onPressEnter={commitPageSize}
+            />
+            <span>条</span>
+          </Space>
+        ),
+        onChange: (page) => onPageChange(page, pageSize),
+      }}
+      rowKey="id"
+      rowSelection={rowSelection}
+      size="middle"
+      tableLayout="auto"
+    />
+  );
+}
