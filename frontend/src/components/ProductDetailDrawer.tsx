@@ -1,4 +1,4 @@
-import { Button, Descriptions, Drawer, Image, Space, Tag, Typography } from 'antd';
+import { Descriptions, Drawer, Image, Space, Tag, Typography } from 'antd';
 import { useEffect, useState } from 'react';
 import { mockCandidates } from '../mock/products';
 import type { Product, SourcingCandidate } from '../types/product';
@@ -17,7 +17,6 @@ type Props = {
   onOpenCandidateDetail: (candidate: SourcingCandidate) => void;
   onBackToSearch: () => void;
   onSelectCandidate: (product: Product, candidate: SourcingCandidate) => void;
-  onDelete: (product: Product) => void;
 };
 
 function DrawerProductImage({ product }: { product: Product }) {
@@ -57,7 +56,6 @@ export function ProductDetailDrawer({
   onOpenCandidateDetail,
   onBackToSearch,
   onSelectCandidate,
-  onDelete,
 }: Props) {
   if (!product) return null;
 
@@ -91,14 +89,6 @@ export function ProductDetailDrawer({
             <Descriptions.Item label="上架时间">{product.listedAt}</Descriptions.Item>
             <Descriptions.Item label="增长率">+{product.growthRate}%</Descriptions.Item>
           </Descriptions>
-          <Space direction="vertical" className="drawer-side-actions">
-            <Button block type="primary" onClick={onSearch}>
-              寻找 1688 同款
-            </Button>
-            <Button block danger onClick={() => onDelete(product)}>
-              删除商品
-            </Button>
-          </Space>
         </aside>
 
         <main className="drawer-sourcing-side">

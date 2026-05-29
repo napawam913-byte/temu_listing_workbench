@@ -1,7 +1,10 @@
 export type ProductStatus = 'active' | 'deleted' | 'sourced';
+export type ProductSourceType = 'yunqi' | 'temu' | '1688' | 'custom';
 
 export type Product = {
   id: string;
+  sourceType?: ProductSourceType;
+  sourceProductId?: string;
   title: string;
   titleEn?: string;
   category: string;
@@ -35,4 +38,4 @@ export type SourcingCandidate = {
   selected?: boolean;
 };
 
-export type ImportSource = 'yunqi' | 'temu' | '1688' | 'custom';
+export type ImportSource = ProductSourceType;

@@ -55,6 +55,7 @@ def normalize_yunqi_dataframe(df: pd.DataFrame) -> tuple[list[dict[str, Any]], l
                 {
                     "id": product_id,
                     "source_row_index": source_row_index,
+                    "source_type": "yunqi",
                     "source_product_id": product_id,
                     "title_cn": title_cn,
                     "title_en": title_en,

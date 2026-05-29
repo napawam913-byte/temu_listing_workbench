@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from app.core.database import (
     create_sourcing_candidate_1688,
+    delete_sourcing_candidate_1688,
     get_active_sourcing_product,
     list_sourcing_candidates_1688,
     set_active_sourcing_product,
@@ -59,3 +60,10 @@ def capture_1688_candidate(payload: Capture1688Request):
 @router.get("/candidates")
 def get_1688_candidates(temu_product_id: str = Query(..., min_length=1)):
     return {"items": list_sourcing_candidates_1688(temu_product_id)}
+
+
+@router.delete("/candidates/{candidate_id}")
+def delete_1688_candidate(candidate_id: str):
+    if not delete_sourcing_candidate_1688(candidate_id):
+        raise HTTPException(status_code=404, detail="1688 采集货源不存在")
+    return {"ok": True}

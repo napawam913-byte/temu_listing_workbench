@@ -8,9 +8,12 @@
   </head>
   <body>
     <main class="popup">
-      <h1>采集到工作台</h1>
-      <p id="status" class="status">请先在工作台抽屉中点击“开始采集”。</p>
-      <button id="captureButton" type="button">采集当前 1688 商品</button>
+      <h1>1688 货源采集</h1>
+      <p id="status" class="status">请先在工作台抽屉中点击“开始采集”，再打开 1688 商品详情页。</p>
+      <div class="button-row">
+        <button id="previewButton" class="secondary-button" type="button">预抓当前页</button>
+        <button id="captureButton" type="button">采集到工作台</button>
+      </div>
       <section id="preview" class="preview" hidden></section>
     </main>
     <script src="popup.js"></script>

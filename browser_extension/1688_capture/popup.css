@@ -3,7 +3,8 @@ body {
   color: #111827;
   font-family: Arial, "Microsoft YaHei", sans-serif;
   margin: 0;
-  width: 320px;
+  min-width: 320px;
+  width: auto;
 }
 
 .popup {
@@ -22,6 +23,12 @@ h1 {
   margin: 0 0 14px;
 }
 
+.button-row {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 1fr;
+}
+
 button {
   background: #1677ff;
   border: 0;
@@ -31,6 +38,12 @@ button {
   font-size: 14px;
   height: 36px;
   width: 100%;
+}
+
+.secondary-button {
+  background: #ffffff;
+  border: 1px solid #d1d5db;
+  color: #111827;
 }
 
 button:disabled {
@@ -44,6 +57,12 @@ button:disabled {
   border-radius: 8px;
   margin-top: 14px;
   padding: 10px;
+}
+
+.preview-layout {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 92px minmax(0, 1fr);
 }
 
 .preview img {
@@ -65,4 +84,10 @@ button:disabled {
   color: #64748b;
   font-size: 12px;
   line-height: 18px;
+}
+
+@media (min-width: 360px) {
+  .button-row {
+    grid-template-columns: 1fr 1.2fr;
+  }
 }

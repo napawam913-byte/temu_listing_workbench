@@ -49,6 +49,7 @@ def init_db() -> None:
                 id TEXT PRIMARY KEY,
                 upload_batch_id TEXT NOT NULL,
                 source_row_index INTEGER NOT NULL,
+                source_type TEXT NOT NULL DEFAULT 'yunqi',
                 source_product_id TEXT NOT NULL,
                 title_cn TEXT,
                 title_en TEXT,
@@ -114,6 +115,13 @@ def init_db() -> None:
                 ON sourcing_candidates_1688(product_url);
             """
         )
+        ensure_column(conn, "products", "source_type", "source_type TEXT NOT NULL DEFAULT 'yunqi'")
+
+
+def ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, ddl: str) -> None:
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+    if column_name not in columns:
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {ddl}")
 
 
 def insert_upload_batch(
@@ -159,13 +167,13 @@ def replace_products(batch_id: str, products: list[dict[str, Any]]) -> None:
         conn.executemany(
             """
             INSERT OR REPLACE INTO products (
-                id, upload_batch_id, source_row_index, source_product_id,
+                id, upload_batch_id, source_row_index, source_type, source_product_id,
                 title_cn, title_en, title, main_image_url, gallery_image_urls_json,
                 video_url, source_url, category_path, category_level1, category_level2,
                 tags_json, price_usd, gmv_usd, weekly_sales, monthly_sales,
                 review_count, listing_time, status, raw_data_json, created_at, updated_at
             ) VALUES (
-                :id, :upload_batch_id, :source_row_index, :source_product_id,
+                :id, :upload_batch_id, :source_row_index, :source_type, :source_product_id,
                 :title_cn, :title_en, :title, :main_image_url, :gallery_image_urls_json,
                 :video_url, :source_url, :category_path, :category_level1, :category_level2,
                 :tags_json, :price_usd, :gmv_usd, :weekly_sales, :monthly_sales,
@@ -176,6 +184,7 @@ def replace_products(batch_id: str, products: list[dict[str, Any]]) -> None:
                 {
                     **product,
                     "upload_batch_id": batch_id,
+                    "source_type": product.get("source_type") or "yunqi",
                     "gallery_image_urls_json": json.dumps(
                         product.get("gallery_image_urls", []), ensure_ascii=False
                     ),
@@ -532,6 +541,15 @@ def list_sourcing_candidates_1688(temu_product_id: str) -> list[dict[str, Any]]:
     return [sourcing_candidate_row_to_api(row) for row in rows]
 
 
+def delete_sourcing_candidate_1688(candidate_id: str) -> bool:
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "DELETE FROM sourcing_candidates_1688 WHERE id = ?",
+            (candidate_id,),
+        )
+        return cursor.rowcount > 0
+
+
 def sourcing_candidate_row_to_api(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
@@ -566,6 +584,7 @@ def soft_delete_product(product_id: str) -> bool:
 def product_row_to_api(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
+        "source_type": row["source_type"] or "yunqi",
         "source_product_id": row["source_product_id"],
         "title": row["title"],
         "title_cn": row["title_cn"],

@@ -4,6 +4,7 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000
 
 export type BackendProduct = {
   id: string;
+  source_type?: string | null;
   source_product_id: string;
   title: string;
   title_cn?: string | null;
@@ -65,6 +66,7 @@ export type Captured1688Sku = {
   price?: number;
   stock?: number;
   image_url?: string;
+  weight_kg?: number;
 };
 
 export type Captured1688Candidate = {
@@ -74,6 +76,7 @@ export type Captured1688Candidate = {
   product_url: string;
   title: string;
   main_image_url?: string | null;
+  gallery_image_urls?: string[];
   price?: number | null;
   price_range?: string | null;
   moq?: number | null;
@@ -173,6 +176,15 @@ export async function fetchCaptured1688Candidates(temuProductId: string): Promis
   return body.items;
 }
 
+export async function deleteCaptured1688Candidate(candidateId: string): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/candidates/${encodeURIComponent(candidateId)}`, {
+    method: 'DELETE',
+  });
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+}
+
 export async function deleteProduct(productId: string): Promise<void> {
   const response = await fetch(`${API_BASE_URL}/api/products/${productId}`, {
     method: 'DELETE',
@@ -185,6 +197,8 @@ export async function deleteProduct(productId: string): Promise<void> {
 export function mapBackendProduct(product: BackendProduct): Product {
   return {
     id: product.id,
+    sourceType: product.source_type === '1688' || product.source_type === 'temu' || product.source_type === 'custom' ? product.source_type : 'yunqi',
+    sourceProductId: product.source_product_id,
     title: product.title,
     titleEn: product.title_en || undefined,
     category: product.category_path || product.category_level1 || product.category_level2 || '未分类',

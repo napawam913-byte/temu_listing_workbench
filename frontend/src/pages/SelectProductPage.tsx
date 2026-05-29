@@ -8,7 +8,6 @@ import {
   Select,
   Space,
   Statistic,
-  TreeSelect,
   Typography,
   message,
 } from 'antd';
@@ -16,19 +15,17 @@ import { useCallback, useEffect, useState } from 'react';
 import type { Key } from 'react';
 import {
   deleteProduct as deleteBackendProduct,
-  fetchProductCategories,
   fetchProductStats,
   fetchProducts,
   mapBackendProduct,
   uploadYunqiFile,
 } from '../api/backendApi';
 import type { ProductStats } from '../api/backendApi';
-import type { ProductCategoryOption } from '../api/backendApi';
 import { DataImportModal } from '../components/DataImportModal';
 import { ProductDetailDrawer } from '../components/ProductDetailDrawer';
 import { ProductTable } from '../components/ProductTable';
 import { mockProducts } from '../mock/products';
-import type { Product, SourcingCandidate } from '../types/product';
+import type { Product, ProductSourceType, SourcingCandidate } from '../types/product';
 
 const { Header, Content } = Layout;
 const { Title, Text } = Typography;
@@ -36,7 +33,6 @@ const { Title, Text } = Typography;
 type Filters = {
   keyword?: string;
   period?: Product['period'] | '全部';
-  category?: string;
   priceRange?: string;
   salesRange?: string;
   gmvRange?: string;
@@ -44,10 +40,60 @@ type Filters = {
 
 const defaultFilters: Filters = {
   period: '全部',
-  category: '全部类目',
 };
 
-const ALL_CATEGORY_VALUE = '全部类目';
+const PRODUCT_ROUTE_PREFIX = '#/products/';
+
+type ProductRoute = {
+  sourceType: ProductSourceType;
+  sourceProductId: string;
+};
+
+function getProductSourceType(product: Product): ProductSourceType {
+  return product.sourceType || 'yunqi';
+}
+
+function getProductSourceProductId(product: Product) {
+  return product.sourceProductId || product.id;
+}
+
+function buildProductRoute(product: Product) {
+  return `${PRODUCT_ROUTE_PREFIX}${encodeURIComponent(getProductSourceType(product))}/${encodeURIComponent(
+    getProductSourceProductId(product),
+  )}`;
+}
+
+function parseProductRoute(hash = window.location.hash): ProductRoute | undefined {
+  if (!hash.startsWith(PRODUCT_ROUTE_PREFIX)) return undefined;
+
+  const path = hash.slice(PRODUCT_ROUTE_PREFIX.length);
+  const separatorIndex = path.indexOf('/');
+  if (separatorIndex <= 0 || separatorIndex >= path.length - 1) return undefined;
+
+  const sourceType = decodeURIComponent(path.slice(0, separatorIndex)) as ProductSourceType;
+  const sourceProductId = decodeURIComponent(path.slice(separatorIndex + 1));
+  if (!sourceType || !sourceProductId) return undefined;
+
+  return { sourceType, sourceProductId };
+}
+
+function matchesProductRoute(product: Product, route: ProductRoute) {
+  return (
+    getProductSourceType(product) === route.sourceType &&
+    getProductSourceProductId(product) === route.sourceProductId
+  );
+}
+
+function syncProductRoute(product: Product) {
+  const nextHash = buildProductRoute(product);
+  if (window.location.hash === nextHash) return;
+  window.history.pushState(null, '', `${window.location.pathname}${window.location.search}${nextHash}`);
+}
+
+function clearProductRoute() {
+  if (!parseProductRoute()) return;
+  window.history.pushState(null, '', `${window.location.pathname}${window.location.search}`);
+}
 
 const defaultStats: ProductStats = {
   active_count: mockProducts.filter((product) => product.status !== 'deleted').length,
@@ -88,7 +134,6 @@ export function SelectProductPage() {
   const [products, setProducts] = useState<Product[]>(mockProducts);
   const [productTotal, setProductTotal] = useState(mockProducts.length);
   const [productStats, setProductStats] = useState<ProductStats>(defaultStats);
-  const [categoryOptions, setCategoryOptions] = useState<ProductCategoryOption[]>([]);
   const [backendReady, setBackendReady] = useState(false);
   const [loadingProducts, setLoadingProducts] = useState(false);
   const [currentPage, setCurrentPage] = useState(1);
@@ -119,15 +164,6 @@ export function SelectProductPage() {
         setBackendReady(false);
         const fallbackProducts = mockProducts.filter((product) => {
           if (nextFilters.period && nextFilters.period !== '全部' && product.period !== nextFilters.period) {
-            return false;
-          }
-          if (
-            nextFilters.category &&
-            nextFilters.category !== '全部类目' &&
-            product.categoryLevel1 !== nextFilters.category &&
-            product.categoryLevel2 !== nextFilters.category &&
-            product.categoryPath !== nextFilters.category
-          ) {
             return false;
           }
           if (
@@ -162,19 +198,9 @@ export function SelectProductPage() {
     }
   }, []);
 
-  const loadCategories = useCallback(async () => {
-    try {
-      const options = await fetchProductCategories();
-      setCategoryOptions(options);
-    } catch {
-      setCategoryOptions([]);
-    }
-  }, []);
-
   useEffect(() => {
     void loadProducts(1, pageSize, filters);
     void loadStats();
-    void loadCategories();
     setCurrentPage(1);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -182,13 +208,59 @@ export function SelectProductPage() {
   const activeCount = productStats.active_count;
   const deletedCount = productStats.deleted_count;
 
-  const openProduct = (product: Product) => {
+  const openProduct = useCallback((product: Product, options: { syncUrl?: boolean } = {}) => {
     setActiveProduct(product);
     setSourcingSearched(product.status === 'sourced');
     setActiveCandidate(undefined);
     setActiveTab('search');
     setDrawerOpen(true);
-  };
+    if (options.syncUrl !== false) syncProductRoute(product);
+  }, []);
+
+  const closeProduct = useCallback(() => {
+    setDrawerOpen(false);
+    clearProductRoute();
+  }, []);
+
+  const openProductFromRoute = useCallback(async () => {
+    const route = parseProductRoute();
+    if (!route) {
+      setDrawerOpen(false);
+      return;
+    }
+
+    const visibleProduct = products.find((product) => matchesProductRoute(product, route));
+    if (visibleProduct) {
+      openProduct(visibleProduct, { syncUrl: false });
+      return;
+    }
+
+    try {
+      const response = await fetchProducts({
+        page: 1,
+        pageSize,
+        keyword: route.sourceProductId,
+      });
+      const routedProducts = response.items.map(mapBackendProduct);
+      const routedProduct = routedProducts.find((product) => matchesProductRoute(product, route));
+      if (!routedProduct) return;
+
+      setProducts(routedProducts);
+      setProductTotal(response.total);
+      setCurrentPage(1);
+      setBackendReady(true);
+      openProduct(routedProduct, { syncUrl: false });
+    } catch {
+      const fallbackProduct = mockProducts.find((product) => matchesProductRoute(product, route));
+      if (fallbackProduct) openProduct(fallbackProduct, { syncUrl: false });
+    }
+  }, [openProduct, pageSize, products]);
+
+  useEffect(() => {
+    void openProductFromRoute();
+    window.addEventListener('hashchange', openProductFromRoute);
+    return () => window.removeEventListener('hashchange', openProductFromRoute);
+  }, [openProductFromRoute]);
 
   const deleteProduct = (product: Product) => {
     const applyLocalDelete = () => {
@@ -201,7 +273,7 @@ export function SelectProductPage() {
         deleted_count: current.deleted_count + 1,
       }));
       setSelectedRowKeys((keys) => keys.filter((key) => key !== product.id));
-      if (activeProduct?.id === product.id) setDrawerOpen(false);
+      if (activeProduct?.id === product.id) closeProduct();
       message.success('商品已删除');
     };
 
@@ -214,7 +286,7 @@ export function SelectProductPage() {
       .then(() => loadProducts(currentPage, pageSize, filters))
       .then(() => loadStats())
       .then(() => {
-        if (activeProduct?.id === product.id) setDrawerOpen(false);
+        if (activeProduct?.id === product.id) closeProduct();
         message.success('商品已删除');
       })
       .catch((error) => message.error(error.message || '删除失败'));
@@ -241,7 +313,10 @@ export function SelectProductPage() {
       <Header className="app-header">
         <div className="app-header-inner">
           <div className="brand">Temu 选品上架工作台</div>
-          <div className="main-nav-active">选品找货</div>
+          <nav aria-label="主导航" className="main-nav">
+            <div className="main-nav-item main-nav-active">选品找货</div>
+            <div className="main-nav-item">商品差异化</div>
+          </nav>
           <Space className="header-actions">
             <span className="batch-pill">当前批次：云启 0522</span>
             <Button className="header-button" type="primary" onClick={() => setImportOpen(true)}>
@@ -302,29 +377,6 @@ export function SelectProductPage() {
                   ]}
                 />
               </Form.Item>
-              <Form.Item label="类目" name="category">
-                <TreeSelect
-                  allowClear
-                  dropdownStyle={{ maxHeight: 420, minWidth: 460, overflow: 'auto' }}
-                  placeholder="分类筛选"
-                  showSearch
-                  style={{ width: 190 }}
-                  treeDefaultExpandAll={false}
-                  treeNodeFilterProp="title"
-                  treeData={[
-                    { value: ALL_CATEGORY_VALUE, title: '全分类' },
-                    ...categoryOptions.map((option) => ({
-                      value: option.value,
-                      title: `${option.label}（${option.count}）`,
-                      children: option.children?.map((child) => ({
-                        value: child.value,
-                        title: `${child.label}（${child.count}）`,
-                      })),
-                    })),
-                  ]}
-                  onClear={() => form.setFieldValue('category', ALL_CATEGORY_VALUE)}
-                />
-              </Form.Item>
               <Form.Item label="价格区间" name="priceRange">
                 <Input allowClear placeholder="¥0 - ¥999" />
               </Form.Item>
@@ -381,7 +433,7 @@ export function SelectProductPage() {
           setImportOpen(false);
           message.success(`导入完成：${result.imported_count} 条商品`);
           setCurrentPage(1);
-          await Promise.all([loadProducts(1, pageSize, filters), loadStats(), loadCategories()]);
+          await Promise.all([loadProducts(1, pageSize, filters), loadStats()]);
         }}
       />
 
@@ -391,7 +443,7 @@ export function SelectProductPage() {
         searched={sourcingSearched}
         activeCandidate={activeCandidate}
         activeTab={activeTab}
-        onClose={() => setDrawerOpen(false)}
+        onClose={closeProduct}
         onSearch={() => {
           setSourcingSearched(true);
           setActiveTab('search');
@@ -402,7 +454,6 @@ export function SelectProductPage() {
         }}
         onBackToSearch={() => setActiveTab('search')}
         onSelectCandidate={selectCandidate}
-        onDelete={deleteProduct}
       />
 
       <Modal
