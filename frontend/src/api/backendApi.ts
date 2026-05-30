@@ -1,6 +1,7 @@
 import type { Product } from '../types/product';
+import type { LinkListRecord } from '../types/linkList';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000';
+export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000';
 
 export type BackendProduct = {
   id: string;
@@ -89,6 +90,28 @@ export type Captured1688Candidate = {
   updated_at: string;
 };
 
+export type Captured1688Material = {
+  id: string;
+  offer_id?: string | null;
+  product_url: string;
+  title: string;
+  main_image_url?: string | null;
+  gallery_image_urls?: string[];
+  price?: number | null;
+  price_range?: string | null;
+  moq?: number | null;
+  shop_name?: string | null;
+  shop_url?: string | null;
+  sku_list: Captured1688Sku[];
+  raw_data: Record<string, unknown>;
+  captured_at: string;
+  assigned_product_id?: string | null;
+  assigned_at?: string | null;
+  product_list_product_id?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type YunqiImportResponse = {
   batch_id: string;
   source_filename: string;
@@ -99,6 +122,54 @@ export type YunqiImportResponse = {
   errors: string[];
 };
 
+export type Link1688ImportResponse = YunqiImportResponse;
+
+export type DianxiaomiExportMode = 'distribution' | 'curated';
+
+export type ChatgptListingPackageResponse = {
+  status: 'planned' | 'generated';
+  safeTitleCn: string;
+  safeTitleEn: string;
+  blockedTerms: string[];
+  imagePlan: Array<Record<string, string>>;
+  generatedImages: Array<Record<string, string>>;
+  record: LinkListRecord;
+};
+
+export type PluginCreativeJob = {
+  id: string;
+  provider: string;
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  recordId: string;
+  productId?: string | null;
+  recordTitle?: string | null;
+  safeTitleEn?: string | null;
+  imageIndex: number;
+  imageKind: string;
+  imageLabel: string;
+  prompt: string;
+  inputImageUrl?: string | null;
+  resultImageUrl?: string | null;
+  resultStorageKey?: string | null;
+  errorMessage?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  claimedAt?: string | null;
+  completedAt?: string | null;
+};
+
+export type PluginCreativeJobsResponse = {
+  items: PluginCreativeJob[];
+};
+
+export type PluginCreativeSyncResponse = {
+  records: LinkListRecord[];
+  jobs: PluginCreativeJob[];
+  completedRecordIds: string[];
+  pendingCount: number;
+  failedCount: number;
+};
+
 export async function uploadYunqiFile(file: File): Promise<YunqiImportResponse> {
   const formData = new FormData();
   formData.append('file', file);
@@ -106,6 +177,20 @@ export async function uploadYunqiFile(file: File): Promise<YunqiImportResponse> 
   const response = await fetch(`${API_BASE_URL}/api/uploads/yunqi`, {
     method: 'POST',
     body: formData,
+  });
+
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json();
+}
+
+export async function upload1688Links(productUrls: string[]): Promise<Link1688ImportResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/uploads/1688`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ product_urls: productUrls }),
   });
 
   if (!response.ok) {
@@ -185,6 +270,49 @@ export async function deleteCaptured1688Candidate(candidateId: string): Promise<
   }
 }
 
+export async function fetchCaptured1688Materials(): Promise<Captured1688Material[]> {
+  const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/materials?limit=100`);
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.items;
+}
+
+export async function assignCaptured1688Material(materialId: string, temuProductId: string): Promise<Captured1688Candidate> {
+  const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/materials/${encodeURIComponent(materialId)}/assign`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ temu_product_id: temuProductId }),
+  });
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json();
+}
+
+export async function addCaptured1688MaterialToProductList(materialId: string): Promise<BackendProduct> {
+  const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/materials/${encodeURIComponent(materialId)}/add-to-products`, {
+    method: 'POST',
+  });
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json();
+}
+
+export async function deleteCaptured1688Material(materialId: string): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/materials/${encodeURIComponent(materialId)}`, {
+    method: 'DELETE',
+  });
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+}
+
 export async function deleteProduct(productId: string): Promise<void> {
   const response = await fetch(`${API_BASE_URL}/api/products/${productId}`, {
     method: 'DELETE',
@@ -192,6 +320,64 @@ export async function deleteProduct(productId: string): Promise<void> {
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
+}
+
+export async function exportDianxiaomiTemuTemplate(
+  records: LinkListRecord[],
+  exportMode: DianxiaomiExportMode,
+): Promise<Blob> {
+  const response = await fetch(`${API_BASE_URL}/api/exports/dianxiaomi/temu-semi-managed`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ records, export_mode: exportMode }),
+  });
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.blob();
+}
+
+export async function generateChatgptListingPackage(
+  record: LinkListRecord,
+  generateImages = true,
+): Promise<ChatgptListingPackageResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/creative/chatgpt/listing-package`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ record, generate_images: generateImages }),
+  });
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json();
+}
+
+export async function createPluginCreativeJobs(records: LinkListRecord[]): Promise<PluginCreativeJobsResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/creative/plugin/jobs`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ records, provider: 'plugin_chatgpt_web' }),
+  });
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json();
+}
+
+export async function syncPluginCreativeJobs(records: LinkListRecord[]): Promise<PluginCreativeSyncResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/creative/plugin/jobs/sync`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ records, provider: 'plugin_chatgpt_web' }),
+  });
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json();
 }
 
 export function mapBackendProduct(product: BackendProduct): Product {

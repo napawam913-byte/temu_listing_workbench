@@ -8,7 +8,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
-from .config import DATABASE_PATH, ensure_runtime_dirs
+from app.modules.creative_generation.sensitive_terms_catalog import DEFAULT_SENSITIVE_TERMS
+
+from .config import DATABASE_PATH, UPLOADS_DIR, ensure_runtime_dirs
 
 
 def utc_now_text() -> str:
@@ -113,15 +115,187 @@ def init_db() -> None:
                 ON sourcing_candidates_1688(temu_product_id);
             CREATE INDEX IF NOT EXISTS idx_sourcing_candidates_url
                 ON sourcing_candidates_1688(product_url);
+
+            CREATE TABLE IF NOT EXISTS sourcing_materials_1688 (
+                id TEXT PRIMARY KEY,
+                offer_id TEXT,
+                product_url TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                main_image_url TEXT,
+                price REAL,
+                price_range TEXT,
+                moq INTEGER,
+                shop_name TEXT,
+                shop_url TEXT,
+                sku_list_json TEXT NOT NULL DEFAULT '[]',
+                raw_data_json TEXT NOT NULL DEFAULT '{}',
+                captured_at TEXT NOT NULL,
+                assigned_product_id TEXT,
+                assigned_at TEXT,
+                product_list_product_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(assigned_product_id) REFERENCES products(id),
+                FOREIGN KEY(product_list_product_id) REFERENCES products(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sourcing_materials_created
+                ON sourcing_materials_1688(created_at);
+            CREATE INDEX IF NOT EXISTS idx_sourcing_materials_assigned_product
+                ON sourcing_materials_1688(assigned_product_id);
+
+            CREATE TABLE IF NOT EXISTS sensitive_terms (
+                id TEXT PRIMARY KEY,
+                term TEXT NOT NULL,
+                normalized_term TEXT NOT NULL UNIQUE,
+                language TEXT NOT NULL DEFAULT 'mixed',
+                category TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'block',
+                match_type TEXT NOT NULL DEFAULT 'contains',
+                replacement TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                source TEXT NOT NULL DEFAULT 'system',
+                notes TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sensitive_terms_enabled
+                ON sensitive_terms(enabled);
+            CREATE INDEX IF NOT EXISTS idx_sensitive_terms_category
+                ON sensitive_terms(category);
             """
         )
         ensure_column(conn, "products", "source_type", "source_type TEXT NOT NULL DEFAULT 'yunqi'")
+        seed_default_sensitive_terms(conn)
 
 
 def ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, ddl: str) -> None:
     columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
     if column_name not in columns:
         conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {ddl}")
+
+
+def normalize_sensitive_term(term: str) -> str:
+    return " ".join(str(term or "").lower().split()).strip()
+
+
+def seed_default_sensitive_terms(conn: sqlite3.Connection) -> None:
+    now = utc_now_text()
+    for item in DEFAULT_SENSITIVE_TERMS:
+        term = str(item["term"]).strip()
+        normalized_term = normalize_sensitive_term(term)
+        conn.execute(
+            """
+            INSERT INTO sensitive_terms (
+                id, term, normalized_term, language, category, severity, match_type,
+                replacement, enabled, source, notes, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(normalized_term) DO NOTHING
+            """,
+            (
+                uuid.uuid5(uuid.NAMESPACE_URL, f"sensitive-term:{normalized_term}").hex,
+                term,
+                normalized_term,
+                item.get("language", "mixed"),
+                item.get("category", "general"),
+                item.get("severity", "block"),
+                item.get("match_type", "contains"),
+                item.get("replacement", ""),
+                1 if item.get("enabled", True) else 0,
+                item.get("source", "system"),
+                item.get("notes"),
+                now,
+                now,
+            ),
+        )
+
+
+def ensure_sensitive_terms_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS sensitive_terms (
+            id TEXT PRIMARY KEY,
+            term TEXT NOT NULL,
+            normalized_term TEXT NOT NULL UNIQUE,
+            language TEXT NOT NULL DEFAULT 'mixed',
+            category TEXT NOT NULL,
+            severity TEXT NOT NULL DEFAULT 'block',
+            match_type TEXT NOT NULL DEFAULT 'contains',
+            replacement TEXT NOT NULL DEFAULT '',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            source TEXT NOT NULL DEFAULT 'system',
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sensitive_terms_enabled
+            ON sensitive_terms(enabled);
+        CREATE INDEX IF NOT EXISTS idx_sensitive_terms_category
+            ON sensitive_terms(category);
+        """
+    )
+    seed_default_sensitive_terms(conn)
+
+
+def list_enabled_sensitive_terms() -> list[dict[str, Any]]:
+    with get_connection() as conn:
+        ensure_sensitive_terms_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM sensitive_terms
+            WHERE enabled = 1
+            ORDER BY length(term) DESC, term ASC
+            """
+        ).fetchall()
+
+    return [sensitive_term_row_to_api(row) for row in rows]
+
+
+def list_sensitive_terms(*, enabled: bool | None = None, category: str | None = None) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if enabled is not None:
+        clauses.append("enabled = ?")
+        params.append(1 if enabled else 0)
+    if category:
+        clauses.append("category = ?")
+        params.append(category)
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+    with get_connection() as conn:
+        ensure_sensitive_terms_schema(conn)
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM sensitive_terms
+            {where_sql}
+            ORDER BY category ASC, length(term) DESC, term ASC
+            """,
+            params,
+        ).fetchall()
+
+    return [sensitive_term_row_to_api(row) for row in rows]
+
+
+def sensitive_term_row_to_api(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "term": row["term"],
+        "normalized_term": row["normalized_term"],
+        "language": row["language"],
+        "category": row["category"],
+        "severity": row["severity"],
+        "match_type": row["match_type"],
+        "replacement": row["replacement"],
+        "enabled": bool(row["enabled"]),
+        "source": row["source"],
+        "notes": row["notes"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
 
 
 def insert_upload_batch(
@@ -550,6 +724,228 @@ def delete_sourcing_candidate_1688(candidate_id: str) -> bool:
         return cursor.rowcount > 0
 
 
+def create_sourcing_material_1688(payload: dict[str, Any]) -> dict[str, Any]:
+    product_url = str(payload.get("product_url") or "").strip()
+    title = str(payload.get("title") or "").strip()
+    if not product_url:
+        raise ValueError("缺少 1688 商品链接")
+    if not title:
+        raise ValueError("缺少 1688 商品标题")
+
+    now = utc_now_text()
+    material_id = uuid.uuid4().hex
+    sku_list = payload.get("sku_list") or []
+    raw_data = payload.get("raw_data") or payload
+
+    with get_connection() as conn:
+        existing = conn.execute(
+            "SELECT id FROM sourcing_materials_1688 WHERE product_url = ?",
+            (product_url,),
+        ).fetchone()
+        if existing:
+            material_id = existing["id"]
+
+        conn.execute(
+            """
+            INSERT INTO sourcing_materials_1688 (
+                id, offer_id, product_url, title, main_image_url, price, price_range,
+                moq, shop_name, shop_url, sku_list_json, raw_data_json, captured_at,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(product_url) DO UPDATE SET
+                offer_id = excluded.offer_id,
+                title = excluded.title,
+                main_image_url = excluded.main_image_url,
+                price = excluded.price,
+                price_range = excluded.price_range,
+                moq = excluded.moq,
+                shop_name = excluded.shop_name,
+                shop_url = excluded.shop_url,
+                sku_list_json = excluded.sku_list_json,
+                raw_data_json = excluded.raw_data_json,
+                captured_at = excluded.captured_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                material_id,
+                payload.get("offer_id"),
+                product_url,
+                title,
+                payload.get("main_image_url"),
+                payload.get("price"),
+                payload.get("price_range"),
+                payload.get("moq"),
+                payload.get("shop_name"),
+                payload.get("shop_url"),
+                json.dumps(sku_list, ensure_ascii=False),
+                json.dumps(raw_data, ensure_ascii=False),
+                payload.get("captured_at") or now,
+                now,
+                now,
+            ),
+        )
+
+    return get_sourcing_material_1688(material_id)
+
+
+def get_sourcing_material_1688(material_id: str) -> dict[str, Any]:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM sourcing_materials_1688 WHERE id = ?",
+            (material_id,),
+        ).fetchone()
+
+    if not row:
+        raise ValueError("1688 采集素材不存在")
+
+    return sourcing_material_row_to_api(row)
+
+
+def list_sourcing_materials_1688(limit: int = 100) -> list[dict[str, Any]]:
+    safe_limit = max(1, min(300, limit))
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM sourcing_materials_1688
+            ORDER BY datetime(captured_at) DESC, datetime(updated_at) DESC
+            LIMIT ?
+            """,
+            (safe_limit,),
+        ).fetchall()
+
+    return [sourcing_material_row_to_api(row) for row in rows]
+
+
+def delete_sourcing_material_1688(material_id: str) -> bool:
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "DELETE FROM sourcing_materials_1688 WHERE id = ?",
+            (material_id,),
+        )
+        return cursor.rowcount > 0
+
+
+def assign_sourcing_material_1688(material_id: str, temu_product_id: str) -> dict[str, Any]:
+    material = get_sourcing_material_1688(material_id)
+    candidate = create_sourcing_candidate_1688({**material, "temu_product_id": temu_product_id})
+    now = utc_now_text()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE sourcing_materials_1688
+            SET assigned_product_id = ?, assigned_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (temu_product_id, now, now, material_id),
+        )
+    return candidate
+
+
+def category_fields_from_1688_raw_data(raw_data: dict[str, Any] | None, fallback_category: str) -> dict[str, str | None]:
+    category_parts = normalize_1688_category_parts((raw_data or {}).get("category_parts"))
+    if not category_parts:
+        category_parts = normalize_1688_category_parts((raw_data or {}).get("category_path"))
+
+    if not category_parts:
+        return {
+            "category_path": fallback_category,
+            "category_level1": fallback_category,
+            "category_level2": None,
+        }
+
+    return {
+        "category_path": "/".join(category_parts),
+        "category_level1": category_parts[0],
+        "category_level2": category_parts[1] if len(category_parts) > 1 else None,
+    }
+
+
+def normalize_1688_category_parts(value: Any) -> list[str]:
+    if isinstance(value, list):
+        raw_parts = [str(item) for item in value]
+    elif isinstance(value, str):
+        raw_parts = [part for part in value.replace(">", "/").replace("›", "/").replace("»", "/").split("/")]
+    else:
+        raw_parts = []
+
+    parts: list[str] = []
+    seen: set[str] = set()
+    blocked = {"首页", "阿里巴巴", "1688", "商品详情", "全部商品", "所有分类", "采集素材", "链接导入"}
+    for raw_part in raw_parts:
+        part = " ".join(raw_part.split()).strip()
+        if not part or part in blocked or len(part) > 32 or part in seen:
+            continue
+        seen.add(part)
+        parts.append(part)
+    return parts[:5]
+
+
+def create_product_from_sourcing_material_1688(material_id: str) -> dict[str, Any]:
+    material = get_sourcing_material_1688(material_id)
+    offer_id = material.get("offer_id")
+    product_url = material["product_url"]
+    source_product_id = str(offer_id or uuid.uuid5(uuid.NAMESPACE_URL, product_url).hex[:16])
+    product_id = f"1688-{source_product_id}"
+    now = utc_now_text()
+    batch_id = uuid.uuid4().hex
+    saved_path = UPLOADS_DIR / f"{batch_id}_{source_product_id}_1688_material.json"
+    with saved_path.open("w", encoding="utf-8") as file:
+        json.dump(material, file, ensure_ascii=False, indent=2)
+    raw_data = material.get("raw_data", {})
+    category_fields = category_fields_from_1688_raw_data(raw_data, "未采集类目")
+
+    product = {
+        "id": product_id,
+        "source_row_index": 1,
+        "source_type": "1688",
+        "source_product_id": source_product_id,
+        "title_cn": material["title"],
+        "title_en": None,
+        "title": material["title"],
+        "main_image_url": material.get("main_image_url"),
+        "gallery_image_urls": material.get("gallery_image_urls", []),
+        "video_url": None,
+        "source_url": product_url,
+        **category_fields,
+        "tags": ["1688采集器"],
+        "price_usd": float(material.get("price") or 0),
+        "gmv_usd": 0,
+        "weekly_sales": 0,
+        "monthly_sales": 0,
+        "review_count": 0,
+        "listing_time": now,
+        "status": "active",
+        "raw_data": {**raw_data, "material_id": material_id},
+    }
+    insert_upload_batch(
+        batch_id=batch_id,
+        source_filename=f"{source_product_id}_1688_material.json",
+        saved_path=saved_path,
+        file_type="1688-material",
+        total_rows=1,
+        imported_count=1,
+        failed_count=0,
+    )
+    replace_products(batch_id, [product])
+
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE sourcing_materials_1688
+            SET product_list_product_id = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (product_id, utc_now_text(), material_id),
+        )
+
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
+    if not row:
+        raise ValueError("1688 商品创建失败")
+    return product_row_to_api(row)
+
+
 def sourcing_candidate_row_to_api(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
@@ -566,6 +962,31 @@ def sourcing_candidate_row_to_api(row: sqlite3.Row) -> dict[str, Any]:
         "sku_list": json.loads(row["sku_list_json"] or "[]"),
         "raw_data": json.loads(row["raw_data_json"] or "{}"),
         "captured_at": row["captured_at"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def sourcing_material_row_to_api(row: sqlite3.Row) -> dict[str, Any]:
+    raw_data = json.loads(row["raw_data_json"] or "{}")
+    return {
+        "id": row["id"],
+        "offer_id": row["offer_id"],
+        "product_url": row["product_url"],
+        "title": row["title"],
+        "main_image_url": row["main_image_url"],
+        "gallery_image_urls": raw_data.get("gallery_image_urls", []),
+        "price": row["price"],
+        "price_range": row["price_range"],
+        "moq": row["moq"],
+        "shop_name": row["shop_name"],
+        "shop_url": row["shop_url"],
+        "sku_list": json.loads(row["sku_list_json"] or "[]"),
+        "raw_data": raw_data,
+        "captured_at": row["captured_at"],
+        "assigned_product_id": row["assigned_product_id"],
+        "assigned_at": row["assigned_at"],
+        "product_list_product_id": row["product_list_product_id"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }

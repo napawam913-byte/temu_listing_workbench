@@ -1,0 +1,80 @@
+{
+  "manifest_version": 3,
+  "name": "Temu 商品核价与主图工作台",
+  "version": "0.2.0",
+  "description": "统一侧边栏承载原 1688 核价录入工具和 Temu GPT 主图自动化工具，原功能保持不变。",
+  "permissions": [
+    "activeTab",
+    "downloads",
+    "scripting",
+    "sidePanel",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "*://detail.1688.com/*",
+    "*://*.1688.com/*",
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "<all_urls>"
+  ],
+  "action": {
+    "default_title": "Temu 商品工作台"
+  },
+  "background": {
+    "service_worker": "src/presentation/background/background.js"
+  },
+  "side_panel": {
+    "default_path": "src/presentation/compat/compatSidepanel.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://detail.1688.com/*",
+        "*://*.1688.com/*"
+      ],
+      "js": [
+        "src/legacy/1688/content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "file://*/*"
+      ],
+      "js": [
+        "src/legacy/1688/preview_bridge.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": [
+        "src/legacy/gpt/contentScript.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "src/legacy/1688/popup.html",
+        "src/legacy/1688/popup.css",
+        "src/legacy/1688/popup.js",
+        "src/legacy/1688/calc.js",
+        "src/legacy/1688/storage.js",
+        "src/legacy/1688/excel_writer.js",
+        "src/legacy/1688/config.json",
+        "src/legacy/gpt/dashboard.html",
+        "src/legacy/gpt/dashboard.css",
+        "src/legacy/gpt/dashboard.js"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
+}

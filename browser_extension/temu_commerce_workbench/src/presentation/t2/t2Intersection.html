@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>T2 价格表信息表交集</title>
+    <link rel="stylesheet" href="./t2Intersection.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>T2 交集处理</h1>
+          <p>按 SKC 对信息表和价格表去重、求交集，导出 result.xlsx 和可传输到 1688 核价页签的 result.html。</p>
+        </div>
+      </header>
+
+      <section class="card">
+        <h2>选择表格</h2>
+        <label>
+          信息表
+          <input id="infoFile" type="file" accept=".xlsx,.xls">
+        </label>
+        <label>
+          价格表
+          <input id="priceFile" type="file" accept=".xlsx,.xls">
+        </label>
+        <button id="processButton" type="button">处理交集</button>
+      </section>
+
+      <section class="metrics">
+        <article>
+          <span>信息表行数</span>
+          <strong id="infoRowCount">0</strong>
+        </article>
+        <article>
+          <span>信息表 SKC</span>
+          <strong id="infoUniqueSkcCount">0</strong>
+        </article>
+        <article>
+          <span>价格表 SKC</span>
+          <strong id="priceUniqueSkcCount">0</strong>
+        </article>
+        <article>
+          <span>交集商品</span>
+          <strong id="matchedProductCount">0</strong>
+        </article>
+      </section>
+
+      <section class="card actions">
+        <h2>导出</h2>
+        <div class="button-row">
+          <button id="exportXlsxButton" type="button" disabled>导出 result.xlsx</button>
+          <button id="appendJsonButton" type="button" disabled>续写 JSON</button>
+          <button id="openPreviewButton" type="button" disabled>打开 HTML 预览页</button>
+        </div>
+        <p class="hint">HTML 预览页是固定页面。每次处理交集后，页面里的商品卡片会根据最新结果动态刷新。</p>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <h2>结果预览</h2>
+          <span id="resultSummary">暂无结果</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>NAME</th>
+                <th>图片 URL</th>
+                <th>SKC</th>
+                <th>调整后申报价</th>
+              </tr>
+            </thead>
+            <tbody id="resultRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="section-head">
+          <h2>重复 SKC</h2>
+          <span id="duplicateSummary">暂无重复</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>SKC</th>
+                <th>重复次数</th>
+                <th>价格表行号</th>
+                <th>调整后申报价列表</th>
+                <th>本 SKC 最大价</th>
+                <th>最大价行号</th>
+              </tr>
+            </thead>
+            <tbody id="duplicateRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card log-card">
+        <h2>日志</h2>
+        <div id="log"></div>
+      </section>
+    </main>
+
+    <script src="/node_modules/xlsx/dist/xlsx.full.min.js"></script>
+    <script type="module" src="./t2Intersection.js"></script>
+  </body>
+</html>

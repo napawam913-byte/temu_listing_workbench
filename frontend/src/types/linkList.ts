@@ -1,0 +1,125 @@
+export type LinkListSchemaVersion = 2;
+export type LinkListImageProvider = 'chatgpt' | 'plugin_chatgpt_web' | 'comfyui';
+export type LinkListImageEditStatus = 'draft' | 'queued' | 'running' | 'done' | 'failed';
+export type LinkListImageRole = 'product-main' | 'product-material' | 'sales-sku';
+
+export type LinkListImageAsset = {
+  id: string;
+  role: LinkListImageRole;
+  sourceUrl?: string;
+  sourceCloudUrl?: string;
+  displayUrl?: string;
+  displayCloudUrl?: string;
+  editedUrl?: string;
+  editedCloudUrl?: string;
+  storageKey?: string;
+  alt?: string;
+};
+
+export type LinkListImageEditTask = {
+  id: string;
+  provider: LinkListImageProvider;
+  mode: 'image-to-image';
+  status: LinkListImageEditStatus;
+  inputImageUrl?: string;
+  outputImageUrl?: string;
+  prompt: string;
+  stylePrompt: string;
+  referenceMainImageAssetId?: string;
+  targetSkuEntryId?: string;
+  workflow?: {
+    chatgptModel?: string;
+    comfyuiWorkflowId?: string;
+    comfyuiNodeMap?: Record<string, string>;
+    jobId?: string;
+    seed?: number;
+    params?: Record<string, unknown>;
+  };
+  createdAt: string;
+  updatedAt?: string;
+};
+
+export type LinkListStyleProfile = {
+  id: string;
+  name: string;
+  provider: LinkListImageProvider;
+  prompt: string;
+  negativePrompt?: string;
+  referenceImageAssetId?: string;
+};
+
+export type LinkListSource = {
+  id: string;
+  title: string;
+  productUrl: string;
+  shopName?: string;
+  shopUrl?: string;
+  imageUrl?: string;
+};
+
+export type LinkListComponentSku = {
+  name: string;
+  specText: string;
+  sourceId?: string;
+  sourceSkuId?: string;
+  sourceSkuKey?: string;
+  sourceTitle: string;
+  sourceUrl: string;
+  sourceImageUrl?: string;
+  imageUrl?: string;
+  rawSpecs?: Record<string, string>;
+};
+
+export type LinkListSourceSkuLink = {
+  sourceId: string;
+  sourceTitle: string;
+  sourceProductUrl: string;
+  sourceSkuId?: string;
+  sourceSkuKey: string;
+  specText: string;
+  optionText: string;
+  imageUrl?: string;
+};
+
+export type LinkListSkuEntry = {
+  id: string;
+  order: number;
+  kind: 'single' | 'combo';
+  name: string;
+  imageAsset?: LinkListImageAsset;
+  imageEditTask?: LinkListImageEditTask;
+  imageUrl?: string;
+  price?: number;
+  weight?: number;
+  sourceSkuLinks?: LinkListSourceSkuLink[];
+  componentSkus: LinkListComponentSku[];
+};
+
+export type LinkListCreativeJobSummary = {
+  id: string;
+  provider: string;
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  imageIndex: number;
+  imageKind: string;
+  imageLabel: string;
+  resultImageUrl?: string | null;
+  updatedAt: string;
+};
+
+export type LinkListRecord = {
+  schemaVersion?: LinkListSchemaVersion;
+  id: string;
+  createdAt: string;
+  productId: string;
+  productTitle: string;
+  productTitleEn?: string;
+  mainImage?: LinkListImageAsset;
+  productMaterialImages?: LinkListImageAsset[];
+  styleProfile?: LinkListStyleProfile;
+  productImageUrl?: string;
+  productSourceUrl?: string;
+  sourceLinks: LinkListSource[];
+  skuEntries: LinkListSkuEntry[];
+  componentSkuCount: number;
+  creativeJobs?: LinkListCreativeJobSummary[];
+};

@@ -1,13 +1,17 @@
 import {
   Button,
   Card,
+  Empty,
   Form,
+  Image,
   Input,
   Layout,
   Modal,
+  Radio,
   Select,
   Space,
   Statistic,
+  Tag,
   Typography,
   message,
 } from 'antd';
@@ -15,20 +19,25 @@ import { useCallback, useEffect, useState } from 'react';
 import type { Key } from 'react';
 import {
   deleteProduct as deleteBackendProduct,
+  createPluginCreativeJobs,
+  exportDianxiaomiTemuTemplate,
   fetchProductStats,
   fetchProducts,
   mapBackendProduct,
+  syncPluginCreativeJobs,
+  upload1688Links,
   uploadYunqiFile,
 } from '../api/backendApi';
-import type { ProductStats } from '../api/backendApi';
+import type { DianxiaomiExportMode, ProductStats } from '../api/backendApi';
 import { DataImportModal } from '../components/DataImportModal';
 import { ProductDetailDrawer } from '../components/ProductDetailDrawer';
 import { ProductTable } from '../components/ProductTable';
 import { mockProducts } from '../mock/products';
+import type { LinkListRecord } from '../types/linkList';
 import type { Product, ProductSourceType, SourcingCandidate } from '../types/product';
 
 const { Header, Content } = Layout;
-const { Title, Text } = Typography;
+const { Text } = Typography;
 
 type Filters = {
   keyword?: string;
@@ -48,6 +57,40 @@ type ProductRoute = {
   sourceType: ProductSourceType;
   sourceProductId: string;
 };
+
+type WorkbenchTab = 'sourcing' | 'differentiation' | 'links';
+
+const LINK_LIST_STORAGE_KEY = 'temuListingWorkbenchLinkListRecords';
+const CURATED_EXPORT_IMAGE_COUNT = 8;
+
+function readLinkListRecords(): LinkListRecord[] {
+  try {
+    const value = JSON.parse(localStorage.getItem(LINK_LIST_STORAGE_KEY) || '[]');
+    return Array.isArray(value) ? value : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeLinkListRecords(records: LinkListRecord[]) {
+  localStorage.setItem(LINK_LIST_STORAGE_KEY, JSON.stringify(records));
+}
+
+function hasCuratedExportImages(record: LinkListRecord) {
+  const mainImage = record.mainImage;
+  const mainReady = Boolean(mainImage?.editedCloudUrl || mainImage?.editedUrl || mainImage?.displayCloudUrl);
+  const curatedImages = (record.productMaterialImages || []).filter(
+    (asset) => asset.editedCloudUrl || asset.editedUrl || asset.displayCloudUrl,
+  );
+
+  return mainReady && curatedImages.length >= CURATED_EXPORT_IMAGE_COUNT;
+}
+
+function formatRecordTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString('zh-CN', { hour12: false });
+}
 
 function getProductSourceType(product: Product): ProductSourceType {
   return product.sourceType || 'yunqi';
@@ -129,6 +172,275 @@ function toOptionalNumber(value?: string) {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+function getRecordMainImageUrl(record?: LinkListRecord) {
+  if (!record) return undefined;
+  return record.mainImage?.editedUrl || record.mainImage?.displayUrl || record.mainImage?.sourceUrl || record.productImageUrl;
+}
+
+function getSkuDisplayImageUrl(entry: LinkListRecord['skuEntries'][number]) {
+  return entry.imageAsset?.editedUrl || entry.imageAsset?.displayUrl || entry.imageAsset?.sourceUrl || entry.imageUrl;
+}
+
+function getImageTaskStatusText(status?: string) {
+  if (status === 'queued') return '排队中';
+  if (status === 'running') return '生成中';
+  if (status === 'done') return '已统一';
+  if (status === 'failed') return '生成失败';
+  return '待修图';
+}
+
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function LinkListPanel({
+  records,
+  onDelete,
+  onUpdate,
+}: {
+  records: LinkListRecord[];
+  onDelete: (recordId: string) => void;
+  onUpdate: (record: LinkListRecord) => void;
+}) {
+  const [previewRecord, setPreviewRecord] = useState<LinkListRecord>();
+  const [generatingRecordId, setGeneratingRecordId] = useState<string>();
+  const previewMainImage = getRecordMainImageUrl(previewRecord);
+
+  const generateRecordCreative = async (record: LinkListRecord) => {
+    setGeneratingRecordId(record.id);
+    try {
+      await createPluginCreativeJobs([record]);
+      const synced = await syncPluginCreativeJobs([record]);
+      const nextRecord = synced.records[0] || record;
+      onUpdate(nextRecord);
+      setPreviewRecord((current) => (current?.id === record.id ? nextRecord : current));
+      message.success('已创建插件生图任务，请在插件侧边栏处理');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '插件生图任务创建失败');
+    } finally {
+      setGeneratingRecordId(undefined);
+    }
+  };
+
+  return (
+    <>
+      {records.length === 0 ? (
+        <Card className="link-list-empty-card">
+          <Empty description="还没有录入链接。请在选品找货中选择 SKU 后点击“录入链接列表”。" />
+        </Card>
+      ) : (
+        <div className="link-list">
+          {records.map((record) => (
+            <Card
+              className="link-record-card"
+              hoverable
+              key={record.id}
+              tabIndex={0}
+              onClick={() => setPreviewRecord(record)}
+              onKeyDown={(event) => {
+                if (event.key !== 'Enter' && event.key !== ' ') return;
+                event.preventDefault();
+                setPreviewRecord(record);
+              }}
+            >
+              <div className="link-record-row">
+                <div className="link-record-image">
+                  {getRecordMainImageUrl(record) ? (
+                    <Image
+                      alt={record.productTitle}
+                      height={56}
+                      preview={false}
+                      referrerPolicy="no-referrer"
+                      src={getRecordMainImageUrl(record)}
+                      width={56}
+                    />
+                  ) : (
+                    <span>商品</span>
+                  )}
+                </div>
+
+                <div className="link-record-summary">
+                  <div className="link-record-title-line">
+                    <Text className="link-record-title" strong>
+                      {record.productTitle}
+                    </Text>
+                    <div className="link-record-tags">
+                      <Tag color="blue">{record.skuEntries.length} 销售 SKU</Tag>
+                      <Tag>{record.sourceLinks.length} 货源</Tag>
+                      {record.styleProfile ? <Tag color="purple">{record.styleProfile.provider === 'comfyui' ? 'ComfyUI' : 'ChatGPT'}</Tag> : null}
+                    </div>
+                  </div>
+                  <Text className="link-record-subline" type="secondary">
+                    录入：{formatRecordTime(record.createdAt)} · 组件 SKU：{record.componentSkuCount}
+                  </Text>
+                  <div className="link-source-strip">
+                    {record.sourceLinks.slice(0, 3).map((source) => (
+                      <a
+                        className="link-source-pill"
+                        href={source.productUrl}
+                        key={source.id}
+                        rel="noreferrer"
+                        target="_blank"
+                        onClick={(event) => event.stopPropagation()}
+                      >
+                        {source.shopName || source.title || '1688 货源'}
+                      </a>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="link-record-sku-preview" aria-label="SKU 顺序预览">
+                  {record.skuEntries.slice(0, 4).map((entry) => (
+                    <span className="link-sku-mini" key={entry.id} title={entry.name}>
+                      <span className="link-sku-mini-order">{entry.order}</span>
+                      {getSkuDisplayImageUrl(entry) ? (
+                        <Image
+                          alt={entry.name}
+                          height={30}
+                          preview={false}
+                          referrerPolicy="no-referrer"
+                          src={getSkuDisplayImageUrl(entry)}
+                          width={30}
+                        />
+                      ) : (
+                        <span>SKU</span>
+                      )}
+                    </span>
+                  ))}
+                </div>
+
+                <Button
+                  loading={generatingRecordId === record.id}
+                  size="small"
+                  type="primary"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void generateRecordCreative(record);
+                  }}
+                >
+                  创建插件任务
+                </Button>
+
+                <Button
+                  className="link-record-delete"
+                  danger
+                  size="small"
+                  type="text"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onDelete(record.id);
+                  }}
+                >
+                  删除
+                </Button>
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
+
+      <Modal
+        className="link-preview-modal"
+        footer={null}
+        open={Boolean(previewRecord)}
+        title="商品预览"
+        width={960}
+        onCancel={() => setPreviewRecord(undefined)}
+      >
+        {previewRecord ? (
+          <div className="link-preview-shell">
+            <div className="link-preview-media">
+              <div className="link-preview-main-image">
+                {previewMainImage ? (
+                  <Image
+                    alt={previewRecord.productTitle}
+                    height="100%"
+                    preview={false}
+                    referrerPolicy="no-referrer"
+                    src={previewMainImage}
+                    width="100%"
+                  />
+                ) : (
+                  <span>商品主图</span>
+                )}
+              </div>
+            </div>
+
+            <div className="link-preview-info">
+              <Text className="link-preview-title" strong>
+                {previewRecord.productTitle}
+              </Text>
+              <div className="link-preview-meta">
+                <Tag color="blue">{previewRecord.skuEntries.length} 个销售 SKU</Tag>
+                <Tag>{previewRecord.sourceLinks.length} 个货源链接</Tag>
+                <Tag>组件 SKU {previewRecord.componentSkuCount}</Tag>
+                {previewRecord.styleProfile ? <Tag color="purple">{previewRecord.styleProfile.provider === 'comfyui' ? 'ComfyUI' : 'ChatGPT'} 统一画风</Tag> : null}
+              </div>
+
+              <div className="link-preview-section">
+                <Text strong>SKU 顺序</Text>
+                <div className="link-preview-sku-list">
+                  {previewRecord.skuEntries.map((entry) => (
+                    <div className="link-preview-sku" key={entry.id}>
+                      <span className="link-sku-order">{entry.order}</span>
+                      <span className="link-sku-thumb">
+                        {getSkuDisplayImageUrl(entry) ? (
+                          <Image
+                            alt={entry.name}
+                            height={38}
+                            preview={false}
+                            referrerPolicy="no-referrer"
+                            src={getSkuDisplayImageUrl(entry)}
+                            width={38}
+                          />
+                        ) : (
+                          'SKU'
+                        )}
+                      </span>
+                      <div className="link-sku-copy">
+                        <Text strong>{entry.name}</Text>
+                        <Text type="secondary">
+                          {entry.kind === 'combo' ? '组合' : '单 SKU'} · {entry.componentSkus.length} 个组件
+                        </Text>
+                        <Tag color="gold">{getImageTaskStatusText(entry.imageEditTask?.status)}</Tag>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="link-preview-section">
+                <Text strong>货源链接</Text>
+                <div className="link-preview-source-list">
+                  {previewRecord.sourceLinks.map((source) => (
+                    <a
+                      className="link-source-card"
+                      href={source.productUrl}
+                      key={source.id}
+                      rel="noreferrer"
+                      target="_blank"
+                    >
+                      <span className="link-source-title">{source.title}</span>
+                      <span>{source.shopName || '1688 货源'}</span>
+                    </a>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : null}
+      </Modal>
+    </>
+  );
+}
+
 export function SelectProductPage() {
   const [form] = Form.useForm<Filters>();
   const [products, setProducts] = useState<Product[]>(mockProducts);
@@ -142,11 +454,15 @@ export function SelectProductPage() {
   const [filters, setFilters] = useState<Filters>(defaultFilters);
   const [importOpen, setImportOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
+  const [exportMode, setExportMode] = useState<DianxiaomiExportMode>('distribution');
+  const [exportingTemplate, setExportingTemplate] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [activeProduct, setActiveProduct] = useState<Product | undefined>();
   const [sourcingSearched, setSourcingSearched] = useState(false);
   const [activeCandidate, setActiveCandidate] = useState<SourcingCandidate | undefined>();
   const [activeTab, setActiveTab] = useState<'search' | 'detail'>('search');
+  const [activeWorkbenchTab, setActiveWorkbenchTab] = useState<WorkbenchTab>('sourcing');
+  const [linkListRecords, setLinkListRecords] = useState<LinkListRecord[]>(() => readLinkListRecords());
 
   const loadProducts = useCallback(
     async (nextPage = currentPage, nextPageSize = pageSize, nextFilters = filters) => {
@@ -221,6 +537,80 @@ export function SelectProductPage() {
     setDrawerOpen(false);
     clearProductRoute();
   }, []);
+
+  const recordLinkEntry = useCallback(
+    (record: LinkListRecord) => {
+      setLinkListRecords((current) => {
+        const next = [record, ...current].slice(0, 200);
+        writeLinkListRecords(next);
+        return next;
+      });
+      closeProduct();
+      setActiveWorkbenchTab('links');
+      message.success('已录入链接列表');
+    },
+    [closeProduct],
+  );
+
+  const deleteLinkEntry = useCallback((recordId: string) => {
+    setLinkListRecords((current) => {
+      const next = current.filter((record) => record.id !== recordId);
+      writeLinkListRecords(next);
+      return next;
+    });
+    message.success('已删除链接记录');
+  }, []);
+
+  const updateLinkEntry = useCallback((record: LinkListRecord) => {
+    setLinkListRecords((current) => {
+      const next = current.map((item) => (item.id === record.id ? record : item));
+      writeLinkListRecords(next);
+      return next;
+    });
+  }, []);
+
+  const exportTemplate = useCallback(async () => {
+    if (linkListRecords.length === 0) {
+      message.warning('请先在选品找货中录入链接列表，再导出店小秘模板');
+      return;
+    }
+
+    setExportingTemplate(true);
+    try {
+      const modeLabel = exportMode === 'distribution' ? '铺货' : '精铺';
+      let recordsForExport = linkListRecords;
+      if (exportMode === 'curated') {
+        const syncResult = await syncPluginCreativeJobs(linkListRecords);
+        recordsForExport = syncResult.records;
+        if (syncResult.completedRecordIds.length > 0) {
+          setLinkListRecords(syncResult.records);
+          writeLinkListRecords(syncResult.records);
+        }
+
+        const missingRecords = recordsForExport.filter((record) => !hasCuratedExportImages(record));
+        if (missingRecords.length > 0) {
+          const jobResult = await createPluginCreativeJobs(missingRecords);
+          setLinkListRecords(recordsForExport);
+          writeLinkListRecords(recordsForExport);
+          setExportOpen(false);
+          message.info(
+            `已创建 ${jobResult.items.length} 个插件生图任务，请在插件侧边栏完成后再导出精铺模板`,
+            6,
+          );
+          return;
+        }
+      }
+
+      const blob = await exportDianxiaomiTemuTemplate(recordsForExport, exportMode);
+      downloadBlob(blob, `店小秘_TEMU半托管_${modeLabel}_${new Date().toISOString().slice(0, 10)}.xlsx`);
+      setExportOpen(false);
+      message.success(`店小秘 TEMU 半托管${modeLabel}模板已生成`);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '模板导出失败');
+    } finally {
+      setExportingTemplate(false);
+    }
+  }, [exportMode, linkListRecords]);
 
   const openProductFromRoute = useCallback(async () => {
     const route = parseProductRoute();
@@ -314,8 +704,27 @@ export function SelectProductPage() {
         <div className="app-header-inner">
           <div className="brand">Temu 选品上架工作台</div>
           <nav aria-label="主导航" className="main-nav">
-            <div className="main-nav-item main-nav-active">选品找货</div>
-            <div className="main-nav-item">商品差异化</div>
+            <button
+              className={`main-nav-item ${activeWorkbenchTab === 'sourcing' ? 'main-nav-active' : ''}`}
+              type="button"
+              onClick={() => setActiveWorkbenchTab('sourcing')}
+            >
+              选品找货
+            </button>
+            <button
+              className={`main-nav-item ${activeWorkbenchTab === 'differentiation' ? 'main-nav-active' : ''}`}
+              type="button"
+              onClick={() => setActiveWorkbenchTab('differentiation')}
+            >
+              商品差异化
+            </button>
+            <button
+              className={`main-nav-item ${activeWorkbenchTab === 'links' ? 'main-nav-active' : ''}`}
+              type="button"
+              onClick={() => setActiveWorkbenchTab('links')}
+            >
+              链接列表
+            </button>
           </nav>
           <Space className="header-actions">
             <span className="batch-pill">当前批次：云启 0522</span>
@@ -331,13 +740,16 @@ export function SelectProductPage() {
 
       <Content className="page-content">
         <div className="page-shell">
-          <div className="page-title-row">
-            <div>
-              <Title level={2}>选品找货</Title>
-              <Text type="secondary">导入云启数据后，在这里查看、筛选和导出商品记录。</Text>
-            </div>
-          </div>
-
+          {activeWorkbenchTab === 'links' ? (
+            <LinkListPanel records={linkListRecords} onDelete={deleteLinkEntry} onUpdate={updateLinkEntry} />
+          ) : activeWorkbenchTab === 'differentiation' ? (
+            <>
+              <Card>
+                <Empty description="商品差异化功能待配置。" />
+              </Card>
+            </>
+          ) : (
+            <>
           <div className="stats-grid">
             <Card className="metric-card metric-card-blue">
               <Statistic title={backendReady ? '当前批次商品' : '演示商品'} value={activeCount} />
@@ -422,6 +834,8 @@ export function SelectProductPage() {
               onDelete={deleteProduct}
             />
           </Card>
+            </>
+          )}
         </div>
       </Content>
 
@@ -432,6 +846,16 @@ export function SelectProductPage() {
           const result = await uploadYunqiFile(file);
           setImportOpen(false);
           message.success(`导入完成：${result.imported_count} 条商品`);
+          setCurrentPage(1);
+          await Promise.all([loadProducts(1, pageSize, filters), loadStats()]);
+        }}
+        onImport1688Links={async (productUrls) => {
+          const result = await upload1688Links(productUrls);
+          setImportOpen(false);
+          message.success(`1688 采集完成：${result.imported_count} 条商品`);
+          if (result.errors.length > 0) {
+            message.warning(`有 ${result.errors.length} 条使用链接兜底导入`);
+          }
           setCurrentPage(1);
           await Promise.all([loadProducts(1, pageSize, filters), loadStats()]);
         }}
@@ -454,30 +878,57 @@ export function SelectProductPage() {
         }}
         onBackToSearch={() => setActiveTab('search')}
         onSelectCandidate={selectCandidate}
+        onRecordLinkEntry={recordLinkEntry}
       />
 
       <Modal
-        title="清单导出"
+        title="店小秘 TEMU 半托管模板导出"
         open={exportOpen}
+        confirmLoading={exportingTemplate}
         onCancel={() => setExportOpen(false)}
-        onOk={() => {
-          setExportOpen(false);
-          message.success('已模拟生成商品清单');
-        }}
+        onOk={exportTemplate}
         okText="开始导出"
         cancelText="取消"
       >
         <Space direction="vertical" size={16} className="export-modal-content">
-          <Text type="secondary">导出当前选品阶段的商品清单，不是店小蜜上架模板。</Text>
-          <Card size="small" title="导出范围">
-            <Space direction="vertical">
-              <Text strong>已勾选商品（{selectedRowKeys.length} 条）</Text>
-              <Text>当前筛选结果（{productTotal} 条）</Text>
-              <Text>当前批次全部商品（{products.length} 条）</Text>
+          <Text type="secondary">按桌面提供的店小秘 TEMU 半托管模板输出；精铺模式会先改图上传云端，再写入模板。</Text>
+          <Card size="small" title="导出模式">
+            <Space direction="vertical" size={10}>
+              <Radio.Group
+                buttonStyle="solid"
+                optionType="button"
+                value={exportMode}
+                onChange={(event) => setExportMode(event.target.value)}
+              >
+                <Radio.Button value="distribution">铺货模式</Radio.Button>
+                <Radio.Button value="curated">精铺模式</Radio.Button>
+              </Radio.Group>
+              <Text type="secondary">
+                {exportMode === 'distribution'
+                  ? '照搬原链接商品主图，产品描述直接使用产品素材图图片。'
+                  : '先生成统一画风主图和素材图并上传 OSS，再用云端图片填写模板。'}
+              </Text>
             </Space>
           </Card>
-          <Card size="small" title="导出地址">
-            <Text>D:\learning\temu_listing_workbench\storage\exports</Text>
+          <Card size="small" title="导出范围">
+            <Space direction="vertical">
+              <Text strong>链接列表商品：{linkListRecords.length} 个</Text>
+              <Text>销售 SKU：{linkListRecords.reduce((total, record) => total + record.skuEntries.length, 0)} 个</Text>
+              <Text>
+                图片策略：
+                {exportMode === 'distribution'
+                  ? '原始主图/素材图进入轮播、素材图和描述；SKU 图使用原图。'
+                  : '缺少精铺云端图时会先调用 ChatGPT 生成 8 张图并上传 OSS。'}
+              </Text>
+            </Space>
+          </Card>
+          <Card size="small" title="默认字段">
+            <Space direction="vertical">
+              <Text>变种属性：按店小秘下拉枚举自动匹配（颜色/风格/材质/数量/型号等）</Text>
+              <Text>包装：不规则 / 硬包装</Text>
+              <Text>尺寸重量缺失时：10 × 10 × 5 cm，200 g</Text>
+              <Text>库存：0；发货时效：16 天</Text>
+            </Space>
           </Card>
         </Space>
       </Modal>

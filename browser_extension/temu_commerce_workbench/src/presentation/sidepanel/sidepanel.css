@@ -1,0 +1,185 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 420px;
+  font-family: Arial, "Microsoft YaHei", sans-serif;
+  color: #1d252c;
+  background: #f6f7f8;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  min-height: 34px;
+  border: 0;
+  border-radius: 6px;
+  padding: 0 12px;
+  color: #fff;
+  background: #1f6fb2;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+button.ghost {
+  color: #1f2933;
+  background: #e6eaf0;
+}
+
+.app-shell {
+  padding: 14px;
+}
+
+.topbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 18px;
+}
+
+h2 {
+  margin-bottom: 10px;
+  font-size: 14px;
+}
+
+.topbar p,
+.muted {
+  margin-top: 4px;
+  color: #5b6570;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.band,
+.queue-section {
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid #dde3ea;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.band label {
+  display: block;
+  margin-bottom: 8px;
+  color: #3b4652;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+input[type="file"],
+input[type="number"] {
+  width: 100%;
+  margin-top: 4px;
+}
+
+input[type="number"] {
+  height: 32px;
+  border: 1px solid #cbd5df;
+  border-radius: 6px;
+  padding: 0 8px;
+}
+
+.button-row,
+.manual-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.button-row button {
+  grid-column: 1 / -1;
+}
+
+.section-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.section-header span {
+  color: #5b6570;
+  font-size: 12px;
+}
+
+.table-wrap {
+  max-height: 300px;
+  overflow: auto;
+  border: 1px solid #e6eaf0;
+  border-radius: 6px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+th,
+td {
+  padding: 7px 8px;
+  border-bottom: 1px solid #eef1f4;
+  text-align: left;
+  vertical-align: top;
+  white-space: nowrap;
+}
+
+th {
+  position: sticky;
+  top: 0;
+  background: #f2f5f8;
+  z-index: 1;
+}
+
+td.name {
+  max-width: 180px;
+  white-space: normal;
+  word-break: break-word;
+}
+
+tr.is-selected {
+  background: #eef6ff;
+}
+
+.log-band {
+  margin-bottom: 0;
+}
+
+#log {
+  max-height: 160px;
+  overflow: auto;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.log-entry {
+  padding: 4px 0;
+  border-bottom: 1px solid #eef1f4;
+}
+
+.log-entry strong {
+  margin-right: 6px;
+  color: #5b6570;
+}

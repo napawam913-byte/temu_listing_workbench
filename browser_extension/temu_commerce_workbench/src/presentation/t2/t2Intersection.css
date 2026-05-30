@@ -1,0 +1,179 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 420px;
+  font-family: Arial, "Microsoft YaHei", sans-serif;
+  color: #1f2933;
+  background: #f6f7f8;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  min-height: 34px;
+  border: 0;
+  border-radius: 6px;
+  padding: 0 12px;
+  color: #fff;
+  background: #1f6fb2;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.shell {
+  padding: 14px;
+}
+
+.topbar {
+  margin-bottom: 12px;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 18px;
+}
+
+h2 {
+  margin-bottom: 10px;
+  font-size: 14px;
+}
+
+.topbar p,
+.hint,
+.section-head span {
+  margin-top: 4px;
+  color: #5b6570;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.card {
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid #dde3ea;
+  border-radius: 8px;
+  background: #fff;
+}
+
+label {
+  display: block;
+  margin-bottom: 8px;
+  color: #3b4652;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+input[type="file"] {
+  width: 100%;
+  margin-top: 4px;
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.metrics article {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid #dde3ea;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.metrics span {
+  display: block;
+  color: #5b6570;
+  font-size: 11px;
+}
+
+.metrics strong {
+  display: block;
+  margin-top: 4px;
+  font-size: 18px;
+}
+
+.button-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px;
+}
+
+.section-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.table-wrap {
+  max-height: 300px;
+  overflow: auto;
+  border: 1px solid #e6eaf0;
+  border-radius: 6px;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+th,
+td {
+  padding: 7px 8px;
+  border-bottom: 1px solid #eef1f4;
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  position: sticky;
+  top: 0;
+  background: #f2f5f8;
+  z-index: 1;
+  white-space: nowrap;
+}
+
+td {
+  word-break: break-word;
+}
+
+.log-card {
+  margin-bottom: 0;
+}
+
+#log {
+  max-height: 150px;
+  overflow: auto;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.log-entry {
+  padding: 4px 0;
+  border-bottom: 1px solid #eef1f4;
+}
+
+.log-entry strong {
+  margin-right: 6px;
+  color: #5b6570;
+}

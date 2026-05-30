@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Temu 商品处理工作台</title>
+    <link rel="stylesheet" href="./sidepanel.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <h1>Temu 商品处理工作台</h1>
+          <p>导入 T2 表格，维护商品队列，抓取 1688 数据，核价后导出。</p>
+        </div>
+        <button id="clearQueue" type="button" class="ghost">清空队列</button>
+      </header>
+
+      <section class="band">
+        <h2>T2 导入</h2>
+        <label>
+          信息表
+          <input id="infoFile" type="file" accept=".xlsx,.xls">
+        </label>
+        <label>
+          价格表
+          <input id="priceFile" type="file" accept=".xlsx,.xls">
+        </label>
+        <button id="importButton" type="button">导入商品队列</button>
+      </section>
+
+      <section class="band">
+        <h2>1688 数据</h2>
+        <p id="selectedProductText" class="muted">未选择商品</p>
+        <div class="button-row">
+          <button id="capture1688Button" type="button">抓取当前 1688 页到选中商品</button>
+        </div>
+        <div class="manual-grid">
+          <label>
+            单件
+            <input id="manualUnitPrice" type="number" min="0" step="0.01" placeholder="如 43.00">
+          </label>
+          <label>
+            重量 kg
+            <input id="manualWeight" type="number" min="0" step="0.001" placeholder="如 0.5">
+          </label>
+          <button id="saveManual1688Button" type="button">保存手动数据</button>
+        </div>
+      </section>
+
+      <section class="band">
+        <h2>核价与导出</h2>
+        <div class="manual-grid">
+          <label>
+            倍数
+            <input id="quantity" type="number" min="1" step="1" value="1">
+          </label>
+          <label>
+            折扣率
+            <input id="discountRate" type="number" min="0.01" step="0.01" value="1">
+          </label>
+          <button id="calculateButton" type="button">批量核价</button>
+          <button id="exportButton" type="button">导出 Excel</button>
+        </div>
+      </section>
+
+      <section class="queue-section">
+        <div class="section-header">
+          <h2>商品队列</h2>
+          <span id="queueSummary">0 个商品</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>选中</th>
+                <th>NAME</th>
+                <th>SKC</th>
+                <th>核价</th>
+                <th>单件</th>
+                <th>重量</th>
+                <th>利润</th>
+                <th>状态</th>
+              </tr>
+            </thead>
+            <tbody id="productRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="band log-band">
+        <h2>日志</h2>
+        <div id="log"></div>
+      </section>
+    </main>
+
+    <script src="/node_modules/xlsx/dist/xlsx.full.min.js"></script>
+    <script type="module" src="./sidepanel.js"></script>
+  </body>
+</html>

@@ -1,0 +1,13 @@
+Temu 商品工作台扩展安装说明
+
+1. 解压整个 temu-commerce-workbench-extension 文件夹（如果你收到的是压缩包）。
+2. 打开 Chrome，进入 chrome://extensions/ 。
+3. 打开右上角“开发者模式”。
+4. 点击“加载已解压的扩展程序”。
+5. 选择当前文件夹：temu-commerce-workbench-extension
+6. 安装完成后，点击扩展图标打开侧边栏即可使用。
+
+说明：
+- 这个发布包已经包含运行所需的 xlsx 浏览器脚本。
+- 不需要再执行 npm install。
+- 如果浏览器更新后扩展失效，请让提供方重新打一个新包。

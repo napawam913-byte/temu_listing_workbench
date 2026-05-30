@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Temu GPT Main Image Automator</title>
+    <link rel="stylesheet" href="dashboard.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>Temu GPT 主图两段式自动化</h1>
+          <p>每张图片按“上传 -> 规划 -> 执行 -> 自动下载”处理，适合 Temu 美国站主图。</p>
+        </div>
+        <div class="actions">
+          <button id="openChatgpt" type="button">打开 GPT</button>
+          <button id="pullWorkbenchJobs" type="button">拉取工作台任务</button>
+          <button id="selectFolder" type="button">选择图片文件夹</button>
+          <button id="importTemplate" type="button">导入模板 Excel</button>
+          <input id="folderInput" type="file" accept="image/jpeg,image/png,image/webp" multiple hidden>
+          <input id="templateInput" type="file" accept=".xlsx,.xls" hidden>
+        </div>
+      </header>
+
+      <section class="status-grid">
+        <div class="metric">
+          <span>总数</span>
+          <strong id="totalCount">0</strong>
+        </div>
+        <div class="metric">
+          <span>成功</span>
+          <strong id="successCount">0</strong>
+        </div>
+        <div class="metric">
+          <span>失败</span>
+          <strong id="failedCount">0</strong>
+        </div>
+        <div class="metric">
+          <span>剩余</span>
+          <strong id="remainingCount">0</strong>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <aside class="panel controls">
+          <h2>任务控制</h2>
+          <div class="button-row">
+            <button id="startBtn" type="button" disabled>开始</button>
+            <button id="pauseBtn" type="button" disabled>暂停</button>
+            <button id="resumeBtn" type="button" disabled>继续</button>
+            <button id="stopBtn" type="button" disabled>停止</button>
+          </div>
+          <div class="button-row">
+            <button id="exportLogBtn" type="button" disabled>导出日志</button>
+            <button id="clearBtn" type="button" disabled>清空队列</button>
+          </div>
+
+          <label>
+            规划超时秒数
+            <input id="planTimeout" type="number" min="30" max="900" value="240">
+          </label>
+          <label>
+            执行超时秒数
+            <input id="executeTimeout" type="number" min="60" max="1200" value="420">
+          </label>
+          <label>
+            输出后缀
+            <input id="outputSuffix" type="text" value="_temu_main">
+          </label>
+          <label>
+            规划指令
+            <textarea id="planPrompt" rows="6"></textarea>
+          </label>
+          <label>
+            执行指令
+            <textarea id="executePrompt" rows="5"></textarea>
+          </label>
+        </aside>
+
+        <section class="panel progress">
+          <div class="current">
+            <span>当前图片</span>
+            <strong id="currentFile">未开始</strong>
+            <em id="currentStage">等待选择文件夹</em>
+          </div>
+          <div class="bar">
+            <div id="progressFill"></div>
+          </div>
+          <h2>当前规划</h2>
+          <pre id="planPreview">暂无规划。</pre>
+          <h2>队列日志</h2>
+          <div id="log" class="log"></div>
+        </section>
+      </section>
+    </main>
+
+    <script src="/node_modules/xlsx/dist/xlsx.full.min.js"></script>
+    <script type="module" src="dashboard.js"></script>
+  </body>
+</html>

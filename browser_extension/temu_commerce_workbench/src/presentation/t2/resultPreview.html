@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>T2 商品结果预览</title>
+    <link rel="stylesheet" href="./resultPreview.css">
+  </head>
+  <body>
+    <header class="header">
+      <div>
+        <h1>商品结果预览</h1>
+        <p id="summaryText">等待 T2 交集结果。</p>
+      </div>
+      <button id="refreshButton" type="button">刷新</button>
+    </header>
+
+    <main id="grid" class="grid"></main>
+
+    <section id="emptyState" class="empty-state">
+      <h2>暂无商品</h2>
+      <p>请先回到侧边栏的“T2 交集”页签，选择信息表和价格表后点击“处理交集”。</p>
+    </section>
+
+    <script type="module" src="./resultPreview.js"></script>
+  </body>
+</html>

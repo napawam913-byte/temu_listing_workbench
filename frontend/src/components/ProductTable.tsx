@@ -19,11 +19,6 @@ function currency(value: number) {
   return `¥${value.toFixed(2)}`;
 }
 
-function compactMoney(value: number) {
-  if (value >= 10000) return `$${(value / 1000).toFixed(1)}k`;
-  return `$${value.toLocaleString()}`;
-}
-
 function ProductThumb({
   alt,
   src,
@@ -67,6 +62,7 @@ function ProductTitleBlock({
   onView: (product: Product) => void;
 }) {
   const visibleTitle = product.titleEn || product.title;
+  const shouldShowFulfillmentTag = product.sourceType !== '1688';
 
   return (
     <div className="product-title-stack">
@@ -78,10 +74,11 @@ function ProductTitleBlock({
           {visibleTitle}
         </button>
       </Tooltip>
-      <div className="product-title-tags">
-        <Tag color="orange">全托管</Tag>
-        <Tag color="magenta">{product.reviewCount.toLocaleString()} 条评论</Tag>
-      </div>
+      {shouldShowFulfillmentTag ? (
+        <div className="product-title-tags">
+          <Tag color="orange">全托管</Tag>
+        </div>
+      ) : null}
       <div className="product-title-meta">上架：{product.listedAt || '-'}</div>
     </div>
   );
@@ -121,7 +118,7 @@ export function ProductTable({
     {
       title: '商品',
       dataIndex: 'title',
-      width: '41%',
+      width: '56%',
       render: (_, product) => (
         <div className="product-cell">
           <ProductThumb alt={product.titleEn || product.title} src={product.mainImageUrl} tone={product.imageTone} />
@@ -132,42 +129,24 @@ export function ProductTable({
     {
       title: '类目',
       dataIndex: 'category',
-      width: '12%',
+      width: '14%',
       render: (value: string) => <span className="table-wrap-text">{value}</span>,
     },
     {
       title: '价格',
       dataIndex: 'price',
-      width: '8%',
+      width: '10%',
       render: currency,
-    },
-    {
-      title: '销量',
-      dataIndex: 'sales',
-      width: '8%',
-      render: (value: number) => value.toLocaleString(),
-    },
-    {
-      title: 'GMV',
-      dataIndex: 'gmv',
-      width: '8%',
-      render: compactMoney,
-    },
-    {
-      title: '评论数',
-      dataIndex: 'reviewCount',
-      width: '8%',
-      render: (value: number) => value.toLocaleString(),
     },
     {
       title: '上架时间',
       dataIndex: 'listedAt',
-      width: '9%',
+      width: '12%',
     },
     {
       title: '操作',
       key: 'action',
-      width: '6%',
+      width: '8%',
       render: (_, product) => (
         <div className="table-actions">
           <Button type="link" onClick={() => onView(product)}>

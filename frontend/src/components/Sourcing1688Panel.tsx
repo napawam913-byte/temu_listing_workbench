@@ -1,14 +1,19 @@
 import { Button, Card, Checkbox, Empty, Image, Input, Modal, Select, Space, Tabs, Tag, Typography, message } from 'antd';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
+  API_BASE_URL,
   deleteCaptured1688Candidate,
   fetchCaptured1688Candidates,
   setActive1688CaptureSession,
 } from '../api/backendApi';
 import type { Captured1688Candidate, Captured1688Sku } from '../api/backendApi';
+import type { LinkListRecord, LinkListSource } from '../types/linkList';
 import type { Product, SourcingCandidate } from '../types/product';
 
 const { Text } = Typography;
+const DEFAULT_IMAGE_PROVIDER = 'chatgpt';
+const DEFAULT_STYLE_PROMPT =
+  '以商品主图为参考，统一光线、背景、色温、质感和构图；保留 SKU 的真实款式、颜色、数量和关键细节，生成干净一致的电商商品图。';
 
 type Props = {
   product: Product;
@@ -20,6 +25,7 @@ type Props = {
   onOpenDetail: (candidate: SourcingCandidate) => void;
   onBackToSearch: () => void;
   onSelectCandidate: (candidate: SourcingCandidate) => void;
+  onRecordLinkEntry: (record: LinkListRecord) => void;
 };
 
 type SkuCombinationItem = {
@@ -113,6 +119,10 @@ function getCandidateImageUrls(candidate: Captured1688Candidate) {
   const skuImages = (candidate.sku_list || []).map((sku) => sku.image_url);
 
   return uniqueStrings([candidate.main_image_url, ...topLevelGallery, ...rawGallery, ...skuImages]);
+}
+
+function getCandidateMainImageUrl(candidate: Captured1688Candidate) {
+  return getCandidateImageUrls(candidate)[0];
 }
 
 function getSkuImageUrl(_candidate: Captured1688Candidate, sku: Captured1688Sku, _index: number) {
@@ -223,7 +233,7 @@ function getSkuCombinationDisplayName(items: SkuCombinationItem[]) {
   return items.map((item) => item.optionText || item.specText).join('+');
 }
 
-export function Sourcing1688Panel({ product, onSearch }: Props) {
+export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Props) {
   const [captureStarted, setCaptureStarted] = useState(false);
   const [loadingCandidates, setLoadingCandidates] = useState(false);
   const [capturedCandidates, setCapturedCandidates] = useState<Captured1688Candidate[]>([]);
@@ -357,12 +367,34 @@ export function Sourcing1688Panel({ product, onSearch }: Props) {
     () =>
       capturedCandidates.map((candidate, candidateIndex) => {
         const skuCount = getDisplaySkuList(candidate).length;
-        const label = `货源 ${candidateIndex + 1} · ${getCandidateLabel(candidate, candidateIndex)} · SKU ${skuCount}`;
+        const labelText = `货源 ${candidateIndex + 1} · ${getCandidateLabel(candidate, candidateIndex)} · SKU ${skuCount}`;
+        const candidateImageUrl = getCandidateMainImageUrl(candidate);
 
         return {
           value: candidate.id,
-          label,
-          title: candidate.title,
+          label: (
+            <span className="source-select-option">
+              <span className="source-select-thumb">
+                {candidateImageUrl ? (
+                  <Image
+                    alt={candidate.title}
+                    height={34}
+                    preview={false}
+                    referrerPolicy="no-referrer"
+                    src={candidateImageUrl}
+                    width={34}
+                  />
+                ) : (
+                  <span>1688</span>
+                )}
+              </span>
+              <span className="source-select-copy">
+                <span className="source-select-title">{labelText}</span>
+                <span className="source-select-subtitle">{candidate.title}</span>
+              </span>
+            </span>
+          ),
+          title: `${labelText} ${candidate.title}`,
         };
       }),
     [capturedCandidates],
@@ -520,7 +552,7 @@ export function Sourcing1688Panel({ product, onSearch }: Props) {
         setCaptureStarted(true);
         onSearch();
         if (showMessage) {
-          message.success('已绑定当前商品，插件采集会回显到这里');
+          message.success('已打开采集流程，请在插件侧边栏选择加入位置');
         }
       } catch (error) {
         setCaptureStarted(false);
@@ -794,17 +826,144 @@ export function Sourcing1688Panel({ product, onSearch }: Props) {
     });
   };
 
-  const open1688 = () => {
-    window.open(`https://s.1688.com/selloffer/offer_search.htm?keywords=${encodeURIComponent(keyword)}`, '_blank', 'noopener,noreferrer');
+  const recordSelectedSkuLinks = () => {
+    if (finalSkuEntries.length === 0) {
+      message.warning('请先选择 SKU，再录入链接列表');
+      return;
+    }
+
+    const recordId = `link-entry-${product.id}-${Date.now()}`;
+    const createdAt = new Date().toISOString();
+    const sourceMap = new Map<string, LinkListSource>();
+    finalSkuEntries.forEach((entry) => {
+      entry.items.forEach((item) => {
+        const candidate = item.candidate;
+        if (sourceMap.has(candidate.id)) return;
+        sourceMap.set(candidate.id, {
+          id: candidate.id,
+          title: candidate.title,
+          productUrl: candidate.product_url,
+          shopName: candidate.shop_name || undefined,
+          shopUrl: candidate.shop_url || undefined,
+          imageUrl: getCandidateMainImageUrl(candidate),
+        });
+      });
+    });
+    const sourceLinks = Array.from(sourceMap.values());
+    const productMaterialImageUrls = uniqueStrings(
+      finalSkuEntries.flatMap((entry) => entry.items.flatMap((item) => getCandidateImageUrls(item.candidate))),
+    );
+    const mainImageUrl =
+      product.mainImageUrl ||
+      finalSkuEntries.map((entry) => entry.imageUrl).find(Boolean) ||
+      sourceLinks.map((source) => source.imageUrl).find(Boolean);
+    const mainImageAssetId = `${recordId}-main-image`;
+    const styleProfileId = `${recordId}-style-profile`;
+
+    onRecordLinkEntry({
+      schemaVersion: 2,
+      id: recordId,
+      createdAt,
+      productId: product.id,
+      productTitle: product.title,
+      productTitleEn: product.titleEn,
+      mainImage: {
+        id: mainImageAssetId,
+        role: 'product-main',
+        sourceUrl: mainImageUrl,
+        displayUrl: mainImageUrl,
+        alt: product.title,
+      },
+      productMaterialImages: productMaterialImageUrls.map((imageUrl, index) => ({
+        id: `${recordId}-material-image-${index + 1}`,
+        role: 'product-material',
+        sourceUrl: imageUrl,
+        displayUrl: imageUrl,
+        alt: `${product.title} 素材图 ${index + 1}`,
+      })),
+      styleProfile: {
+        id: styleProfileId,
+        name: '统一 SKU 商品图风格',
+        provider: DEFAULT_IMAGE_PROVIDER,
+        prompt: DEFAULT_STYLE_PROMPT,
+        referenceImageAssetId: mainImageAssetId,
+      },
+      productImageUrl: product.mainImageUrl,
+      productSourceUrl: product.sourceUrl,
+      sourceLinks,
+      skuEntries: finalSkuEntries.map((entry, index) => {
+        const entryImageUrl = entry.imageUrl || entry.items.map((item) => item.imageUrl).find(Boolean);
+        const imageAssetId = `${recordId}-sku-image-${index + 1}`;
+        return {
+          id: entry.id,
+          order: index + 1,
+          kind: entry.kind,
+          name: entry.name,
+          imageAsset: {
+            id: imageAssetId,
+            role: 'sales-sku',
+            sourceUrl: entryImageUrl,
+            displayUrl: entryImageUrl,
+            alt: entry.name,
+          },
+          imageEditTask: {
+            id: `${recordId}-image-task-${index + 1}`,
+            provider: DEFAULT_IMAGE_PROVIDER,
+            mode: 'image-to-image',
+            status: 'draft',
+            inputImageUrl: entryImageUrl,
+            prompt: `将销售 SKU「${entry.name}」处理成与商品主图一致的电商图风格，保留 SKU 真实规格和可识别细节。`,
+            stylePrompt: DEFAULT_STYLE_PROMPT,
+            referenceMainImageAssetId: mainImageAssetId,
+            targetSkuEntryId: entry.id,
+            workflow: {
+              chatgptModel: 'gpt-image',
+            },
+            createdAt,
+          },
+          imageUrl: entryImageUrl,
+          price: entry.price,
+          weight: entry.weight,
+          sourceSkuLinks: entry.items.map((item) => ({
+            sourceId: item.candidate.id,
+            sourceTitle: getCandidateLabel(item.candidate, item.candidateIndex),
+            sourceProductUrl: item.candidate.product_url,
+            sourceSkuId: item.sku.sku_id,
+            sourceSkuKey: item.key,
+            specText: item.specText,
+            optionText: item.optionText || item.specText,
+            imageUrl: item.imageUrl,
+          })),
+          componentSkus: entry.items.map((item) => ({
+            name: item.optionText || item.specText,
+            specText: item.specText,
+            sourceId: item.candidate.id,
+            sourceSkuId: item.sku.sku_id,
+            sourceSkuKey: item.key,
+            sourceTitle: getCandidateLabel(item.candidate, item.candidateIndex),
+            sourceUrl: item.candidate.product_url,
+            sourceImageUrl: getCandidateMainImageUrl(item.candidate),
+            imageUrl: item.imageUrl,
+            rawSpecs: item.sku.specs,
+          })),
+        };
+      }),
+      componentSkuCount: selectedComponentSkuCount,
+    });
   };
 
-  const selectedCandidateMainImageUrl = selectedCandidate ? getCandidateImageUrls(selectedCandidate)[0] : undefined;
+  const open1688 = () => {
+    const search = new URLSearchParams({ keyword });
+    window.open(`${API_BASE_URL}/api/sourcing/1688/search?${search.toString()}`, '_blank', 'noopener,noreferrer');
+  };
+
+  const selectedCandidateMainImageUrl = selectedCandidate ? getCandidateMainImageUrl(selectedCandidate) : undefined;
   const activePreviewSkuEntry = finalSkuEntries.find((entry) => entry.id === previewActiveEntryId) ?? finalSkuEntries[0];
   const previewMainImageUrl =
     activePreviewSkuEntry?.imageUrl ||
     product.mainImageUrl ||
     selectedCandidateMainImageUrl ||
-    capturedCandidates.map((candidate) => getCandidateImageUrls(candidate)[0]).find(Boolean);
+    capturedCandidates.map((candidate) => getCandidateMainImageUrl(candidate)).find(Boolean);
   const previewGalleryUrls = uniqueStrings([
     previewMainImageUrl,
     product.mainImageUrl,
@@ -844,31 +1003,27 @@ export function Sourcing1688Panel({ product, onSearch }: Props) {
             <Input value={keyword} readOnly />
             <Button onClick={open1688}>打开 1688</Button>
             <Button type="primary" onClick={startCapture}>
-              开始采集
+              刷新货源素材
             </Button>
           </div>
 
           <Card className="capture-guide" size="small">
             <Space direction="vertical" size={6}>
               <Text strong>采集流程</Text>
-              <Text type="secondary">1. 点击开始采集，绑定当前 Temu 商品。</Text>
-              <Text type="secondary">2. 使用 1688 官方图搜插件找到同款并进入商品详情页。</Text>
-              <Text type="secondary">3. 点击我们的 Chrome 插件打开侧边栏，确认预抓到价格、运费和重量。</Text>
-              <Text type="secondary">4. 点击“采集到工作台”，本抽屉会自动刷新候选货源。</Text>
+              <Text type="secondary">1. 点击打开 1688，或手动进入任意 1688 商品详情页。</Text>
+              <Text type="secondary">2. 在 Chrome 采集器侧边栏预抓当前页。</Text>
+              <Text type="secondary">3. 在插件里点击“加入采集列表”，再从采集列表中选择加入商品列表或货源素材。</Text>
             </Space>
           </Card>
 
           {capturedCandidates.length === 0 ? (
             <Empty
               className="sourcing-empty"
-              description={captureStarted ? '当前商品已绑定，等待插件采集当前 1688 商品页。' : '正在绑定当前商品，请稍后再试。'}
+              description="还没有加入当前商品的 1688 货源素材。请在插件侧边栏先加入采集列表，再选择加入货源素材。"
             >
               <Space>
-                <Button onClick={startCapture} type="primary">
-                  {captureStarted ? '重新绑定' : '开始采集'}
-                </Button>
-                <Button loading={loadingCandidates} onClick={loadCapturedCandidates}>
-                  刷新结果
+                <Button loading={loadingCandidates} onClick={loadCapturedCandidates} type="primary">
+                  刷新货源素材
                 </Button>
               </Space>
             </Empty>
@@ -952,7 +1107,7 @@ export function Sourcing1688Panel({ product, onSearch }: Props) {
                 <Text type="secondary">货源</Text>
                 <Select
                   className="sku-source-select"
-                  optionFilterProp="label"
+                  optionFilterProp="title"
                   options={comboSourceOptions}
                   placeholder="选择货源"
                   popupMatchSelectWidth={false}
@@ -980,7 +1135,7 @@ export function Sourcing1688Panel({ product, onSearch }: Props) {
                     const candidateIndex = capturedCandidates.findIndex((item) => item.id === candidate.id);
                     const displaySkuList = getDisplaySkuList(candidate);
                     const dominantPropName = getDominantSkuPropName(displaySkuList);
-                    const candidateImageUrl = getCandidateImageUrls(candidate)[0];
+                    const candidateImageUrl = getCandidateMainImageUrl(candidate);
 
                     return (
                       <div className="sku-source-group" key={candidate.id}>
@@ -1247,9 +1402,9 @@ export function Sourcing1688Panel({ product, onSearch }: Props) {
                     block
                     className="sku-combo-confirm"
                     type="primary"
-                    onClick={() => message.success(`已确认 ${selectedEntryCount} 个已选项，包含 ${selectedComponentSkuCount} 个 SKU`)}
+                    onClick={recordSelectedSkuLinks}
                   >
-                    确认已选 SKU
+                    录入链接列表
                   </Button>
                 </Space>
               </>
@@ -1565,7 +1720,7 @@ export function Sourcing1688Panel({ product, onSearch }: Props) {
         </div>
       </Modal>
       <Modal
-        destroyOnClose
+        destroyOnHidden
         okButtonProps={{ disabled: comboModalSkuKeys.length < 2 }}
         okText="添加组合"
         open={skuComboModalOpen}
@@ -1580,7 +1735,7 @@ export function Sourcing1688Panel({ product, onSearch }: Props) {
             <div className="sku-combo-modal-add-source">
               <Select
                 className="sku-combo-modal-source-select"
-                optionFilterProp="label"
+                optionFilterProp="title"
                 options={comboModalAvailableSourceOptions}
                 placeholder="选择要添加的货源"
                 value={comboModalSourcePickerId}
@@ -1606,6 +1761,7 @@ export function Sourcing1688Panel({ product, onSearch }: Props) {
                   const sourceSkuKeys = getCandidateSkuKeys(candidate);
                   const selectedSourceSkuCount = sourceSkuKeys.filter((key) => comboModalSkuKeySet.has(key)).length;
                   const active = activeComboModalCandidate?.id === candidate.id;
+                  const candidateImageUrl = getCandidateMainImageUrl(candidate);
 
                   return (
                     <div
@@ -1617,6 +1773,20 @@ export function Sourcing1688Panel({ product, onSearch }: Props) {
                         type="button"
                         onClick={() => setActiveComboModalSourceId(candidate.id)}
                       >
+                        <span className="source-select-thumb sku-combo-modal-source-thumb">
+                          {candidateImageUrl ? (
+                            <Image
+                              alt={candidate.title}
+                              height={34}
+                              preview={false}
+                              referrerPolicy="no-referrer"
+                              src={candidateImageUrl}
+                              width={34}
+                            />
+                          ) : (
+                            <span>1688</span>
+                          )}
+                        </span>
                         <span className="sku-combo-modal-source-name">
                           {`货源 ${candidateIndex + 1} · ${getCandidateLabel(candidate, candidateIndex)}`}
                         </span>
@@ -1638,9 +1808,25 @@ export function Sourcing1688Panel({ product, onSearch }: Props) {
               {activeComboModalCandidate ? (
                 <div className="sku-combo-modal-source">
                   <div className="sku-source-head">
-                    <div>
-                      <Text strong>{getCandidateLabel(activeComboModalCandidate, activeComboModalCandidateIndex)}</Text>
-                      <Text type="secondary"> · {activeComboModalCandidate.title}</Text>
+                    <div className="sku-combo-modal-source-heading">
+                      <span className="source-select-thumb sku-combo-modal-source-heading-thumb">
+                        {getCandidateMainImageUrl(activeComboModalCandidate) ? (
+                          <Image
+                            alt={activeComboModalCandidate.title}
+                            height={44}
+                            preview={false}
+                            referrerPolicy="no-referrer"
+                            src={getCandidateMainImageUrl(activeComboModalCandidate)}
+                            width={44}
+                          />
+                        ) : (
+                          <span>1688</span>
+                        )}
+                      </span>
+                      <div>
+                        <Text strong>{getCandidateLabel(activeComboModalCandidate, activeComboModalCandidateIndex)}</Text>
+                        <Text type="secondary"> · {activeComboModalCandidate.title}</Text>
+                      </div>
                     </div>
                     <Space size={6}>
                       <Tag>SKU {activeComboModalDisplaySkuList.length}</Tag>

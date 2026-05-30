@@ -9,12 +9,35 @@
   <body>
     <main class="popup">
       <h1>1688 货源采集</h1>
-      <p id="status" class="status">请先在工作台抽屉中点击“开始采集”，再打开 1688 商品详情页。</p>
-      <div class="button-row">
+      <p id="status" class="status">打开 1688 商品详情页后，先预抓并加入采集列表，再从列表里选择加入位置。</p>
+      <section class="active-product">
+        <span class="active-product-label">当前监听商品</span>
+        <span id="activeProductText" class="active-product-text">读取中...</span>
+      </section>
+      <div class="button-row button-row-preview">
         <button id="previewButton" class="secondary-button" type="button">预抓当前页</button>
-        <button id="captureButton" type="button">采集到工作台</button>
       </div>
       <section id="preview" class="preview" hidden></section>
+      <section class="action-panel">
+        <h2>当前页动作</h2>
+        <div class="button-row">
+          <button id="addCaptureListButton" type="button">加入采集列表</button>
+        </div>
+      </section>
+      <section class="material-panel">
+        <div class="material-panel-head">
+          <h2>采集列表 <span id="captureListCount" class="panel-count">0</span></h2>
+          <button id="refreshListButton" class="text-button" type="button">刷新</button>
+        </div>
+        <div class="batch-actions">
+          <button id="addSelectedProductButton" type="button">加入选中到商品列表</button>
+          <button id="addSelectedMaterialButton" class="secondary-button" type="button">加入选中为货源素材</button>
+        </div>
+        <button id="clearSelectionButton" class="text-button clear-selection" type="button">清空选择</button>
+        <div id="captureList" class="material-list">
+          <div class="empty">还没有采集商品</div>
+        </div>
+      </section>
     </main>
     <script src="popup.js"></script>
   </body>

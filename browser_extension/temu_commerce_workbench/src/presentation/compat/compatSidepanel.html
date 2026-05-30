@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Temu 商品工作台</title>
+    <link rel="stylesheet" href="./compatSidepanel.css">
+  </head>
+  <body>
+    <main class="compat-shell">
+      <header class="compat-tabs" role="tablist" aria-label="商品工作台功能">
+        <button id="tabT2" class="tab" type="button" role="tab" aria-selected="false" data-panel="panelT2">
+          T2 交集
+        </button>
+        <button id="tab1688" class="tab is-active" type="button" role="tab" aria-selected="true" data-panel="panel1688">
+          1688 核价
+        </button>
+        <button id="tabGpt" class="tab" type="button" role="tab" aria-selected="false" data-panel="panelGpt">
+          GPT 主图
+        </button>
+      </header>
+
+      <section id="panelT2" class="panel" role="tabpanel" aria-labelledby="tabT2">
+        <iframe title="T2 价格表信息表交集处理" src="/src/presentation/t2/t2Intersection.html"></iframe>
+      </section>
+
+      <section id="panel1688" class="panel is-active" role="tabpanel" aria-labelledby="tab1688">
+        <iframe title="1688 商品录入工具" src="/src/legacy/1688/popup.html"></iframe>
+      </section>
+
+      <section id="panelGpt" class="panel" role="tabpanel" aria-labelledby="tabGpt">
+        <iframe title="Temu GPT 主图自动化" src="/src/legacy/gpt/dashboard.html"></iframe>
+      </section>
+    </main>
+
+    <script src="./compatSidepanel.js"></script>
+  </body>
+</html>

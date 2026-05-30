@@ -1,0 +1,8 @@
+{
+  "first_leg_surcharge": 7.5,
+  "first_leg_price_per_kg": 80,
+  "last_leg_fee": 23,
+  "last_leg_subsidy": 21,
+  "after_sales_rate": 0.05,
+  "discount_rate": 1.0
+}

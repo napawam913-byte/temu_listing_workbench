@@ -1,0 +1,35 @@
+﻿{
+  "manifest_version": 3,
+  "name": "1688 商品录入工具",
+  "version": "1.1.0",
+  "description": "抓取 1688 商品价格、重量和图片，并支持从 T2 预览页点击传输商品到计算器。",
+  "permissions": ["activeTab", "downloads", "scripting", "sidePanel", "storage", "tabs"],
+  "host_permissions": ["*://detail.1688.com/*", "*://*.1688.com/*", "<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "1688 商品录入工具"
+  },
+  "side_panel": {
+    "default_path": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://detail.1688.com/*", "*://*.1688.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["file://*/*"],
+      "js": ["preview_bridge.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["popup.html", "popup.css", "popup.js", "calc.js", "storage.js", "excel_writer.js", "config.json"],
+      "matches": ["*://detail.1688.com/*", "*://*.1688.com/*"]
+    }
+  ]
+}

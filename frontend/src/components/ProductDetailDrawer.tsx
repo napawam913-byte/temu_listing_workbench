@@ -1,6 +1,7 @@
 import { Descriptions, Drawer, Image, Space, Tag, Typography } from 'antd';
 import { useEffect, useState } from 'react';
 import { mockCandidates } from '../mock/products';
+import type { LinkListRecord } from '../types/linkList';
 import type { Product, SourcingCandidate } from '../types/product';
 import { Sourcing1688Panel } from './Sourcing1688Panel';
 
@@ -17,6 +18,7 @@ type Props = {
   onOpenCandidateDetail: (candidate: SourcingCandidate) => void;
   onBackToSearch: () => void;
   onSelectCandidate: (product: Product, candidate: SourcingCandidate) => void;
+  onRecordLinkEntry: (record: LinkListRecord) => void;
 };
 
 function DrawerProductImage({ product }: { product: Product }) {
@@ -56,6 +58,7 @@ export function ProductDetailDrawer({
   onOpenCandidateDetail,
   onBackToSearch,
   onSelectCandidate,
+  onRecordLinkEntry,
 }: Props) {
   if (!product) return null;
 
@@ -102,6 +105,7 @@ export function ProductDetailDrawer({
             onOpenDetail={onOpenCandidateDetail}
             onBackToSearch={onBackToSearch}
             onSelectCandidate={(candidate) => onSelectCandidate(product, candidate)}
+            onRecordLinkEntry={onRecordLinkEntry}
           />
         </main>
       </div>

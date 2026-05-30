@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>1688 商品录入工具</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="app-shell compact-shell">
+      <section class="card cache-summary-card">
+        <div class="summary-row">
+          <p id="cacheSummaryText" class="cache-summary-text">未绑定本地 JSON 文件。第一次保存时会让你选择一个 records.json。</p>
+          <button id="bindJsonButton" class="secondary-button" type="button">绑定 JSON</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-header">
+          <h2>商品信息</h2>
+          <button id="refreshPageButton" class="secondary-button" type="button">重新抓取当前页</button>
+        </div>
+
+        <div class="form-grid">
+          <label class="field">
+            <span>NAME</span>
+            <input id="name" type="text" autocomplete="off" />
+          </label>
+          <label class="field">
+            <span>SKC</span>
+            <input id="skc" type="text" autocomplete="off" />
+          </label>
+          <label class="field">
+            <span>核价</span>
+            <input id="quotedPrice" type="number" min="0" step="0.01" autocomplete="off" />
+          </label>
+          <label class="field">
+            <span>单件</span>
+            <input id="unitPrice" type="number" min="0" step="0.01" autocomplete="off" />
+          </label>
+          <label class="field">
+            <span>重量(kg)</span>
+            <input id="weight" type="number" min="0" step="0.001" autocomplete="off" />
+          </label>
+          <label class="field">
+            <span>倍数(件)</span>
+            <input id="quantity" type="number" min="1" step="1" value="1" autocomplete="off" />
+          </label>
+          <label class="field">
+            <span>折扣率(%)</span>
+            <input id="discountRate" type="number" min="0.01" step="0.01" autocomplete="off" />
+          </label>
+          <label class="field full-width">
+            <span>URL</span>
+            <input id="url" type="url" autocomplete="off" />
+          </label>
+        </div>
+      </section>
+
+      <section class="card result-card">
+        <div class="card-header">
+          <h2>核心结果</h2>
+          <button id="calculateButton" class="primary-button" type="button">计算</button>
+        </div>
+
+        <div class="hero-metrics">
+          <article class="metric-tile">
+            <span class="metric-label">实际利润</span>
+            <strong id="actualProfitResult" class="metric-value">-</strong>
+          </article>
+          <article class="metric-tile">
+            <span class="metric-label">利润率</span>
+            <strong id="marginResult" class="metric-value">-</strong>
+          </article>
+          <article class="metric-tile">
+            <span class="metric-label">ROI</span>
+            <strong id="roiResult" class="metric-value">-</strong>
+          </article>
+        </div>
+
+        <div class="detail-grid">
+          <div class="detail-row"><span>实际成交价</span><strong id="actualPriceResult">-</strong></div>
+          <div class="detail-row"><span>头程运费</span><strong id="firstLegFeeResult">-</strong></div>
+          <div class="detail-row"><span>头程成本</span><strong id="firstLegCostResult">-</strong></div>
+          <div class="detail-row"><span>尾程成本(补贴后)</span><strong id="lastLegCostResult">-</strong></div>
+          <div class="detail-row"><span>利润</span><strong id="profitResult">-</strong></div>
+          <div class="detail-row"><span>货损</span><strong id="cargoLossResult">-</strong></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-header">
+          <h2>图片</h2>
+          <div class="button-row">
+            <button id="pasteImageButton" class="primary-button" type="button">粘贴图片</button>
+            <button id="clearImageButton" class="secondary-button" type="button">清空图片</button>
+          </div>
+        </div>
+        <div id="imageDropzone" class="image-dropzone" tabindex="0">
+          <img id="imagePreview" alt="图片预览" hidden />
+          <p id="imagePlaceholder">图片必填。支持直接 Ctrl+V 粘贴，也支持从 T2 预览页自动导入。</p>
+        </div>
+      </section>
+
+      <section class="card action-card">
+        <div class="button-row">
+          <button id="saveButton" class="primary-button wide-button" type="button">保存到 JSON</button>
+          <button id="exportButton" class="primary-button wide-button" type="button">导出 Excel</button>
+          <button id="clearButton" class="secondary-button wide-button" type="button">清空表单</button>
+        </div>
+        <p id="statusText" class="status-text">等待从 T2 预览页导入，或抓取当前 1688 页面单件和重量。</p>
+      </section>
+    </main>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

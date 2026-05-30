@@ -18,15 +18,18 @@ function collect1688Product() {
   const title = pickTitle();
   if (!title) throw new Error("未识别到商品标题");
 
+  const selectedQuantity = findSelectedQuantity();
   const goodsPrice = findGoodsPrice();
   const shippingFee = findShippingFee();
-  const unitPriceWithShipping = computeUnitPrice(goodsPrice, shippingFee);
+  const unitPriceWithShipping = computeUnitPrice(goodsPrice, shippingFee, selectedQuantity);
   const weightKg = findWeight();
   const priceRange = pickPriceRange(goodsPrice);
   const galleryImageUrls = pickGalleryImages();
   const mainImageUrl = galleryImageUrls[0] || null;
   const skuList = enrichSkuImages(pickSkuList(), galleryImageUrls);
   const skuImageCount = skuList.filter((sku) => sku.image_url).length;
+  const categoryParts = pickCategoryParts();
+  const categoryPath = categoryParts.join("/");
 
   return {
     offer_id: pickOfferId(productUrl),
@@ -47,8 +50,11 @@ function collect1688Product() {
       goods_price: toOptionalNumber(goodsPrice),
       shipping_fee: toOptionalNumber(shippingFee),
       unit_price_with_shipping: toOptionalNumber(unitPriceWithShipping),
+      selected_quantity: selectedQuantity,
       weight_kg: toPositiveOptionalNumber(weightKg),
       price_text: pickPriceText(),
+      category_path: categoryPath || null,
+      category_parts: categoryParts,
       gallery_image_urls: galleryImageUrls,
       product_image_count: galleryImageUrls.length,
       sku_text_count: skuList.length,
@@ -154,8 +160,8 @@ function pickPriceText() {
 function pickMoq() {
   const text = document.body.innerText;
   const match =
-    text.match(/(\d+)\s*(?:件|个|只|套)\s*起批/) ||
-    text.match(/起批\s*(\d+)/) ||
+    text.match(/(\d+)\s*(?:件|个|只|套)\s*起(?:批|订|定)/) ||
+    text.match(/起(?:批|订|定)\s*(\d+)/) ||
     text.match(/MOQ\s*[:：]?\s*(\d+)/i);
   return match ? Number(match[1]) : null;
 }
@@ -179,6 +185,93 @@ function pickShopUrl() {
   return link || null;
 }
 
+function pickCategoryParts() {
+  const domParts = pickCategoryPartsFromDom();
+  if (domParts.length > 0) return domParts;
+
+  const scriptParts = pickCategoryPartsFromScript();
+  return scriptParts;
+}
+
+function pickCategoryPartsFromDom() {
+  const selectors = [
+    "[class*='breadcrumb']",
+    "[class*='Breadcrumb']",
+    "[class*='crumb']",
+    "[class*='Crumb']",
+    "[class*='category']",
+    "[class*='Category']",
+  ];
+
+  for (const selector of selectors) {
+    for (const container of document.querySelectorAll(selector)) {
+      const elementParts = Array.from(container.querySelectorAll("a, span, li"))
+        .map((element) => normalizeCategoryText(element.textContent))
+        .filter(isLikelyCategoryPart);
+      const parts = normalizeCategoryParts(
+        elementParts.length >= 2 ? elementParts : splitCategoryText(container.textContent)
+      );
+      if (parts.length >= 2) return parts.slice(0, 5);
+    }
+  }
+
+  return [];
+}
+
+function pickCategoryPartsFromScript() {
+  const scriptText = getInlineContextScriptText();
+  const categoryPath = extractValueByPatterns(scriptText, [
+    /"categoryPath"\s*:\s*"([^"]+)"/,
+    /"catPath"\s*:\s*"([^"]+)"/,
+    /"catePath"\s*:\s*"([^"]+)"/,
+  ]);
+  const pathParts = normalizeCategoryParts(splitCategoryText(categoryPath));
+  if (pathParts.length >= 2) return pathParts.slice(0, 5);
+
+  const categoryNames = Array.from(
+    scriptText.matchAll(/"(?:categoryName|catName|cateName)"\s*:\s*"([^"]+)"/g)
+  )
+    .map((match) => normalizeCategoryText(decodeJsonString(match[1])))
+    .filter(isLikelyCategoryPart);
+  return normalizeCategoryParts(categoryNames).slice(0, 5);
+}
+
+function splitCategoryText(value) {
+  return String(value || "")
+    .split(/\s*(?:>|›|»|\/|\\|｜|\|)\s*/g)
+    .map(normalizeCategoryText);
+}
+
+function normalizeCategoryParts(parts) {
+  const seen = new Set();
+  const normalized = [];
+  for (const part of parts) {
+    const text = normalizeCategoryText(part);
+    if (!isLikelyCategoryPart(text) || seen.has(text)) continue;
+    seen.add(text);
+    normalized.push(text);
+  }
+  return normalized;
+}
+
+function normalizeCategoryText(value) {
+  return cleanText(decodeJsonString(value))
+    .replace(/^[当前位置所在类目分类：:\s]+/g, "")
+    .replace(/\s*批发价格.*$/g, "")
+    .trim();
+}
+
+function isLikelyCategoryPart(value) {
+  const text = cleanText(value);
+  if (!text || text.length < 2 || text.length > 24) return false;
+  if (/^\d+$/.test(text)) return false;
+  if (/[¥￥$]\s*\d/.test(text)) return false;
+  if (/首页|阿里巴巴|1688|商品详情|全部商品|所有分类|找工厂|找供应商|找服务|找代发|工业品|搜索|店铺|旺铺|公司/.test(text)) {
+    return false;
+  }
+  return true;
+}
+
 function pickSkuList() {
   const contextItems = pickSkuListFromContext();
   const strongContextItems = contextItems.filter(isStrongSkuItem);
@@ -186,8 +279,9 @@ function pickSkuList() {
     return mergeSkuItems(strongContextItems).slice(0, 80);
   }
 
-  if (contextItems.length > 0) {
-    return mergeSkuItems(contextItems).slice(0, 80);
+  const weakContextItems = contextItems.filter(hasUsefulSpecValue);
+  if (weakContextItems.length > 0 && hasExplicitSkuChoiceSignal()) {
+    return mergeSkuItems(weakContextItems).slice(0, 80);
   }
 
   const rowItems = pickSkuRowsFromDom();
@@ -196,11 +290,13 @@ function pickSkuList() {
     return mergeSkuItems(strongRowItems).slice(0, 80);
   }
 
-  const textItems = pickFallbackSkuTexts().map((text, index) => ({
+  const fallbackSkuTexts = hasExplicitSkuChoiceSignal() ? pickFallbackSkuTexts() : [];
+  const textItems = fallbackSkuTexts.map((text, index) => ({
     sku_id: `text-${index + 1}`,
     specs: { 规格: text },
   }));
-  return mergeSkuItems(textItems).slice(0, 40);
+  const mergedTextItems = mergeSkuItems(textItems).slice(0, 40);
+  return mergedTextItems.length > 0 ? mergedTextItems : [buildDefaultQuantitySku()];
 }
 
 function enrichSkuImages(skuList, galleryImageUrls) {
@@ -452,7 +548,7 @@ function extractSkuSpecFromRow(row, rowText) {
 
 function pickFallbackSkuTexts() {
   const containers = Array.from(
-    document.querySelectorAll("[class*='sku'], [class*='Sku'], [class*='prop'], [class*='spec']")
+    document.querySelectorAll("[class*='sku'], [class*='Sku']")
   );
   const visibleTexts = containers
     .flatMap((container) => Array.from(container.querySelectorAll("button, li, span, div")))
@@ -465,6 +561,40 @@ function pickFallbackSkuTexts() {
     .filter(isUsefulSkuText);
 
   return Array.from(new Set([...visibleTexts, ...contextTexts]));
+}
+
+function buildDefaultQuantitySku() {
+  const quantity = findSelectedQuantity() || pickMoq();
+  return cleanSkuItem({
+    sku_id: "quantity-default",
+    specs: { 规格: quantity ? `默认款（${quantity}件起订）` : "默认款" },
+  });
+}
+
+function hasUsefulSpecValue(item) {
+  const values = Object.values(item?.specs || {});
+  return values.length > 0 && values.some(isUsefulSkuText);
+}
+
+function hasExplicitSkuChoiceSignal() {
+  const selectors = [
+    "#skuSelection .expand-view-item",
+    ".module-od-sku-selection .expand-view-item",
+    "[class*='sku'] [data-sku-id]",
+    "[class*='Sku'] [data-sku-id]",
+    "[class*='sku'] button",
+    "[class*='Sku'] button",
+    "[class*='sku'] li",
+    "[class*='Sku'] li",
+  ];
+
+  return selectors.some((selector) =>
+    Array.from(document.querySelectorAll(selector)).some((element) => {
+      const text = cleanText(element.innerText || element.textContent);
+      if (!text && !pickImageFromElement(element)) return false;
+      return isUsefulSkuText(text) || Boolean(pickImageFromElement(element));
+    })
+  );
 }
 
 function collectSkuPropMeta(skuProps) {
@@ -744,10 +874,24 @@ function isStrongSkuItem(item) {
 
 function isUsefulSkuText(text) {
   if (!text || text.length > 50) return false;
+  if (isProductAttributeText(text)) return false;
   if (/价格|库存|起批|采购|数量|加入进货单|立即订购|order now|add cart|inventory\d*item|已选|selected/i.test(text)) return false;
   if (/^[¥￥]?\d+(?:\.\d+)?$/.test(text)) return false;
   if (/^[+\-−]$/.test(text)) return false;
   return true;
+}
+
+function isProductAttributeText(text) {
+  const normalized = cleanText(text).replace(/^规格\s*[:：]\s*/, "");
+  if (!normalized) return true;
+  if (/^TEMPLATED$/i.test(normalized)) return true;
+  if (/^(材质|品牌|产品编号|货号|型号|产地|加工定制|是否进口|类别|分类|钥匙配饰分类|包装|用途|风格)$/.test(normalized)) {
+    return true;
+  }
+  if (/^(材质|品牌|产品编号|货号|型号|产地|类别|分类|钥匙配饰分类)\s*[:：]/.test(normalized)) {
+    return true;
+  }
+  return false;
 }
 
 function isLikelyPropName(text) {
@@ -953,9 +1097,10 @@ function normalizeWeightNumber(value) {
 }
 
 function findGoodsPrice() {
+  const unitPriceFromText = findUnitPriceFromPageText();
+  if (unitPriceFromText) return unitPriceFromText;
+
   const priceText = getFirstVisibleText([
-    "#submitOrder .total-price strong",
-    ".module-od-submit-order .total-price strong",
     "#skuSelection .expand-view-item .item-price-stock",
     ".module-od-sku-selection .expand-view-item .item-price-stock",
     "#mainPrice .price-info:last-child",
@@ -963,13 +1108,31 @@ function findGoodsPrice() {
   ]);
   if (priceText) return parseMoney(priceText);
 
+  const totalPriceText = getFirstVisibleText([
+    "#submitOrder .total-price strong",
+    ".module-od-submit-order .total-price strong",
+  ]);
+  const quantity = findSelectedQuantity();
+  const totalPrice = toOptionalNumber(parseMoney(totalPriceText));
+  if (totalPrice !== null && quantity > 1) return (totalPrice / quantity).toFixed(2);
+  if (totalPrice !== null) return String(totalPrice);
+
   const scriptText = getInlineContextScriptText();
   return extractValueByPatterns(scriptText, [
+    /"minPrice"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)"?/,
+    /"priceDisplay"\s*:\s*"([0-9]+(?:\.[0-9]+)?)(?:-[0-9]+(?:\.[0-9]+)?)?"/,
     /"maxPrice"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)"?/,
-    /"priceDisplay"\s*:\s*"[0-9]+(?:\.[0-9]+)?-([0-9]+(?:\.[0-9]+)?)"/,
     /"discountPrice"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)"?/,
     /"price"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)"?/,
   ]);
+}
+
+function findUnitPriceFromPageText() {
+  const pageText = normalizeWhitespace(document.body.innerText || "").replace(/,/g, "");
+  const match =
+    pageText.match(/单价\s*[:：]?\s*[¥￥]?\s*([0-9]+(?:\.[0-9]+)?)/) ||
+    pageText.match(/价格\s*[¥￥]\s*([0-9]+(?:\.[0-9]+)?)/);
+  return match?.[1] || "";
 }
 
 function findShippingFee() {
@@ -1023,11 +1186,32 @@ function findWeight() {
   return "";
 }
 
-function computeUnitPrice(goodsPrice, shippingFee) {
+function findSelectedQuantity() {
+  const inputText = getFirstVisibleText([
+    "#submitOrder input[type='number']",
+    ".module-od-submit-order input[type='number']",
+    "input[aria-label*='数量']",
+  ]);
+  const inputQuantity = toOptionalNumber(inputText);
+  if (inputQuantity !== null && inputQuantity > 0) return inputQuantity;
+
+  const text = normalizeWhitespace(document.body.innerText || "").replace(/,/g, "");
+  const match =
+    text.match(/已选\s*(\d+)\s*(?:件|个|只|套)/) ||
+    text.match(/数量\s*[:：]?\s*(\d+)/) ||
+    text.match(/(\d+)\s*(?:件|个|只|套)\s*起(?:批|订|定)/) ||
+    text.match(/起(?:批|订|定)\s*(\d+)/);
+  const quantity = match ? Number(match[1]) : null;
+  return Number.isFinite(quantity) && quantity > 0 ? quantity : null;
+}
+
+function computeUnitPrice(goodsPrice, shippingFee, selectedQuantity = null) {
   const goods = Number(goodsPrice || 0);
   const shipping = Number(shippingFee || 0);
   if (goods <= 0) return "";
-  return (goods + shipping).toFixed(2);
+  const quantity = Number(selectedQuantity || 0);
+  const unitShipping = quantity > 1 ? shipping / quantity : shipping;
+  return (goods + unitShipping).toFixed(2);
 }
 
 function getFirstVisibleText(selectors) {
@@ -1053,7 +1237,10 @@ function getInlineContextScriptText() {
       text.includes("window.context=") ||
       text.includes('"tradeModel"') ||
       text.includes('"unitWeight"') ||
-      text.includes('"sku"')
+      text.includes('"sku"') ||
+      text.includes("categoryPath") ||
+      text.includes("cateName") ||
+      text.includes("catName")
     ) {
       matches.push(text);
     }
