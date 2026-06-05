@@ -2,8 +2,13 @@ import os
 from pathlib import Path
 
 
-BACKEND_DIR = Path(__file__).resolve().parents[2]
-PROJECT_ROOT = BACKEND_DIR.parent
+def _resolve_path_env(name: str) -> Path | None:
+    value = os.getenv(name, "").strip()
+    return Path(value).expanduser().resolve() if value else None
+
+
+BACKEND_DIR = _resolve_path_env("TEMU_WORKBENCH_BACKEND_DIR") or Path(__file__).resolve().parents[2]
+PROJECT_ROOT = _resolve_path_env("TEMU_WORKBENCH_PROJECT_ROOT") or BACKEND_DIR.parent
 
 
 def load_local_env() -> None:
@@ -25,7 +30,16 @@ def load_local_env() -> None:
 load_local_env()
 
 DATA_DIR = BACKEND_DIR / "data"
-DATABASE_PATH = DATA_DIR / "app.db"
+
+
+def resolve_database_path() -> Path:
+    configured_path = os.getenv("TEMU_WORKBENCH_DATABASE_PATH") or os.getenv("DATABASE_PATH")
+    if configured_path:
+        return Path(configured_path).expanduser()
+    return DATA_DIR / "app.db"
+
+
+DATABASE_PATH = resolve_database_path()
 
 STORAGE_DIR = PROJECT_ROOT / "storage"
 UPLOADS_DIR = STORAGE_DIR / "uploads"
@@ -47,7 +61,10 @@ OPENAI_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-4.1-mini").strip()
 OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1").strip()
 OPENAI_IMAGE_QUALITY = os.getenv("OPENAI_IMAGE_QUALITY", "medium").strip()
 
+TMAPI_API_TOKEN = os.getenv("TMAPI_API_TOKEN", "").strip()
+TMAPI_BASE_URL = os.getenv("TMAPI_BASE_URL", "http://api.tmapi.top").strip().rstrip("/")
+
 
 def ensure_runtime_dirs() -> None:
-    for path in (DATA_DIR, UPLOADS_DIR, EXPORTS_DIR, TEMPLATES_DIR):
+    for path in (DATA_DIR, DATABASE_PATH.parent, UPLOADS_DIR, EXPORTS_DIR, TEMPLATES_DIR):
         path.mkdir(parents=True, exist_ok=True)

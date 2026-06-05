@@ -151,6 +151,13 @@ button:disabled {
   margin: 0 0 8px;
 }
 
+.panel-hint {
+  color: #64748b;
+  font-size: 12px;
+  line-height: 18px;
+  margin: 0 0 10px;
+}
+
 .action-row {
   grid-template-columns: 1fr;
 }

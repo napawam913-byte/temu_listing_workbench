@@ -1,19 +1,27 @@
-import { Button, Card, Checkbox, Empty, Image, Input, Modal, Select, Space, Tabs, Tag, Typography, message } from 'antd';
+import { BulbOutlined, EyeOutlined } from '@ant-design/icons';
+import { Button, Card, Checkbox, Empty, Image, Input, Modal, Select, Skeleton, Space, Tabs, Tag, Typography, message } from 'antd';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   API_BASE_URL,
   deleteCaptured1688Candidate,
   fetchCaptured1688Candidates,
+  fetchSmart1688Keywords,
+  fetchSmart1688Recommendations,
   setActive1688CaptureSession,
 } from '../api/backendApi';
-import type { Captured1688Candidate, Captured1688Sku } from '../api/backendApi';
-import type { LinkListRecord, LinkListSource } from '../types/linkList';
+import type {
+  Captured1688Candidate,
+  Captured1688Sku,
+  Smart1688Keyword,
+  Smart1688Recommendation,
+} from '../api/backendApi';
+import type { LinkListImageAsset, LinkListImageSlot, LinkListRecord, LinkListSource } from '../types/linkList';
 import type { Product, SourcingCandidate } from '../types/product';
 
 const { Text } = Typography;
 const DEFAULT_IMAGE_PROVIDER = 'chatgpt';
 const DEFAULT_STYLE_PROMPT =
-  '以商品主图为参考，统一光线、背景、色温、质感和构图；保留 SKU 的真实款式、颜色、数量和关键细节，生成干净一致的电商商品图。';
+  '先分析，再执行。先分析商品品类、主体组件、SKU/组合售卖内容、可复用画风和禁用元素；再统一光线、背景、色温、质感和构图。保留 SKU 的真实款式、颜色、数量和关键细节，组合 SKU 必须把购买会收到的所有组件同框展示，生成干净一致的 Temu 电商商品图。';
 
 type Props = {
   product: Product;
@@ -57,7 +65,7 @@ type FinalSkuEntry = {
   weight?: number;
 };
 
-type PanelTab = 'search' | 'combo' | 'preview';
+type PanelTab = 'search' | 'recommend' | 'combo' | 'preview';
 
 function buildKeyword(product: Product) {
   return (product.title || product.titleEn || '')
@@ -231,6 +239,257 @@ function getCandidateLabel(candidate: Captured1688Candidate, candidateIndex: num
 
 function getSkuCombinationDisplayName(items: SkuCombinationItem[]) {
   return items.map((item) => item.optionText || item.specText).join('+');
+}
+
+function Smart1688KeywordRecommendations({ product }: { product: Product }) {
+  const [keywordLoading, setKeywordLoading] = useState(false);
+  const [recommendLoading, setRecommendLoading] = useState(false);
+  const [summary, setSummary] = useState('');
+  const [strategy, setStrategy] = useState('');
+  const [keywords, setKeywords] = useState<Smart1688Keyword[]>([]);
+  const [selectedKeywords, setSelectedKeywords] = useState<string[]>([]);
+  const [customKeyword, setCustomKeyword] = useState('');
+  const [items, setItems] = useState<Smart1688Recommendation[]>([]);
+  const [previewItem, setPreviewItem] = useState<Smart1688Recommendation | null>(null);
+
+  useEffect(() => {
+    setSummary('');
+    setStrategy('');
+    setKeywords([]);
+    setSelectedKeywords([]);
+    setCustomKeyword('');
+    setItems([]);
+    setPreviewItem(null);
+  }, [product.id]);
+
+  const analyzeKeywords = async () => {
+    setKeywordLoading(true);
+    setItems([]);
+    try {
+      const result = await fetchSmart1688Keywords(product);
+      setSummary(result.summary);
+      setStrategy(result.strategy);
+      setKeywords(result.keywords);
+      setSelectedKeywords(result.keywords.map((item) => item.keyword));
+      if (result.keywords.length === 0) {
+        message.info('暂时没有分析出可用关键词');
+      }
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '关键词分析失败');
+    } finally {
+      setKeywordLoading(false);
+    }
+  };
+
+  const addCustomKeyword = () => {
+    const keyword = customKeyword.trim();
+    if (!keyword) return;
+    if (keywords.some((item) => item.keyword === keyword)) {
+      setSelectedKeywords((current) => (current.includes(keyword) ? current : [...current, keyword]));
+      setCustomKeyword('');
+      return;
+    }
+    const nextKeyword: Smart1688Keyword = {
+      keyword,
+      intent: '人工补充关键词',
+      reason: '由你手动添加后用于本地商品列表推荐。',
+    };
+    setKeywords((current) => [...current, nextKeyword]);
+    setSelectedKeywords((current) => [...current, keyword]);
+    setCustomKeyword('');
+  };
+
+  const toggleKeyword = (keyword: string, checked: boolean) => {
+    setSelectedKeywords((current) => {
+      if (checked) return current.includes(keyword) ? current : [...current, keyword];
+      return current.filter((item) => item !== keyword);
+    });
+  };
+
+  const loadRecommendations = async () => {
+    const selectedKeywordObjects = keywords.filter((item) => selectedKeywords.includes(item.keyword));
+    if (selectedKeywordObjects.length === 0) {
+      message.warning('请先选择至少 1 个关键词');
+      return;
+    }
+
+    setRecommendLoading(true);
+    try {
+      const result = await fetchSmart1688Recommendations(product, 12, selectedKeywordObjects);
+      setStrategy(result.strategy || strategy);
+      setKeywords(result.keywords);
+      setSelectedKeywords(result.keywords.map((item) => item.keyword).filter((keyword) => selectedKeywords.includes(keyword)));
+      setItems(result.items);
+      if (result.items.length === 0) {
+        message.info('本地商品列表暂时没有匹配到推荐商品');
+      }
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '本地商品推荐失败');
+    } finally {
+      setRecommendLoading(false);
+    }
+  };
+
+  const previewRecommendationImage = (item: Smart1688Recommendation) => {
+    if (!item.main_image_url) {
+      message.warning('这个推荐商品没有主图，不能预览');
+      return;
+    }
+    setPreviewItem(item);
+  };
+
+  return (
+    <section className="smart-recommend-panel smart-recommend-panel-wide">
+      <div className="smart-recommend-head">
+        <div>
+          <Space size={6}>
+            <BulbOutlined />
+            <Text strong>智能推荐</Text>
+          </Space>
+          <Text className="smart-recommend-subtitle" type="secondary">
+            先筛选 GPT 分析关键词，再从你的本地商品列表中回显可参考商品
+          </Text>
+        </div>
+        <Space>
+          <Button icon={<BulbOutlined />} loading={keywordLoading} onClick={analyzeKeywords}>
+            {keywords.length > 0 ? '重新分析' : '分析关键词'}
+          </Button>
+          <Button
+            disabled={keywords.length === 0}
+            loading={recommendLoading}
+            type="primary"
+            onClick={loadRecommendations}
+          >
+            推荐商品
+          </Button>
+        </Space>
+      </div>
+
+      {summary || strategy ? (
+        <Text className="smart-recommend-summary" type="secondary">
+          {strategy || summary}
+        </Text>
+      ) : null}
+
+      {keywords.length > 0 ? (
+        <div className="smart-keyword-section">
+          <div className="smart-keyword-toolbar">
+            <Text strong>关键词筛选</Text>
+            <Text type="secondary">已选 {selectedKeywords.length} 个</Text>
+          </div>
+          <div className="smart-keyword-grid">
+            {keywords.map((item) => {
+              const checked = selectedKeywords.includes(item.keyword);
+              const searchUrl =
+                item.searchUrl ||
+                `https://s.1688.com/selloffer/offer_search.htm?keywords=${encodeURIComponent(item.keyword)}`;
+              return (
+                <label className={`smart-keyword-card ${checked ? 'smart-keyword-card-active' : ''}`} key={item.keyword}>
+                  <Checkbox checked={checked} onChange={(event) => toggleKeyword(item.keyword, event.target.checked)} />
+                  <span>
+                    <strong>{item.keyword}</strong>
+                    <em>{item.reason || item.intent}</em>
+                    <a
+                      className="smart-keyword-search"
+                      href={searchUrl}
+                      rel="noopener noreferrer"
+                      target="_blank"
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      搜1688
+                    </a>
+                  </span>
+                </label>
+              );
+            })}
+          </div>
+          <div className="smart-keyword-custom">
+            <Input
+              placeholder="手动补充关键词，例如：圆形药片盒"
+              value={customKeyword}
+              onChange={(event) => setCustomKeyword(event.target.value)}
+              onPressEnter={addCustomKeyword}
+            />
+            <Button onClick={addCustomKeyword}>添加关键词</Button>
+          </div>
+        </div>
+      ) : (
+        <Empty
+          className="sourcing-empty"
+          image={Empty.PRESENTED_IMAGE_SIMPLE}
+          description="先点击分析关键词，确认搜索方向后再推荐商品"
+        >
+          <Button type="primary" loading={keywordLoading} onClick={analyzeKeywords}>
+            分析关键词
+          </Button>
+        </Empty>
+      )}
+
+      {recommendLoading ? (
+        <Skeleton active paragraph={{ rows: 4 }} title={false} />
+      ) : items.length > 0 ? (
+        <div className="smart-recommend-list">
+          {items.map((item) => (
+            <button
+              className="smart-recommend-card"
+              key={item.id}
+              type="button"
+              onClick={() => previewRecommendationImage(item)}
+              title={`点击预览主图：${item.reason}`}
+            >
+              <div className="smart-recommend-image">
+                {item.main_image_url ? (
+                  <Image
+                    alt={item.title}
+                    height={54}
+                    preview={false}
+                    referrerPolicy="no-referrer"
+                    src={item.main_image_url}
+                    width={54}
+                  />
+                ) : (
+                  <span>商品</span>
+                )}
+              </div>
+              <div className="smart-recommend-content">
+                <div className="smart-recommend-title">{item.title}</div>
+                <div className="smart-recommend-meta">
+                  <Tag color="blue">图片预览</Tag>
+                  <span>{item.keyword}</span>
+                  {item.price ? <span>¥{Number(item.price).toFixed(2)}</span> : null}
+                  {item.shop_name ? <span>{item.shop_name}</span> : null}
+                </div>
+              </div>
+              <EyeOutlined className="smart-recommend-link-icon" />
+            </button>
+          ))}
+        </div>
+      ) : keywords.length > 0 ? (
+        <Empty
+          className="sourcing-empty"
+          image={Empty.PRESENTED_IMAGE_SIMPLE}
+          description="点击推荐商品后，这里会回显本地商品列表中的匹配商品"
+        />
+      ) : null}
+
+      {previewItem?.main_image_url ? (
+        <Image
+          alt={previewItem.title}
+          preview={{
+            visible: true,
+            src: previewItem.main_image_url,
+            onVisibleChange: (visible) => {
+              if (!visible) setPreviewItem(null);
+            },
+          }}
+          referrerPolicy="no-referrer"
+          src={previewItem.main_image_url}
+          style={{ display: 'none' }}
+        />
+      ) : null}
+
+    </section>
+  );
 }
 
 export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Props) {
@@ -664,6 +923,12 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
     setPreviewActiveEntryId(finalSkuEntries[0].id);
   }, [finalSkuEntries, previewActiveEntryId, tab]);
 
+  useEffect(() => {
+    if (tab === 'preview') {
+      setTab(selectedEntryCount > 0 ? 'combo' : 'search');
+    }
+  }, [selectedEntryCount, tab]);
+
   const startCapture = async () => {
     await bindCaptureSession({ showMessage: true });
     void loadCapturedCandidates();
@@ -859,9 +1124,34 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
       sourceLinks.map((source) => source.imageUrl).find(Boolean);
     const mainImageAssetId = `${recordId}-main-image`;
     const styleProfileId = `${recordId}-style-profile`;
+    const productMaterialImageAssets: LinkListImageAsset[] = productMaterialImageUrls.map((imageUrl, index) => ({
+      id: `${recordId}-material-image-${index + 1}`,
+      role: 'product-material',
+      sourceUrl: imageUrl,
+      displayUrl: imageUrl,
+      alt: `${product.title} material image ${index + 1}`,
+    }));
+    const carouselAssets = [
+      { id: mainImageAssetId },
+      ...productMaterialImageAssets.map((asset) => ({ id: asset.id })),
+    ].slice(0, 10);
+    const imageSlots: LinkListImageSlot[] = [
+      {
+        id: `${recordId}-slot-main`,
+        type: 'main',
+        order: 0,
+        assetId: mainImageAssetId,
+      },
+      ...carouselAssets.map((asset, index) => ({
+        id: `${recordId}-slot-carousel-${index + 1}`,
+        type: 'carousel' as const,
+        order: index + 1,
+        assetId: asset.id,
+      })),
+    ];
 
     onRecordLinkEntry({
-      schemaVersion: 2,
+      schemaVersion: 3,
       id: recordId,
       createdAt,
       productId: product.id,
@@ -881,6 +1171,7 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
         displayUrl: imageUrl,
         alt: `${product.title} 素材图 ${index + 1}`,
       })),
+      imageSlots,
       styleProfile: {
         id: styleProfileId,
         name: '统一 SKU 商品图风格',
@@ -894,6 +1185,13 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
       skuEntries: finalSkuEntries.map((entry, index) => {
         const entryImageUrl = entry.imageUrl || entry.items.map((item) => item.imageUrl).find(Boolean);
         const imageAssetId = `${recordId}-sku-image-${index + 1}`;
+        const componentSummary = entry.items
+          .map((item) => `${item.optionText || item.specText}（${getCandidateLabel(item.candidate, item.candidateIndex)}）`)
+          .join(' + ');
+        const skuPrompt =
+          entry.kind === 'combo'
+            ? `先分析，再执行。先分析销售 SKU「${entry.name}」的组合关系和所有组件：${componentSummary}。执行时必须把这些组件放在同一张 SKU 图中，主体清楚、不遮挡、不融合成错误商品，并与商品 8 张主图保持统一画风。`
+            : `先分析，再执行。先分析销售 SKU「${entry.name}」的真实规格、颜色、数量和细节：${componentSummary}。执行时生成与商品 8 张主图一致的电商 SKU 图，保留 SKU 可识别特征。`;
         return {
           id: entry.id,
           order: index + 1,
@@ -912,7 +1210,7 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
             mode: 'image-to-image',
             status: 'draft',
             inputImageUrl: entryImageUrl,
-            prompt: `将销售 SKU「${entry.name}」处理成与商品主图一致的电商图风格，保留 SKU 真实规格和可识别细节。`,
+            prompt: skuPrompt,
             stylePrompt: DEFAULT_STYLE_PROMPT,
             referenceMainImageAssetId: mainImageAssetId,
             targetSkuEntryId: entry.id,
@@ -983,6 +1281,7 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
         activeKey={tab}
         items={[
           { key: 'search', label: '1688 采集' },
+          { key: 'recommend', label: '智能推荐' },
           {
             key: 'combo',
             label: selectedEntryCount > 0 ? `SKU 选择 (${selectedEntryCount})` : 'SKU 选择',
@@ -993,7 +1292,7 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
             label: '商品预览',
             disabled: selectedEntryCount === 0,
           },
-        ]}
+        ].filter((item) => item.key !== 'preview')}
         onChange={(key) => setTab(key as PanelTab)}
       />
 
@@ -1098,6 +1397,8 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
             </>
           )}
         </div>
+      ) : tab === 'recommend' ? (
+        <Smart1688KeywordRecommendations product={product} />
       ) : tab === 'combo' ? (
         <div className="sku-combo-page">
           <Card

@@ -24,8 +24,9 @@ DEFAULT_WIDTH_CM = 10
 DEFAULT_HEIGHT_CM = 5
 DEFAULT_WEIGHT_G = 200
 DEFAULT_PRICE = 200
+DEFAULT_DECLARED_PRICE = 300
 DEFAULT_STOCK = 0
-DEFAULT_DELIVERY_DAYS = 16
+DEFAULT_DELIVERY_DAYS = ""
 MAX_CAROUSEL_IMAGE_COUNT = 10
 MAX_PRODUCT_MATERIAL_IMAGE_COUNT = 1
 
@@ -232,15 +233,16 @@ def build_rows_for_record(record: dict[str, Any], export_mode: str = EXPORT_MODE
     product_id = clean_text(record.get("productId")) or uuid.uuid4().hex[:10]
     raw_main_image_url = pick_record_main_image(record, export_mode)
     main_image_url = mirror_image_url(raw_main_image_url, product_id, "main", 1)
-    material_image_urls = unique_strings([
+    material_image_urls = unique_http_urls([
         mirror_image_url(image_url, product_id, "material", index)
         for index, image_url in enumerate(pick_product_material_images(record, export_mode, raw_main_image_url), start=1)
     ])
     source_url = pick_record_source_url(record)
     variant_count = len(sku_entries)
-    carousel_images = "\n".join(material_image_urls[:MAX_CAROUSEL_IMAGE_COUNT])
+    carousel_image_urls = material_image_urls[:MAX_CAROUSEL_IMAGE_COUNT]
+    carousel_images = "\n".join(carousel_image_urls)
     product_material_images = "\n".join(material_image_urls[:MAX_PRODUCT_MATERIAL_IMAGE_COUNT])
-    description = build_description_from_images(material_image_urls)
+    description = build_description_from_images(carousel_image_urls)
 
     rows: list[list[Any]] = []
     for index, sku_entry in enumerate(sku_entries, start=1):
@@ -263,8 +265,8 @@ def build_rows_for_record(record: dict[str, Any], export_mode: str = EXPORT_MODE
                 variant_two[0],  # G 变种属性名称二
                 variant_two[1],  # H 变种属性值二
                 sku_image_url,  # I 预览图
-                price,  # J *申报价格
-                build_sku_code(product_id, index, sku_entry),  # K SKU货号
+                DEFAULT_DECLARED_PRICE,  # J *申报价格
+                "",  # K SKU货号
                 DEFAULT_LENGTH_CM,  # L *长（cm）
                 DEFAULT_WIDTH_CM,  # M *宽（cm）
                 DEFAULT_HEIGHT_CM,  # N *高（cm）
@@ -355,10 +357,13 @@ def derive_variant_pairs(sku_entry: dict[str, Any], fallback_value: str) -> list
     add_variant_candidates_from_text(candidates, sku_entry.get("name"))
 
     merged: dict[str, list[str]] = {}
+    has_named_candidates = any(clean_text(raw_name) for raw_name, _raw_value in candidates)
     for raw_name, raw_value in candidates:
         name = normalize_variant_name(raw_name, raw_value)
         value = clean_text(raw_value)
         if not value:
+            continue
+        if has_named_candidates and not clean_text(raw_name) and name == "型号":
             continue
         merged.setdefault(name, [])
         if value not in merged[name]:
@@ -445,6 +450,10 @@ def normalize_export_mode(export_mode: str) -> str:
 
 
 def pick_record_main_image(record: dict[str, Any], export_mode: str = EXPORT_MODE_CURATED) -> str:
+    slot_main_image = first_non_empty(*pick_slot_image_urls(record, "main", export_mode))
+    if slot_main_image:
+        return slot_main_image
+
     if export_mode == EXPORT_MODE_DISTRIBUTION:
         return pick_original_record_main_image(record)
 
@@ -476,6 +485,10 @@ def pick_original_record_main_image(record: dict[str, Any]) -> str:
 
 
 def pick_product_material_images(record: dict[str, Any], export_mode: str, main_image_url: str) -> list[str]:
+    slot_image_urls = pick_slot_image_urls(record, "carousel", export_mode)
+    if slot_image_urls:
+        return slot_image_urls[:MAX_CAROUSEL_IMAGE_COUNT]
+
     image_assets = [asset for asset in record.get("productMaterialImages") or [] if isinstance(asset, dict)]
     if export_mode == EXPORT_MODE_DISTRIBUTION:
         return unique_strings(
@@ -489,16 +502,118 @@ def pick_product_material_images(record: dict[str, Any], export_mode: str, main_
     return unique_strings([*(pick_asset_curated_url(asset) for asset in image_assets), main_image_url])
 
 
+def pick_slot_image_urls(record: dict[str, Any], slot_type: str, export_mode: str) -> list[str]:
+    image_slots = [slot for slot in record.get("imageSlots") or [] if isinstance(slot, dict)]
+    if not image_slots:
+        return []
+
+    asset_map = build_record_asset_map(record)
+    image_urls: list[str] = []
+    for slot in sorted(image_slots, key=lambda item: positive_number(item.get("order")) or 0):
+        if slot.get("type") != slot_type:
+            continue
+        asset = asset_map.get(clean_text(slot.get("assetId"))) or {}
+        image_url = (
+            pick_asset_original_url(asset)
+            if export_mode == EXPORT_MODE_DISTRIBUTION
+            else pick_asset_curated_url(asset)
+        )
+        image_urls.append(first_non_empty(image_url, slot.get("imageUrl"), slot.get("url")))
+    return unique_strings(image_urls)
+
+
+def build_record_asset_map(record: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    asset_map: dict[str, dict[str, Any]] = {}
+
+    def add_asset(asset: Any) -> None:
+        if not isinstance(asset, dict):
+            return
+        asset_id = clean_text(asset.get("id"))
+        if asset_id:
+            asset_map[asset_id] = asset
+
+    add_asset(record.get("mainImage"))
+    for asset in record.get("productMaterialImages") or []:
+        add_asset(asset)
+
+    for index, source in enumerate(record.get("sourceLinks") or [], start=1):
+        if not isinstance(source, dict):
+            continue
+        source_image_url = clean_text(source.get("imageUrl"))
+        if source_image_url:
+            source_id = clean_text(source.get("id")) or str(index)
+            add_asset(
+                {
+                    "id": f"{record.get('id')}-source-image-{source_id}",
+                    "role": "product-material",
+                    "sourceUrl": source_image_url,
+                    "displayUrl": source_image_url,
+                }
+            )
+
+    for sku_entry in record.get("skuEntries") or []:
+        if not isinstance(sku_entry, dict):
+            continue
+        add_asset(sku_entry.get("imageAsset"))
+        sku_image_url = clean_text(sku_entry.get("imageUrl"))
+        sku_entry_id = clean_text(sku_entry.get("id"))
+        if sku_image_url and sku_entry_id:
+            add_asset(
+                {
+                    "id": f"{record.get('id')}-sku-url-{sku_entry_id}",
+                    "role": "sales-sku",
+                    "sourceUrl": sku_image_url,
+                    "displayUrl": sku_image_url,
+                }
+            )
+
+    for job in record.get("creativeJobs") or []:
+        if not isinstance(job, dict):
+            continue
+        result_image_url = clean_text(job.get("resultImageUrl"))
+        job_id = clean_text(job.get("id"))
+        if result_image_url and job_id:
+            add_asset(
+                {
+                    "id": f"{record.get('id')}-creative-job-{job_id}",
+                    "role": "sales-sku" if job.get("targetSkuEntryId") else "product-material",
+                    "editedUrl": result_image_url,
+                    "editedCloudUrl": result_image_url,
+                }
+            )
+
+    return asset_map
+
+
 def build_description_from_images(image_urls: list[str]) -> str:
-    return "\n".join(f'<p><img src="{image_url}" /></p>' for image_url in unique_strings(image_urls))
+    return "\n".join(unique_http_urls(image_urls))
 
 
 def pick_sku_image(sku_entry: dict[str, Any], export_mode: str = EXPORT_MODE_CURATED) -> str:
     image_asset = sku_entry.get("imageAsset") or {}
     if export_mode == EXPORT_MODE_DISTRIBUTION:
-        return first_non_empty(pick_asset_original_url(image_asset), sku_entry.get("imageUrl"))
+        return first_non_empty(
+            pick_asset_original_url(image_asset),
+            sku_entry.get("imageUrl"),
+            *pick_sku_link_images(sku_entry),
+        )
 
-    return first_non_empty(pick_asset_curated_url(image_asset), sku_entry.get("imageUrl"))
+    return first_non_empty(
+        pick_asset_curated_url(image_asset),
+        sku_entry.get("imageUrl"),
+        *pick_sku_link_images(sku_entry),
+    )
+
+
+def pick_sku_link_images(sku_entry: dict[str, Any]) -> list[str]:
+    candidates: list[str] = []
+    for source_sku in sku_entry.get("sourceSkuLinks") or []:
+        if isinstance(source_sku, dict):
+            candidates.append(source_sku.get("imageUrl"))
+    for component in sku_entry.get("componentSkus") or []:
+        if isinstance(component, dict):
+            candidates.extend([component.get("imageUrl"), component.get("sourceImageUrl")])
+    return candidates
 
 
 def pick_asset_original_url(image_asset: dict[str, Any]) -> str:
@@ -590,6 +705,14 @@ def unique_strings(values: list[str]) -> list[str]:
         seen.add(text)
         result.append(text)
     return result
+
+
+def unique_http_urls(values: list[str]) -> list[str]:
+    return [value for value in unique_strings(values) if is_http_url(value)]
+
+
+def is_http_url(value: Any) -> bool:
+    return clean_text(value).lower().startswith(("http://", "https://"))
 
 
 def clone_row_style(worksheet: Any, template_row: int, target_row: int) -> None:

@@ -1,4 +1,4 @@
-import { Descriptions, Drawer, Image, Space, Tag, Typography } from 'antd';
+import { Button, Descriptions, Drawer, Image, Space, Tag, Typography } from 'antd';
 import { useEffect, useState } from 'react';
 import { mockCandidates } from '../mock/products';
 import type { LinkListRecord } from '../types/linkList';
@@ -10,6 +10,7 @@ const { Title, Text } = Typography;
 type Props = {
   open: boolean;
   product?: Product;
+  mode?: 'sourcing' | 'sales';
   searched: boolean;
   activeCandidate?: SourcingCandidate;
   activeTab: 'search' | 'detail';
@@ -20,6 +21,18 @@ type Props = {
   onSelectCandidate: (product: Product, candidate: SourcingCandidate) => void;
   onRecordLinkEntry: (record: LinkListRecord) => void;
 };
+
+function formatMoney(value: number) {
+  return Number.isFinite(value) ? `¥${value.toFixed(2)}` : '-';
+}
+
+function formatUsd(value: number) {
+  return Number.isFinite(value) ? `$${(value / 1000).toFixed(1)}k` : '-';
+}
+
+function formatNumber(value?: number) {
+  return typeof value === 'number' && Number.isFinite(value) ? value.toLocaleString() : '0';
+}
 
 function DrawerProductImage({ product }: { product: Product }) {
   const [broken, setBroken] = useState(false);
@@ -41,7 +54,7 @@ function DrawerProductImage({ product }: { product: Product }) {
           onError={() => setBroken(true)}
         />
       ) : (
-        <span>云启商品图</span>
+        <span>商品主图</span>
       )}
     </div>
   );
@@ -50,6 +63,7 @@ function DrawerProductImage({ product }: { product: Product }) {
 export function ProductDetailDrawer({
   open,
   product,
+  mode = 'sourcing',
   searched,
   activeCandidate,
   activeTab,
@@ -61,6 +75,8 @@ export function ProductDetailDrawer({
   onRecordLinkEntry,
 }: Props) {
   if (!product) return null;
+  const weeklySales = product.weeklySales ?? (product.period === '近7天' ? product.sales : 0);
+  const monthlySales = product.monthlySales ?? product.sales;
 
   return (
     <Drawer
@@ -81,32 +97,82 @@ export function ProductDetailDrawer({
         <aside className="drawer-product-side">
           <DrawerProductImage product={product} />
           <Title level={4}>{product.title}</Title>
-          <Text type="secondary">原始行：{product.sourceRow} · {product.category}</Text>
+          <Text type="secondary">
+            原始行：{product.sourceRow} · {product.category}
+          </Text>
           <Descriptions column={2} className="product-descriptions">
             <Descriptions.Item label="价格">¥{product.price.toFixed(2)}</Descriptions.Item>
             <Descriptions.Item label="销量">{product.sales.toLocaleString()}</Descriptions.Item>
             <Descriptions.Item label="GMV">${(product.gmv / 1000).toFixed(1)}k</Descriptions.Item>
-            <Descriptions.Item label="评论数">
-              {product.reviewCount.toLocaleString()}
-            </Descriptions.Item>
+            <Descriptions.Item label="评论数">{product.reviewCount.toLocaleString()}</Descriptions.Item>
             <Descriptions.Item label="上架时间">{product.listedAt}</Descriptions.Item>
             <Descriptions.Item label="增长率">+{product.growthRate}%</Descriptions.Item>
           </Descriptions>
         </aside>
 
         <main className="drawer-sourcing-side">
-          <Sourcing1688Panel
-            product={product}
-            candidates={mockCandidates}
-            searched={searched}
-            activeCandidate={activeCandidate}
-            activeTab={activeTab}
-            onSearch={onSearch}
-            onOpenDetail={onOpenCandidateDetail}
-            onBackToSearch={onBackToSearch}
-            onSelectCandidate={(candidate) => onSelectCandidate(product, candidate)}
-            onRecordLinkEntry={onRecordLinkEntry}
-          />
+          {mode === 'sales' ? (
+            <div className="drawer-sales-panel">
+              <div className="drawer-sales-head">
+                <div>
+                  <Title level={4}>销售数据</Title>
+                  <Text type="secondary">来自数据台商品记录，用于后续筛选、推荐和选品判断。</Text>
+                </div>
+                {product.sourceUrl ? (
+                  <Button onClick={() => window.open(product.sourceUrl, '_blank', 'noopener,noreferrer')}>
+                    打开原链接
+                  </Button>
+                ) : null}
+              </div>
+
+              <div className="drawer-sales-grid">
+                <div className="drawer-sales-card">
+                  <Text type="secondary">周销量</Text>
+                  <strong>{formatNumber(weeklySales)}</strong>
+                </div>
+                <div className="drawer-sales-card">
+                  <Text type="secondary">月销量</Text>
+                  <strong>{formatNumber(monthlySales)}</strong>
+                </div>
+                <div className="drawer-sales-card">
+                  <Text type="secondary">GMV</Text>
+                  <strong>{formatUsd(product.gmv)}</strong>
+                </div>
+                <div className="drawer-sales-card">
+                  <Text type="secondary">评论数</Text>
+                  <strong>{formatNumber(product.reviewCount)}</strong>
+                </div>
+              </div>
+
+              <Descriptions bordered column={2} className="drawer-sales-descriptions">
+                <Descriptions.Item label="商品价格">{formatMoney(product.price)}</Descriptions.Item>
+                <Descriptions.Item label="增长率">+{product.growthRate}%</Descriptions.Item>
+                <Descriptions.Item label="上架时间">{product.listedAt || '-'}</Descriptions.Item>
+                <Descriptions.Item label="来源行">{product.sourceRow || '-'}</Descriptions.Item>
+                <Descriptions.Item label="一级类目">{product.categoryLevel1 || '-'}</Descriptions.Item>
+                <Descriptions.Item label="二级类目">{product.categoryLevel2 || '-'}</Descriptions.Item>
+                <Descriptions.Item label="完整类目" span={2}>
+                  {product.categoryPath || product.category || '-'}
+                </Descriptions.Item>
+                <Descriptions.Item label="商品 ID" span={2}>
+                  {product.sourceProductId || product.id}
+                </Descriptions.Item>
+              </Descriptions>
+            </div>
+          ) : (
+            <Sourcing1688Panel
+              product={product}
+              candidates={mockCandidates}
+              searched={searched}
+              activeCandidate={activeCandidate}
+              activeTab={activeTab}
+              onSearch={onSearch}
+              onOpenDetail={onOpenCandidateDetail}
+              onBackToSearch={onBackToSearch}
+              onSelectCandidate={(candidate) => onSelectCandidate(product, candidate)}
+              onRecordLinkEntry={onRecordLinkEntry}
+            />
+          )}
         </main>
       </div>
     </Drawer>

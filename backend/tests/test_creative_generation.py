@@ -58,10 +58,10 @@ class CreativeGenerationTest(unittest.TestCase):
                 }
 
                 jobs = plugin_jobs.create_plugin_jobs([record])
-                self.assertEqual(len(jobs), IMAGE_COUNT)
+                self.assertEqual(len(jobs), IMAGE_COUNT + 1)
                 self.assertEqual(jobs[0]["status"], "queued")
 
-                for _ in range(IMAGE_COUNT):
+                for _ in range(len(jobs)):
                     job = plugin_jobs.claim_next_plugin_job()
                     self.assertIsNotNone(job)
                     plugin_jobs.complete_plugin_job(
@@ -78,6 +78,7 @@ class CreativeGenerationTest(unittest.TestCase):
         self.assertIn("record-plugin-1", sync["completedRecordIds"])
         self.assertEqual(len(updated["productMaterialImages"]), IMAGE_COUNT)
         self.assertTrue(updated["mainImage"]["editedCloudUrl"].startswith("https://oss.example/"))
+        self.assertTrue(updated["skuEntries"][0]["imageAsset"]["editedCloudUrl"].startswith("https://oss.example/"))
 
     def test_plan_mode_returns_eight_temu_style_images(self):
         result = generate_listing_package(

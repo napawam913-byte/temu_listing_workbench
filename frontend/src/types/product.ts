@@ -13,6 +13,8 @@ export type Product = {
   categoryPath?: string;
   price: number;
   sales: number;
+  weeklySales?: number;
+  monthlySales?: number;
   gmv: number;
   reviewCount: number;
   listedAt: string;
@@ -20,6 +22,7 @@ export type Product = {
   sourceRow: number;
   period: '近7天' | '近30天';
   status: ProductStatus;
+  inProductPool?: boolean;
   imageTone: 'blue' | 'red' | 'green';
   mainImageUrl?: string;
   sourceUrl?: string;

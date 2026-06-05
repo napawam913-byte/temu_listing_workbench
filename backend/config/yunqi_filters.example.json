@@ -1,0 +1,52 @@
+{
+  "_notes": [
+    "Copy this file and adjust category path/date range for a Yunqi RPA run.",
+    "Actions use DOM/Playwright selectors, not screen coordinates.",
+    "Use --search-only while tuning filters; remove it when ready to export Excel and import into SQLite."
+  ],
+  "start_url": "https://www.yunqishuju.com/temu/semiy2/",
+  "actions": [
+    {
+      "type": "assert_min_viewport",
+      "width": 1400
+    },
+    {
+      "type": "cascader_path",
+      "placeholder": "分类筛选",
+      "path": [
+        "Sports & Outdoors(运动与户外)",
+        "Camping & Hiking(野营登山)"
+      ]
+    },
+    {
+      "type": "date_range",
+      "label": "上架时间",
+      "days_back": 30,
+      "end": "today"
+    }
+  ],
+  "search_action": {
+    "type": "dom_click_text",
+    "selector": "button",
+    "text": "搜索",
+    "exact": true
+  },
+  "after_search_actions": [
+    {
+      "type": "wait",
+      "milliseconds": 3000
+    }
+  ],
+  "before_export_actions": [
+    {
+      "type": "wait",
+      "milliseconds": 1000
+    }
+  ],
+  "export_action": {
+    "type": "dom_click_text",
+    "selector": "button",
+    "text": "导出",
+    "exact": true
+  }
+}

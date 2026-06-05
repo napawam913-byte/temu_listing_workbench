@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes_creative import router as creative_router
 from app.api.routes_exports import router as exports_router
+from app.api.routes_link_records import router as link_records_router
 from app.api.routes_products import router as products_router
 from app.api.routes_sourcing_1688 import router as sourcing_1688_router
 from app.api.routes_upload import router as upload_router
@@ -31,6 +32,7 @@ def create_app() -> FastAPI:
     app.include_router(products_router)
     app.include_router(sourcing_1688_router)
     app.include_router(exports_router)
+    app.include_router(link_records_router)
     app.include_router(creative_router)
 
     @app.get("/api/health")

@@ -1,0 +1,49 @@
+{
+  "_name": "sleeping_bag_recent_listing",
+  "_description": "组长优先类目：户外睡袋。第一步选类目，第二步筛选上架时间，第三步点击搜索。",
+  "start_url": "https://www.yunqishuju.com/temu/semiy2/",
+  "actions": [
+    {
+      "type": "assert_min_viewport",
+      "width": 1400
+    },
+    {
+      "type": "cascader_path",
+      "placeholder": "分类筛选",
+      "path": [
+        "Sports & Outdoors(运动与户外)",
+        "Camping & Hiking(野营登山)"
+      ]
+    },
+    {
+      "type": "select_labeled_option",
+      "label": "上架时间",
+      "text": "3月内",
+      "exact": true
+    }
+  ],
+  "search_action": {
+    "type": "dom_click_text",
+    "selector": "button",
+    "text": "搜索",
+    "exact": true
+  },
+  "after_search_actions": [
+    {
+      "type": "wait",
+      "milliseconds": 3000
+    }
+  ],
+  "before_export_actions": [
+    {
+      "type": "wait",
+      "milliseconds": 1000
+    }
+  ],
+  "export_action": {
+    "type": "dom_click_text",
+    "selector": "button",
+    "text": "导出",
+    "exact": true
+  }
+}

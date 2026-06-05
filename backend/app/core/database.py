@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from app.modules.creative_generation.sensitive_terms_catalog import DEFAULT_SENSITIVE_TERMS
+from app.modules.recommendation.keyword_index import ensure_recommendation_schema, replace_product_keyword_index
 
 from .config import DATABASE_PATH, UPLOADS_DIR, ensure_runtime_dirs
 
@@ -82,6 +83,41 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_products_source_id ON products(source_product_id);
             CREATE INDEX IF NOT EXISTS idx_products_listing_time ON products(listing_time);
             CREATE INDEX IF NOT EXISTS idx_products_category ON products(category_path);
+
+            CREATE TABLE IF NOT EXISTS product_pool_products (
+                id TEXT PRIMARY KEY,
+                upload_batch_id TEXT NOT NULL,
+                source_row_index INTEGER NOT NULL,
+                source_type TEXT NOT NULL DEFAULT 'yunqi',
+                source_product_id TEXT NOT NULL,
+                title_cn TEXT,
+                title_en TEXT,
+                title TEXT NOT NULL,
+                main_image_url TEXT,
+                gallery_image_urls_json TEXT NOT NULL DEFAULT '[]',
+                video_url TEXT,
+                source_url TEXT,
+                category_path TEXT,
+                category_level1 TEXT,
+                category_level2 TEXT,
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                price_usd REAL NOT NULL DEFAULT 0,
+                gmv_usd REAL NOT NULL DEFAULT 0,
+                weekly_sales INTEGER NOT NULL DEFAULT 0,
+                monthly_sales INTEGER NOT NULL DEFAULT 0,
+                review_count INTEGER NOT NULL DEFAULT 0,
+                listing_time TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                raw_data_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(upload_batch_id) REFERENCES upload_batches(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_product_pool_status ON product_pool_products(status);
+            CREATE INDEX IF NOT EXISTS idx_product_pool_source_id ON product_pool_products(source_product_id);
+            CREATE INDEX IF NOT EXISTS idx_product_pool_listing_time ON product_pool_products(listing_time);
+            CREATE INDEX IF NOT EXISTS idx_product_pool_category ON product_pool_products(category_path);
 
             CREATE TABLE IF NOT EXISTS sourcing_capture_sessions (
                 id TEXT PRIMARY KEY,
@@ -167,6 +203,12 @@ def init_db() -> None:
             """
         )
         ensure_column(conn, "products", "source_type", "source_type TEXT NOT NULL DEFAULT 'yunqi'")
+        ensure_column(conn, "products", "in_product_pool", "in_product_pool INTEGER NOT NULL DEFAULT 1")
+        ensure_link_list_schema(conn)
+        ensure_product_identity_index(conn)
+        ensure_yunqi_category_schema(conn)
+        seed_product_pool_from_legacy_flag(conn)
+        ensure_recommendation_schema(conn)
         seed_default_sensitive_terms(conn)
 
 
@@ -174,6 +216,122 @@ def ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, d
     columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
     if column_name not in columns:
         conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {ddl}")
+
+
+def ensure_link_list_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS link_list_records (
+            id TEXT PRIMARY KEY,
+            product_id TEXT,
+            product_title TEXT,
+            product_title_en TEXT,
+            source_product_url TEXT,
+            source_count INTEGER NOT NULL DEFAULT 0,
+            sku_count INTEGER NOT NULL DEFAULT 0,
+            component_sku_count INTEGER NOT NULL DEFAULT 0,
+            record_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_link_list_records_status
+            ON link_list_records(status);
+        CREATE INDEX IF NOT EXISTS idx_link_list_records_product
+            ON link_list_records(product_id);
+        CREATE INDEX IF NOT EXISTS idx_link_list_records_updated
+            ON link_list_records(updated_at);
+        """
+    )
+
+
+def ensure_product_identity_index(conn: sqlite3.Connection) -> None:
+    duplicate = conn.execute(
+        """
+        SELECT 1
+        FROM products
+        GROUP BY source_type, source_product_id
+        HAVING COUNT(*) > 1
+        LIMIT 1
+        """
+    ).fetchone()
+    if duplicate:
+        return
+
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_products_source_identity
+            ON products(source_type, source_product_id)
+        """
+    )
+
+
+def ensure_yunqi_category_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS yunqi_categories (
+            id TEXT PRIMARY KEY,
+            source_type TEXT NOT NULL DEFAULT 'yunqi',
+            category_key TEXT NOT NULL UNIQUE,
+            parent_key TEXT,
+            level INTEGER NOT NULL,
+            label TEXT NOT NULL,
+            label_en TEXT,
+            label_cn TEXT,
+            path_text TEXT NOT NULL,
+            parent_path_text TEXT,
+            path_json TEXT NOT NULL DEFAULT '[]',
+            node_id TEXT,
+            aria_haspopup INTEGER NOT NULL DEFAULT 0,
+            aria_owns TEXT,
+            has_children INTEGER NOT NULL DEFAULT 0,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            selected INTEGER NOT NULL DEFAULT 0,
+            checked INTEGER NOT NULL DEFAULT 0,
+            disabled INTEGER NOT NULL DEFAULT 0,
+            class_name TEXT,
+            source_snapshot_path TEXT,
+            raw_data_json TEXT NOT NULL DEFAULT '{}',
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_yunqi_categories_path
+            ON yunqi_categories(source_type, path_text);
+        CREATE INDEX IF NOT EXISTS idx_yunqi_categories_parent
+            ON yunqi_categories(parent_key);
+        CREATE INDEX IF NOT EXISTS idx_yunqi_categories_level
+            ON yunqi_categories(level);
+        CREATE INDEX IF NOT EXISTS idx_yunqi_categories_label_cn
+            ON yunqi_categories(label_cn);
+        CREATE INDEX IF NOT EXISTS idx_yunqi_categories_label_en
+            ON yunqi_categories(label_en);
+        """
+    )
+    ensure_column(conn, "yunqi_categories", "is_active", "is_active INTEGER NOT NULL DEFAULT 1")
+    ensure_column(conn, "yunqi_categories", "source_snapshot_path", "source_snapshot_path TEXT")
+
+
+def seed_product_pool_from_legacy_flag(conn: sqlite3.Connection) -> None:
+    existing_count = conn.execute("SELECT COUNT(*) FROM product_pool_products").fetchone()[0]
+    if existing_count:
+        return
+
+    product_ids = [
+        row["id"]
+        for row in conn.execute(
+            """
+            SELECT id
+            FROM products
+            WHERE status != 'deleted'
+                AND COALESCE(in_product_pool, 0) = 1
+            """
+        ).fetchall()
+    ]
+    copy_products_to_pool(conn, product_ids)
 
 
 def normalize_sensitive_term(term: str) -> str:
@@ -345,13 +503,13 @@ def replace_products(batch_id: str, products: list[dict[str, Any]]) -> None:
                 title_cn, title_en, title, main_image_url, gallery_image_urls_json,
                 video_url, source_url, category_path, category_level1, category_level2,
                 tags_json, price_usd, gmv_usd, weekly_sales, monthly_sales,
-                review_count, listing_time, status, raw_data_json, created_at, updated_at
+                review_count, listing_time, status, in_product_pool, raw_data_json, created_at, updated_at
             ) VALUES (
                 :id, :upload_batch_id, :source_row_index, :source_type, :source_product_id,
                 :title_cn, :title_en, :title, :main_image_url, :gallery_image_urls_json,
                 :video_url, :source_url, :category_path, :category_level1, :category_level2,
                 :tags_json, :price_usd, :gmv_usd, :weekly_sales, :monthly_sales,
-                :review_count, :listing_time, :status, :raw_data_json, :created_at, :updated_at
+                :review_count, :listing_time, :status, :in_product_pool, :raw_data_json, :created_at, :updated_at
             )
             """,
             [
@@ -359,6 +517,7 @@ def replace_products(batch_id: str, products: list[dict[str, Any]]) -> None:
                     **product,
                     "upload_batch_id": batch_id,
                     "source_type": product.get("source_type") or "yunqi",
+                    "in_product_pool": 1 if product.get("in_product_pool", True) else 0,
                     "gallery_image_urls_json": json.dumps(
                         product.get("gallery_image_urls", []), ensure_ascii=False
                     ),
@@ -370,6 +529,202 @@ def replace_products(batch_id: str, products: list[dict[str, Any]]) -> None:
                 for product in products
             ],
         )
+        replace_product_keyword_index(conn, products, now=now)
+        copy_products_to_pool(conn, [product["id"] for product in products], now=now)
+
+
+def product_table_for_scope(scope: str) -> str:
+    return "products" if scope == "all" else "product_pool_products"
+
+
+def copy_products_to_pool(conn: sqlite3.Connection, product_ids: list[str], *, now: str | None = None) -> int:
+    clean_ids = [product_id.strip() for product_id in product_ids if product_id and product_id.strip()]
+    if not clean_ids:
+        return 0
+
+    timestamp = now or utc_now_text()
+    placeholders = ",".join("?" for _ in clean_ids)
+    cursor = conn.execute(
+        f"""
+        INSERT OR REPLACE INTO product_pool_products (
+            id, upload_batch_id, source_row_index, source_type, source_product_id,
+            title_cn, title_en, title, main_image_url, gallery_image_urls_json,
+            video_url, source_url, category_path, category_level1, category_level2,
+            tags_json, price_usd, gmv_usd, weekly_sales, monthly_sales,
+            review_count, listing_time, status, raw_data_json, created_at, updated_at
+        )
+        SELECT
+            id, upload_batch_id, source_row_index, source_type, source_product_id,
+            title_cn, title_en, title, main_image_url, gallery_image_urls_json,
+            video_url, source_url, category_path, category_level1, category_level2,
+            tags_json, price_usd, gmv_usd, weekly_sales, monthly_sales,
+            review_count, listing_time, status, raw_data_json, ?, ?
+        FROM products
+        WHERE id IN ({placeholders})
+            AND status != 'deleted'
+        """,
+        [timestamp, timestamp, *clean_ids],
+    )
+    return cursor.rowcount
+
+
+def list_link_list_records(*, include_deleted: bool = False, limit: int = 500) -> list[dict[str, Any]]:
+    safe_limit = max(1, min(int(limit or 500), 1000))
+    where_sql = "" if include_deleted else "WHERE status != 'deleted'"
+    with get_connection() as conn:
+        ensure_link_list_schema(conn)
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM link_list_records
+            {where_sql}
+            ORDER BY datetime(created_at) DESC, datetime(updated_at) DESC
+            LIMIT ?
+            """,
+            (safe_limit,),
+        ).fetchall()
+
+    return [link_list_record_row_to_api(row) for row in rows]
+
+
+def upsert_link_list_record(record: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        raise ValueError("链接记录格式不正确")
+
+    normalized = normalize_link_list_record(record)
+    now = utc_now_text()
+    created_at = _clean_record_text(normalized.get("createdAt")) or now
+    metadata = link_list_record_metadata(normalized)
+    with get_connection() as conn:
+        ensure_link_list_schema(conn)
+        conn.execute(
+            """
+            INSERT INTO link_list_records (
+                id, product_id, product_title, product_title_en, source_product_url,
+                source_count, sku_count, component_sku_count, record_json, status,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                product_id = excluded.product_id,
+                product_title = excluded.product_title,
+                product_title_en = excluded.product_title_en,
+                source_product_url = excluded.source_product_url,
+                source_count = excluded.source_count,
+                sku_count = excluded.sku_count,
+                component_sku_count = excluded.component_sku_count,
+                record_json = excluded.record_json,
+                status = 'active',
+                updated_at = excluded.updated_at
+            """,
+            (
+                normalized["id"],
+                metadata["product_id"],
+                metadata["product_title"],
+                metadata["product_title_en"],
+                metadata["source_product_url"],
+                metadata["source_count"],
+                metadata["sku_count"],
+                metadata["component_sku_count"],
+                json.dumps(normalized, ensure_ascii=False),
+                created_at,
+                now,
+            ),
+        )
+        row = conn.execute("SELECT * FROM link_list_records WHERE id = ?", (normalized["id"],)).fetchone()
+
+    return link_list_record_row_to_api(row)
+
+
+def upsert_link_list_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not isinstance(records, list):
+        raise ValueError("链接记录列表格式不正确")
+    return [upsert_link_list_record(record) for record in records if isinstance(record, dict)]
+
+
+def soft_delete_link_list_record(record_id: str) -> bool:
+    clean_id = _clean_record_text(record_id)
+    if not clean_id:
+        return False
+
+    now = utc_now_text()
+    with get_connection() as conn:
+        ensure_link_list_schema(conn)
+        cursor = conn.execute(
+            """
+            UPDATE link_list_records
+            SET status = 'deleted', updated_at = ?
+            WHERE id = ? AND status != 'deleted'
+            """,
+            (now, clean_id),
+        )
+    return cursor.rowcount > 0
+
+
+def normalize_link_list_record(record: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(record)
+    record_id = _clean_record_text(normalized.get("id")) or uuid.uuid4().hex
+    normalized["id"] = record_id
+    normalized.setdefault("schemaVersion", 3)
+    normalized["createdAt"] = _clean_record_text(normalized.get("createdAt")) or utc_now_text()
+    normalized.setdefault("sourceLinks", [])
+    normalized.setdefault("skuEntries", [])
+    normalized["componentSkuCount"] = safe_record_int(normalized.get("componentSkuCount"), count_component_skus(normalized))
+    return normalized
+
+
+def count_component_skus(record: dict[str, Any]) -> int:
+    count = 0
+    for entry in record.get("skuEntries") or []:
+        if isinstance(entry, dict):
+            component_skus = entry.get("componentSkus") or []
+            count += len(component_skus) if isinstance(component_skus, list) else 0
+    return count
+
+
+def link_list_record_metadata(record: dict[str, Any]) -> dict[str, Any]:
+    source_links = record.get("sourceLinks") if isinstance(record.get("sourceLinks"), list) else []
+    sku_entries = record.get("skuEntries") if isinstance(record.get("skuEntries"), list) else []
+    first_source = next((source for source in source_links if isinstance(source, dict)), {})
+    return {
+        "product_id": _clean_record_text(record.get("productId")),
+        "product_title": _clean_record_text(record.get("productTitle")),
+        "product_title_en": _clean_record_text(record.get("productTitleEn")),
+        "source_product_url": _clean_record_text(first_source.get("productUrl")) if isinstance(first_source, dict) else "",
+        "source_count": len(source_links),
+        "sku_count": len(sku_entries),
+        "component_sku_count": safe_record_int(record.get("componentSkuCount"), count_component_skus(record)),
+    }
+
+
+def link_list_record_row_to_api(row: sqlite3.Row | None) -> dict[str, Any]:
+    if row is None:
+        raise ValueError("链接记录不存在")
+    try:
+        record = json.loads(row["record_json"] or "{}")
+    except json.JSONDecodeError:
+        record = {}
+    if not isinstance(record, dict):
+        record = {}
+    record.setdefault("id", row["id"])
+    record.setdefault("createdAt", row["created_at"])
+    record.setdefault("productId", row["product_id"] or "")
+    record.setdefault("productTitle", row["product_title"] or "")
+    record.setdefault("productTitleEn", row["product_title_en"] or "")
+    record.setdefault("sourceLinks", [])
+    record.setdefault("skuEntries", [])
+    record.setdefault("componentSkuCount", row["component_sku_count"] or 0)
+    return record
+
+
+def _clean_record_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def safe_record_int(value: Any, fallback: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
 
 
 def list_products(
@@ -385,8 +740,10 @@ def list_products(
     sales_max: int | None = None,
     gmv_min: float | None = None,
     gmv_max: float | None = None,
+    scope: str = "pool",
     include_deleted: bool = False,
 ) -> dict[str, Any]:
+    table_name = product_table_for_scope(scope)
     where, params = build_product_where(
         keyword=keyword,
         period=period,
@@ -406,10 +763,10 @@ def list_products(
     offset = (safe_page - 1) * safe_page_size
 
     with get_connection() as conn:
-        total = conn.execute(f"SELECT COUNT(*) FROM products {where_sql}", params).fetchone()[0]
+        total = conn.execute(f"SELECT COUNT(*) FROM {table_name} {where_sql}", params).fetchone()[0]
         rows = conn.execute(
             f"""
-            SELECT * FROM products
+            SELECT * FROM {table_name}
             {where_sql}
             ORDER BY datetime(listing_time) DESC, gmv_usd DESC
             LIMIT ? OFFSET ?
@@ -425,10 +782,11 @@ def list_products(
     }
 
 
-def get_product_stats() -> dict[str, int]:
+def get_product_stats(scope: str = "pool") -> dict[str, int]:
+    table_name = product_table_for_scope(scope)
     with get_connection() as conn:
         row = conn.execute(
-            """
+            f"""
             SELECT
                 SUM(CASE WHEN status != 'deleted' THEN 1 ELSE 0 END) AS active_count,
                 SUM(
@@ -450,7 +808,7 @@ def get_product_stats() -> dict[str, int]:
                     END
                 ) AS recent_30_count,
                 SUM(CASE WHEN status = 'deleted' THEN 1 ELSE 0 END) AS deleted_count
-            FROM products
+            FROM {table_name}
             """
         ).fetchone()
 
@@ -992,17 +1350,28 @@ def sourcing_material_row_to_api(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def soft_delete_product(product_id: str) -> bool:
+def soft_delete_product(product_id: str, scope: str = "pool") -> bool:
     now = utc_now_text()
+    table_name = product_table_for_scope(scope)
     with get_connection() as conn:
         cursor = conn.execute(
-            "UPDATE products SET status = 'deleted', updated_at = ? WHERE id = ?",
+            f"UPDATE {table_name} SET status = 'deleted', updated_at = ? WHERE id = ?",
             (now, product_id),
         )
         return cursor.rowcount > 0
 
 
+def add_products_to_pool(product_ids: list[str]) -> int:
+    clean_ids = [product_id.strip() for product_id in product_ids if product_id and product_id.strip()]
+    if not clean_ids:
+        return 0
+
+    with get_connection() as conn:
+        return copy_products_to_pool(conn, clean_ids)
+
+
 def product_row_to_api(row: sqlite3.Row) -> dict[str, Any]:
+    keys = set(row.keys())
     return {
         "id": row["id"],
         "source_type": row["source_type"] or "yunqi",
@@ -1025,5 +1394,6 @@ def product_row_to_api(row: sqlite3.Row) -> dict[str, Any]:
         "review_count": row["review_count"],
         "listing_time": row["listing_time"],
         "status": row["status"],
+        "in_product_pool": True if "in_product_pool" not in keys else bool(row["in_product_pool"]),
         "source_row_index": row["source_row_index"],
     }

@@ -1,0 +1,50 @@
+{
+  "manifest_version": 3,
+  "name": "Temu GPT Listing Automator V2",
+  "version": "0.2.0",
+  "description": "Record-level ChatGPT listing image workflow: analyze once, extract prompts for all product and SKU images, then generate one by one.",
+  "permissions": [
+    "downloads",
+    "storage",
+    "tabs",
+    "scripting",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*"
+  ],
+  "action": {
+    "default_title": "Temu GPT Listing V2"
+  },
+  "side_panel": {
+    "default_path": "dashboard.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "js": [
+        "contentScript.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "dashboard.html",
+        "dashboard.css",
+        "dashboard.js"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
+}

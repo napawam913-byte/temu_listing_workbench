@@ -25,6 +25,7 @@ export type BackendProduct = {
   review_count: number;
   listing_time?: string;
   status: 'active' | 'deleted' | 'sourced';
+  in_product_pool?: boolean;
   source_row_index: number;
 };
 
@@ -44,6 +45,7 @@ export type ProductListParams = {
   priceRange?: string;
   salesRange?: string;
   gmvRange?: string;
+  scope?: 'pool' | 'all';
 };
 
 export type ProductStats = {
@@ -51,6 +53,11 @@ export type ProductStats = {
   recent_7_count: number;
   recent_30_count: number;
   deleted_count: number;
+};
+
+export type AddProductsToPoolResponse = {
+  ok: boolean;
+  added_count: number;
 };
 
 export type ProductCategoryOption = {
@@ -126,6 +133,10 @@ export type Link1688ImportResponse = YunqiImportResponse;
 
 export type DianxiaomiExportMode = 'distribution' | 'curated';
 
+export type LinkListRecordsResponse = {
+  items: LinkListRecord[];
+};
+
 export type ChatgptListingPackageResponse = {
   status: 'planned' | 'generated';
   safeTitleCn: string;
@@ -147,7 +158,9 @@ export type PluginCreativeJob = {
   imageIndex: number;
   imageKind: string;
   imageLabel: string;
+  targetSkuEntryId?: string | null;
   prompt: string;
+  analysisText?: string | null;
   inputImageUrl?: string | null;
   resultImageUrl?: string | null;
   resultStorageKey?: string | null;
@@ -168,6 +181,55 @@ export type PluginCreativeSyncResponse = {
   completedRecordIds: string[];
   pendingCount: number;
   failedCount: number;
+};
+
+export type Smart1688Recommendation = {
+  id: string;
+  type: 'offer' | 'search';
+  title: string;
+  main_image_url?: string | null;
+  product_url: string;
+  image_search_url?: string | null;
+  keyword: string;
+  reason: string;
+  shop_name?: string | null;
+  price?: number | null;
+  source: 'material' | 'product' | 'ai_search';
+  score: number;
+};
+
+export type Smart1688RecommendationsResponse = {
+  summary: string;
+  strategy: string;
+  keywords: Smart1688Keyword[];
+  items: Smart1688Recommendation[];
+};
+
+export type Smart1688Keyword = {
+  keyword: string;
+  intent: string;
+  reason: string;
+  searchUrl?: string;
+};
+
+export type ImageSearch1688Item = {
+  id: string;
+  offer_id?: string;
+  title: string;
+  main_image_url?: string | null;
+  product_url: string;
+  price?: string | null;
+  shop_name?: string | null;
+  sales?: string | number | null;
+  keyword?: string | null;
+  raw_data?: Record<string, unknown>;
+};
+
+export type ImageSearch1688Response = {
+  provider: string;
+  image_url: string;
+  query_image_url: string;
+  items: ImageSearch1688Item[];
 };
 
 export async function uploadYunqiFile(file: File): Promise<YunqiImportResponse> {
@@ -207,6 +269,7 @@ export async function fetchProducts(params: ProductListParams): Promise<ProductL
   if (params.keyword) search.set('keyword', params.keyword);
   if (params.period && params.period !== '全部') search.set('period', params.period);
   if (params.category && params.category !== '全部类目') search.set('category', params.category);
+  if (params.scope) search.set('scope', params.scope);
   appendRangeParams(search, 'price', params.priceRange);
   appendRangeParams(search, 'sales', params.salesRange);
   appendRangeParams(search, 'gmv', params.gmvRange);
@@ -219,8 +282,22 @@ export async function fetchProducts(params: ProductListParams): Promise<ProductL
   return response.json();
 }
 
-export async function fetchProductStats(): Promise<ProductStats> {
-  const response = await fetch(`${API_BASE_URL}/api/products/stats`);
+export async function fetchProductStats(scope: 'pool' | 'all' = 'pool'): Promise<ProductStats> {
+  const search = new URLSearchParams({ scope });
+  const response = await fetch(`${API_BASE_URL}/api/products/stats?${search.toString()}`);
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json();
+}
+
+export async function addProductsToPool(productIds: string[]): Promise<AddProductsToPoolResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/products/pool`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ product_ids: productIds }),
+  });
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -313,8 +390,9 @@ export async function deleteCaptured1688Material(materialId: string): Promise<vo
   }
 }
 
-export async function deleteProduct(productId: string): Promise<void> {
-  const response = await fetch(`${API_BASE_URL}/api/products/${productId}`, {
+export async function deleteProduct(productId: string, scope: 'pool' | 'all' = 'pool'): Promise<void> {
+  const search = new URLSearchParams({ scope });
+  const response = await fetch(`${API_BASE_URL}/api/products/${productId}?${search.toString()}`, {
     method: 'DELETE',
   });
   if (!response.ok) {
@@ -324,7 +402,7 @@ export async function deleteProduct(productId: string): Promise<void> {
 
 export async function exportDianxiaomiTemuTemplate(
   records: LinkListRecord[],
-  exportMode: DianxiaomiExportMode,
+  exportMode: DianxiaomiExportMode = 'curated',
 ): Promise<Blob> {
   const response = await fetch(`${API_BASE_URL}/api/exports/dianxiaomi/temu-semi-managed`, {
     method: 'POST',
@@ -338,6 +416,52 @@ export async function exportDianxiaomiTemuTemplate(
   return response.blob();
 }
 
+export async function fetchLinkListRecords(): Promise<LinkListRecord[]> {
+  const response = await fetch(`${API_BASE_URL}/api/link-records`);
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body: LinkListRecordsResponse = await response.json();
+  return body.items;
+}
+
+export async function saveLinkListRecord(record: LinkListRecord): Promise<LinkListRecord> {
+  const response = await fetch(`${API_BASE_URL}/api/link-records`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ record }),
+  });
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json();
+}
+
+export async function saveLinkListRecords(records: LinkListRecord[]): Promise<LinkListRecord[]> {
+  const response = await fetch(`${API_BASE_URL}/api/link-records/batch`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ records }),
+  });
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body: LinkListRecordsResponse = await response.json();
+  return body.items;
+}
+
+export async function deleteLinkListRecord(recordId: string): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/api/link-records/${encodeURIComponent(recordId)}`, {
+    method: 'DELETE',
+  });
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+}
+
 export async function generateChatgptListingPackage(
   record: LinkListRecord,
   generateImages = true,
@@ -346,6 +470,53 @@ export async function generateChatgptListingPackage(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ record, generate_images: generateImages }),
+  });
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json();
+}
+
+export async function fetchSmart1688Recommendations(
+  product: Product,
+  limit = 6,
+  keywords: Smart1688Keyword[] = [],
+): Promise<Smart1688RecommendationsResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/creative/1688-smart-recommendations`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ product, keywords, limit }),
+  });
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json();
+}
+
+export async function fetchSmart1688Keywords(product: Product): Promise<Omit<Smart1688RecommendationsResponse, 'items'>> {
+  const response = await fetch(`${API_BASE_URL}/api/creative/1688-smart-keywords`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ product, limit: 6 }),
+  });
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json();
+}
+
+export async function search1688ByImage(
+  imageUrl: string,
+  keyword = '',
+  limit = 20,
+): Promise<ImageSearch1688Response> {
+  const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/image-search`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ image_url: imageUrl, keyword, limit }),
   });
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
@@ -393,6 +564,8 @@ export function mapBackendProduct(product: BackendProduct): Product {
     categoryPath: product.category_path || undefined,
     price: product.price_usd,
     sales: product.weekly_sales || product.monthly_sales,
+    weeklySales: product.weekly_sales,
+    monthlySales: product.monthly_sales,
     gmv: product.gmv_usd,
     reviewCount: product.review_count,
     listedAt: product.listing_time ? product.listing_time.slice(0, 10) : '',
@@ -400,6 +573,7 @@ export function mapBackendProduct(product: BackendProduct): Product {
     sourceRow: product.source_row_index,
     period: product.weekly_sales > 0 ? '近7天' : '近30天',
     status: product.status,
+    inProductPool: Boolean(product.in_product_pool),
     imageTone: pickImageTone(product.category_level1 || product.category_path || ''),
     mainImageUrl: product.main_image_url || undefined,
     sourceUrl: product.source_url || undefined,

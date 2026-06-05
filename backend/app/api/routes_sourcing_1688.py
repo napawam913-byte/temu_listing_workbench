@@ -19,6 +19,11 @@ from app.core.database import (
     set_active_sourcing_product,
 )
 from app.modules.sourcing_1688.search_url import build_1688_search_url
+from app.modules.sourcing_1688.image_search_api import (
+    ImageSearchApiError,
+    ImageSearchConfigError,
+    search_1688_by_image_url,
+)
 
 router = APIRouter(prefix="/api/sourcing/1688", tags=["sourcing-1688"])
 
@@ -45,6 +50,12 @@ class Capture1688Request(BaseModel):
 
 class AssignMaterialRequest(BaseModel):
     temu_product_id: str = Field(..., min_length=1)
+
+
+class ImageSearchRequest(BaseModel):
+    image_url: str = Field(..., min_length=1)
+    keyword: str | None = None
+    limit: int = Field(default=20, ge=1, le=20)
 
 
 @router.post("/active-session")
@@ -107,6 +118,20 @@ def open_1688_search(keyword: str = Query(..., min_length=1)):
     try:
         return RedirectResponse(build_1688_search_url(keyword), status_code=302)
     except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/image-search")
+def image_search_1688(payload: ImageSearchRequest):
+    try:
+        return search_1688_by_image_url(
+            image_url=payload.image_url,
+            keyword=payload.keyword or "",
+            limit=payload.limit,
+        )
+    except ImageSearchConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (ImageSearchApiError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 

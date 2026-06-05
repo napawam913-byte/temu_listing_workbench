@@ -33,6 +33,30 @@ TEMU_STYLE_PROMPT = (
     "Keep the product recognizable and faithful to source SKU details."
 )
 
+IMAGE_TEXT_COPY_POLICY = (
+    "On-image text policy: short on-image text is allowed when it helps explain function, but it must be safe and minimal. "
+    "Use 0-4 small English callout labels, each 1-4 words, such as 'Easy Carry', 'Compact Size', 'Soft Touch', "
+    "'Organized Storage', or 'Gift Ready'. Do not use platform names, brand names, IP names, medical/health claims, "
+    "certification words, absolute marketing words, price/discount words, guarantee words, or any sensitive terms. "
+    "Do not add long paragraphs, badges, fake certifications, star ratings, urgency banners, QR codes, watermarks, "
+    "or UI-like sale labels. If no safe text is needed, use no on-image text."
+)
+
+ANALYZE_THEN_EXECUTE_PROMPT = (
+    "Workflow is mandatory: first analyze, then execute. "
+    "Analysis phase: identify the real product category, visible components, SKU/bundle contents, reusable visual style, "
+    "safe short on-image text options, sensitive text risks, watermark/brand/medical claims, and which elements must stay consistent across all generated images. "
+    "Execution phase: generate only the requested target image role, keeping all required components accurate and reusable "
+    "with the same lighting, background, camera angle family, color temperature, and marketplace style."
+)
+
+REUSE_STRATEGY_PROMPT = (
+    "Reuse strategy: treat this product image set as one reusable visual system. "
+    "The 8 product images are shared listing assets, not independent redesigns. "
+    "When a product can be sold with multiple other products, keep the base product appearance reusable, "
+    "and only change the bundle composition needed by the target image."
+)
+
 
 class CreativeGenerationError(Exception):
     pass
@@ -217,16 +241,141 @@ def build_image_prompt(record: dict[str, Any], safe_title_en: str, plan: dict[st
     source_titles = ", ".join(
         clean_text(source.get("title")) for source in (record.get("sourceLinks") or [])[:3] if clean_text(source.get("title"))
     )
+    listing_structure = describe_listing_structure(record)
+    component_summary = summarize_bundle_components(record)
+    sku_summary = summarize_sku_entries(record)
     prompt = (
+        f"{ANALYZE_THEN_EXECUTE_PROMPT} "
+        f"{REUSE_STRATEGY_PROMPT} "
         f"Create a square ecommerce listing image for: {safe_title_en}. "
-        f"Image role: {plan['label']} ({plan['promptFocus']}). "
+        f"This image belongs to the 8-image product set: hero main image, effect image, person usage scene, room/everyday scene, "
+        f"material/detail image, size/structure image, comparison image, and package/variant lineup image. "
+        f"Current target image role: {plan['label']} ({plan['promptFocus']}). "
+        f"Listing structure: {listing_structure}. "
         f"Relevant SKU/options: {sku_names or 'assorted product options'}. "
+        f"SKU structure: {sku_summary}. "
+        f"Bundle/components that may need to appear together: {component_summary}. "
         f"Source product context: {source_titles or safe_title_en}. "
         f"{TEMU_STYLE_PROMPT} "
-        "Use realistic product photography style. Avoid readable brand text. If text is necessary, use simple neutral short labels only."
+        f"{IMAGE_TEXT_COPY_POLICY} "
+        "For bundle or combo listings, the hero/main image and combo SKU images must show all products included in the purchase "
+        "in the same image, arranged clearly without merging them into one object. "
+        "Use realistic product photography style. Any text placed inside the image must be neutral, factual, short, and safe."
     )
     sanitized_prompt, _ = sanitize_marketplace_text(prompt)
     return sanitized_prompt
+
+
+def build_sku_image_prompt(record: dict[str, Any], safe_title_en: str, sku_entry: dict[str, Any], sku_index: int) -> str:
+    sku_name = clean_text(sku_entry.get("name")) or f"SKU {sku_index}"
+    sku_kind = clean_text(sku_entry.get("kind")) or "single"
+    listing_structure = describe_listing_structure(record)
+    all_sku_summary = summarize_sku_entries(record)
+    component_summary = summarize_single_sku_components(sku_entry)
+    source_summary = summarize_single_sku_sources(sku_entry)
+    prompt = (
+        f"{ANALYZE_THEN_EXECUTE_PROMPT} "
+        f"{REUSE_STRATEGY_PROMPT} "
+        f"Create one square ecommerce SKU option image for the listing: {safe_title_en}. "
+        f"Target SKU #{sku_index}: {sku_name}. SKU type: {sku_kind}. "
+        f"This is a SKU image, so the generated image must faithfully show only what the buyer receives for this SKU option. "
+        f"If this SKU is a bundle/combo, show every included component together in the same image, clearly separated and not merged. "
+        f"If this SKU is a single option, keep the option's color, style, material, size cues, and visible structure accurate. "
+        f"Target SKU components: {component_summary}. "
+        f"Source SKU details: {source_summary}. "
+        f"Full listing structure: {listing_structure}. "
+        f"All listing SKU context: {all_sku_summary}. "
+        f"{TEMU_STYLE_PROMPT} "
+        f"{IMAGE_TEXT_COPY_POLICY} "
+        "Use the same reusable visual system as the product's main 8-image set: consistent lighting, background, camera angle family, "
+        "scale, color temperature, and clean Temu marketplace style. Any SKU image text must describe only the exact SKU contents "
+        "with safe, short, neutral wording."
+    )
+    sanitized_prompt, _ = sanitize_marketplace_text(prompt)
+    return sanitized_prompt
+
+
+def describe_listing_structure(record: dict[str, Any]) -> str:
+    sku_entries = [sku for sku in record.get("skuEntries") or [] if isinstance(sku, dict)]
+    combo_count = sum(1 for sku in sku_entries if sku.get("kind") == "combo" or len(sku.get("componentSkus") or []) > 1)
+    source_count = len([source for source in record.get("sourceLinks") or [] if isinstance(source, dict)])
+    if combo_count and len(sku_entries) == combo_count:
+        return f"bundle listing with {combo_count} combo SKU(s) from {source_count or 'multiple'} source product(s)"
+    if combo_count:
+        return f"family listing with {len(sku_entries)} SKU(s), including {combo_count} bundle/combo SKU(s)"
+    if len(sku_entries) > 1:
+        return f"multi-SKU listing with {len(sku_entries)} single SKU option(s)"
+    return "single-SKU or simple listing"
+
+
+def summarize_sku_entries(record: dict[str, Any]) -> str:
+    summaries: list[str] = []
+    for sku in (record.get("skuEntries") or [])[:12]:
+        if not isinstance(sku, dict):
+            continue
+        name = clean_text(sku.get("name")) or "Unnamed SKU"
+        kind = clean_text(sku.get("kind")) or "single"
+        component_count = len(sku.get("componentSkus") or [])
+        if component_count > 1:
+            summaries.append(f"{name} ({kind}, {component_count} components)")
+        else:
+            summaries.append(f"{name} ({kind})")
+    return "; ".join(summaries) or "No explicit SKU entries"
+
+
+def summarize_bundle_components(record: dict[str, Any]) -> str:
+    bundle_summaries: list[str] = []
+    for sku in (record.get("skuEntries") or [])[:12]:
+        if not isinstance(sku, dict):
+            continue
+        components = [component for component in sku.get("componentSkus") or [] if isinstance(component, dict)]
+        if len(components) <= 1:
+            continue
+        component_text = " + ".join(
+            clean_text(component.get("name"))
+            or clean_text(component.get("specText"))
+            or clean_text(component.get("sourceTitle"))
+            or "component"
+            for component in components[:6]
+        )
+        bundle_summaries.append(f"{clean_text(sku.get('name')) or 'Combo SKU'} = {component_text}")
+    return "; ".join(bundle_summaries) or "No combo components; reuse the base product style across the 8-image set"
+
+
+def summarize_single_sku_components(sku_entry: dict[str, Any]) -> str:
+    components = [component for component in sku_entry.get("componentSkus") or [] if isinstance(component, dict)]
+    if not components:
+        return clean_text(sku_entry.get("name")) or "No explicit component list; use the target SKU option itself"
+
+    summaries: list[str] = []
+    for component in components[:8]:
+        name = clean_text(component.get("name")) or clean_text(component.get("specText")) or "component"
+        source_title = clean_text(component.get("sourceTitle"))
+        raw_specs = component.get("rawSpecs") if isinstance(component.get("rawSpecs"), dict) else {}
+        spec_text = clean_text(component.get("specText"))
+        option_text = clean_text(component.get("optionText"))
+        spec_pairs = ", ".join(
+            f"{clean_text(key)}={clean_text(value)}"
+            for key, value in list(raw_specs.items())[:6]
+            if clean_text(key) and clean_text(value)
+        )
+        detail = first_non_empty(spec_pairs, spec_text, option_text, source_title)
+        summaries.append(f"{name} ({detail})" if detail else name)
+    return " + ".join(summaries)
+
+
+def summarize_single_sku_sources(sku_entry: dict[str, Any]) -> str:
+    links = [link for link in sku_entry.get("sourceSkuLinks") or [] if isinstance(link, dict)]
+    if not links:
+        return "No explicit source SKU links"
+
+    summaries: list[str] = []
+    for link in links[:8]:
+        source_title = clean_text(link.get("sourceTitle")) or "source product"
+        spec_text = clean_text(link.get("specText"))
+        option_text = clean_text(link.get("optionText"))
+        summaries.append(f"{source_title}: {first_non_empty(spec_text, option_text, 'unspecified option')}")
+    return "; ".join(summaries)
 
 
 def generate_image_bytes(prompt: str, settings: OpenAISettings) -> bytes:
@@ -277,6 +426,14 @@ def trim_title(value: str) -> str:
 def clean_key_part(value: Any) -> str:
     text = re.sub(r"[^A-Za-z0-9_-]+", "-", clean_text(value)).strip("-")
     return text[:80] or "product"
+
+
+def first_non_empty(*values: Any) -> str:
+    for value in values:
+        text = clean_text(value)
+        if text:
+            return text
+    return ""
 
 
 def clean_text(value: Any) -> str:

@@ -36,9 +36,7 @@ function createCard(product) {
   card.className = "card";
 
   const imageUrl = String(product.imageUrl || "").trim();
-  const searchUrl = imageUrl
-    ? `https://s.1688.com/youyuan/index.htm?tab=imageSearch&imageAddress=${encodeURIComponent(imageUrl)}`
-    : "#";
+  const searchUrl = "https://s.1688.com/youyuan/index.htm?tab=imageSearch";
 
   card.innerHTML = `
     <div class="image-wrap">

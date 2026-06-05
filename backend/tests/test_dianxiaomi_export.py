@@ -75,6 +75,7 @@ class DianxiaomiExportTest(unittest.TestCase):
         )
 
         self.assertEqual(rows[0][3], "")
+        self.assertEqual(rows[0][10], "")
         self.assertEqual(rows[0][17], "")
 
     def test_uses_existing_english_title_when_available(self):
@@ -146,7 +147,9 @@ class DianxiaomiExportTest(unittest.TestCase):
         )
 
         self.assertIn("https://example.com/material-source.jpg", rows[0][2])
+        self.assertEqual(rows[0][2], rows[0][18])
         self.assertEqual(rows[0][8], "https://example.com/sku-source.jpg")
+        self.assertEqual(rows[0][9], 300)
         self.assertEqual(rows[0][18], "https://example.com/material-source.jpg\nhttps://example.com/source-main.jpg")
         self.assertEqual(rows[0][19], "https://example.com/material-source.jpg")
 
@@ -185,7 +188,9 @@ class DianxiaomiExportTest(unittest.TestCase):
         )
 
         self.assertIn("https://example.com/material-edited.jpg", rows[0][2])
+        self.assertEqual(rows[0][2], rows[0][18])
         self.assertEqual(rows[0][8], "https://example.com/sku-edited.jpg")
+        self.assertEqual(rows[0][9], 300)
         self.assertEqual(rows[0][18], "https://example.com/material-edited.jpg\nhttps://example.com/main-edited.jpg")
         self.assertEqual(rows[0][19], "https://example.com/material-edited.jpg")
 
@@ -227,7 +232,9 @@ class DianxiaomiExportTest(unittest.TestCase):
         )
 
         self.assertIn("https://oss.example.com/material-edited.jpg", rows[0][2])
+        self.assertEqual(rows[0][2], rows[0][18])
         self.assertEqual(rows[0][8], "https://oss.example.com/sku-edited.jpg")
+        self.assertEqual(rows[0][9], 300)
         self.assertEqual(rows[0][18], "https://oss.example.com/material-edited.jpg\nhttps://oss.example.com/main-edited.jpg")
         self.assertEqual(rows[0][19], "https://oss.example.com/material-edited.jpg")
 
@@ -247,9 +254,55 @@ class DianxiaomiExportTest(unittest.TestCase):
         )
 
         self.assertEqual(len(rows[0][18].split("\n")), 10)
+        self.assertEqual(rows[0][2], rows[0][18])
+        self.assertEqual(len(rows[0][2].split("\n")), 10)
         self.assertEqual(len(rows[0][19].split("\n")), 1)
 
-    def test_delivery_days_default_is_16(self):
+    def test_sku_preview_falls_back_to_source_sku_image_before_main_image(self):
+        rows = build_rows_for_record(
+            {
+                "productId": "p1",
+                "productTitle": "娴嬭瘯鍟嗗搧",
+                "mainImage": {"sourceUrl": "https://example.com/main.jpg"},
+                "sourceLinks": [{"productUrl": "https://detail.1688.com/offer/1.html"}],
+                "skuEntries": [
+                    {
+                        "id": "sku-1",
+                        "name": "Default SKU",
+                        "sourceSkuLinks": [{"imageUrl": "https://example.com/source-sku.jpg"}],
+                        "componentSkus": [],
+                    }
+                ],
+            },
+            export_mode="distribution",
+        )
+
+        self.assertEqual(rows[0][8], "https://example.com/source-sku.jpg")
+
+    def test_named_variant_does_not_create_extra_model_from_sku_name(self):
+        rows = build_rows_for_record(
+            {
+                "productId": "p1",
+                "productTitle": "Test Product",
+                "mainImage": {"sourceUrl": "https://example.com/main.jpg"},
+                "sourceLinks": [{"productUrl": "https://detail.1688.com/offer/1.html"}],
+                "skuEntries": [
+                    {
+                        "id": "sku-1",
+                        "name": "C+B+C+B",
+                        "imageAsset": {"sourceUrl": "https://example.com/sku.jpg"},
+                        "componentSkus": [{"rawSpecs": {"颜色": "C+B"}}],
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(rows[0][4], "颜色")
+        self.assertEqual(rows[0][5], "C+B")
+        self.assertEqual(rows[0][6], "")
+        self.assertEqual(rows[0][7], "")
+
+    def test_delivery_days_default_is_blank(self):
         rows = build_rows_for_record(
             {
                 "productId": "p1",
@@ -260,7 +313,7 @@ class DianxiaomiExportTest(unittest.TestCase):
             }
         )
 
-        self.assertEqual(rows[0][25], 16)
+        self.assertEqual(rows[0][25], "")
 
 
 if __name__ == "__main__":

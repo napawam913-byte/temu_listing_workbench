@@ -1,4 +1,4 @@
-export type LinkListSchemaVersion = 2;
+export type LinkListSchemaVersion = 3;
 export type LinkListImageProvider = 'chatgpt' | 'plugin_chatgpt_web' | 'comfyui';
 export type LinkListImageEditStatus = 'draft' | 'queued' | 'running' | 'done' | 'failed';
 export type LinkListImageRole = 'product-main' | 'product-material' | 'sales-sku';
@@ -14,6 +14,17 @@ export type LinkListImageAsset = {
   editedCloudUrl?: string;
   storageKey?: string;
   alt?: string;
+};
+
+export type LinkListImageSlotType = 'main' | 'carousel' | 'sku';
+
+export type LinkListImageSlot = {
+  id: string;
+  type: LinkListImageSlotType;
+  order: number;
+  assetId?: string;
+  skuEntryId?: string;
+  locked?: boolean;
 };
 
 export type LinkListImageEditTask = {
@@ -102,7 +113,9 @@ export type LinkListCreativeJobSummary = {
   imageIndex: number;
   imageKind: string;
   imageLabel: string;
+  targetSkuEntryId?: string | null;
   resultImageUrl?: string | null;
+  analysisText?: string | null;
   updatedAt: string;
 };
 
@@ -115,6 +128,7 @@ export type LinkListRecord = {
   productTitleEn?: string;
   mainImage?: LinkListImageAsset;
   productMaterialImages?: LinkListImageAsset[];
+  imageSlots?: LinkListImageSlot[];
   styleProfile?: LinkListStyleProfile;
   productImageUrl?: string;
   productSourceUrl?: string;
