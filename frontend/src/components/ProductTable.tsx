@@ -1,5 +1,5 @@
 import { Button, Image, InputNumber, Popconfirm, Space, Table, Tag, Tooltip } from 'antd';
-import type { ColumnsType, TableRowSelection } from 'antd/es/table/interface';
+import type { ColumnsType, SortOrder, TableRowSelection } from 'antd/es/table/interface';
 import { useEffect, useState } from 'react';
 import type { Product } from '../types/product';
 
@@ -11,12 +11,23 @@ type Props = {
   selectedRowKeys: React.Key[];
   onSelectedRowKeysChange: (keys: React.Key[]) => void;
   onPageChange: (page: number, pageSize: number) => void;
+  priceSortOrder?: SortOrder;
+  onPriceSortChange?: (order?: SortOrder) => void;
+  gmvSortOrder?: SortOrder;
+  onGmvSortChange?: (order?: SortOrder) => void;
   onView: (product: Product) => void;
   onDelete: (product: Product) => void;
 };
 
-function currency(value: number) {
-  return `¥${value.toFixed(2)}`;
+function formatProductPrice(product: Product) {
+  if (!Number.isFinite(product.price)) return '-';
+  const symbol = product.sourceType === '1688' ? '¥' : '$';
+  return `${symbol}${product.price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function formatProductGmv(product: Product) {
+  if (!Number.isFinite(product.gmv)) return '-';
+  return `$${product.gmv.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 function ProductThumb({
@@ -76,7 +87,7 @@ function ProductTitleBlock({
       </Tooltip>
       {shouldShowFulfillmentTag ? (
         <div className="product-title-tags">
-          <Tag color="orange">全托管</Tag>
+          <Tag color="orange">半托管</Tag>
         </div>
       ) : null}
       <div className="product-title-meta">上架：{product.listedAt || '-'}</div>
@@ -92,6 +103,10 @@ export function ProductTable({
   selectedRowKeys,
   onSelectedRowKeysChange,
   onPageChange,
+  priceSortOrder,
+  onPriceSortChange,
+  gmvSortOrder,
+  onGmvSortChange,
   onView,
   onDelete,
 }: Props) {
@@ -118,7 +133,7 @@ export function ProductTable({
     {
       title: '商品',
       dataIndex: 'title',
-      width: '56%',
+      width: '45%',
       render: (_, product) => (
         <div className="product-cell">
           <ProductThumb alt={product.titleEn || product.title} src={product.mainImageUrl} tone={product.imageTone} />
@@ -134,9 +149,23 @@ export function ProductTable({
     },
     {
       title: '价格',
+      key: 'price',
       dataIndex: 'price',
       width: '10%',
-      render: currency,
+      sorter: true,
+      sortDirections: ['ascend', 'descend'],
+      sortOrder: priceSortOrder || null,
+      render: (_, product) => formatProductPrice(product),
+    },
+    {
+      title: 'GMV',
+      key: 'gmv',
+      dataIndex: 'gmv',
+      width: '11%',
+      sorter: true,
+      sortDirections: ['descend', 'ascend'],
+      sortOrder: gmvSortOrder || null,
+      render: (_, product) => formatProductGmv(product),
     },
     {
       title: '上架时间',
@@ -180,6 +209,7 @@ export function ProductTable({
 
   return (
     <Table<Product>
+      className="product-table"
       columns={columns}
       dataSource={products}
       pagination={{
@@ -213,6 +243,14 @@ export function ProductTable({
       rowSelection={rowSelection}
       size="middle"
       tableLayout="auto"
+      onChange={(_, __, sorter, extra) => {
+        if (extra.action !== 'sort') return;
+        const activeSorter = Array.isArray(sorter) ? sorter[0] : sorter;
+        const nextPriceOrder = activeSorter?.columnKey === 'price' ? activeSorter.order : undefined;
+        const nextGmvOrder = activeSorter?.columnKey === 'gmv' ? activeSorter.order : undefined;
+        onPriceSortChange?.(nextPriceOrder || undefined);
+        onGmvSortChange?.(nextGmvOrder || undefined);
+      }}
     />
   );
 }

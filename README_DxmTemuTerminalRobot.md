@@ -21,14 +21,14 @@
 ## 运行
 
 ```powershell
-.\DxmTemuTerminalRobot.exe
+.\dist\DxmTemuTerminalRobot\DxmTemuTerminalRobot.exe
 ```
 
 当前交付为终端 exe。源码和打包脚本保留用于后续维护；打包产生的 `build`、`dist`、`.spec`、`__pycache__` 已清理。
 
 ## 使用顺序
 
-1. 双击或在终端运行 `DxmTemuTerminalRobot.exe`。
+1. 双击或在终端运行 `dist\DxmTemuTerminalRobot\DxmTemuTerminalRobot.exe`。
 2. 选择 `1. 一键准备环境`。
 3. 在固定 Chrome 登录店小秘。
 4. 打开 Temu 半托管商品编辑页，URL 需要包含 `edit?id=...`。

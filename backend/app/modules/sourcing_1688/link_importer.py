@@ -21,7 +21,12 @@ class Link1688ImportError(Exception):
 PageFetcher = Callable[[str], str]
 
 
-def import_1688_links(product_urls: list[str], fetch_page: PageFetcher | None = None) -> dict[str, object]:
+def import_1688_links(
+    product_urls: list[str],
+    fetch_page: PageFetcher | None = None,
+    *,
+    add_to_pool_user_id: str | None = None,
+) -> dict[str, object]:
     ensure_runtime_dirs()
     batch_id = uuid.uuid4().hex
     fetcher = fetch_page or fetch_1688_page
@@ -57,7 +62,7 @@ def import_1688_links(product_urls: list[str], fetch_page: PageFetcher | None = 
         status="imported",
         error_message="\n".join(errors[:20]) if errors else None,
     )
-    replace_products(batch_id, products)
+    replace_products(batch_id, products, add_to_pool_user_id=add_to_pool_user_id)
 
     return {
         "batch_id": batch_id,

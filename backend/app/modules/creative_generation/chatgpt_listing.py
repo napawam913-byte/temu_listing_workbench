@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_IMAGE_MODEL, OPENAI_IMAGE_QUALITY, OPENAI_TEXT_MODEL
+from app.core.database import get_app_setting_value
 from app.modules.creative_generation.safety import find_sensitive_terms, sanitize_marketplace_text
 from app.modules.exports.dianxiaomi_temu import normalize_english_title
 from app.modules.image_storage.aliyun_oss import ImageStorageError, upload_image_bytes
@@ -156,12 +157,19 @@ def generate_listing_package(record: dict[str, Any], *, generate_images: bool = 
 
 def get_openai_settings() -> OpenAISettings:
     return OpenAISettings(
-        api_key=os.getenv("OPENAI_API_KEY", OPENAI_API_KEY).strip(),
-        base_url=os.getenv("OPENAI_BASE_URL", OPENAI_BASE_URL).strip().rstrip("/"),
-        text_model=os.getenv("OPENAI_TEXT_MODEL", OPENAI_TEXT_MODEL).strip() or "gpt-4.1-mini",
-        image_model=os.getenv("OPENAI_IMAGE_MODEL", OPENAI_IMAGE_MODEL).strip() or "gpt-image-1",
-        image_quality=os.getenv("OPENAI_IMAGE_QUALITY", OPENAI_IMAGE_QUALITY).strip() or "medium",
+        api_key=get_runtime_setting("OPENAI_API_KEY", OPENAI_API_KEY).strip(),
+        base_url=get_runtime_setting("OPENAI_BASE_URL", OPENAI_BASE_URL).strip().rstrip("/"),
+        text_model=get_runtime_setting("OPENAI_TEXT_MODEL", OPENAI_TEXT_MODEL).strip() or "gpt-4.1-mini",
+        image_model=get_runtime_setting("OPENAI_IMAGE_MODEL", OPENAI_IMAGE_MODEL).strip() or "gpt-image-1",
+        image_quality=get_runtime_setting("OPENAI_IMAGE_QUALITY", OPENAI_IMAGE_QUALITY).strip() or "medium",
     )
+
+
+def get_runtime_setting(key: str, default: str = "") -> str:
+    saved_value = get_app_setting_value(key, "")
+    if saved_value != "":
+        return saved_value
+    return os.getenv(key, default).strip()
 
 
 def generate_safe_english_title(record: dict[str, Any], safe_title_cn: str, settings: OpenAISettings | None) -> str:

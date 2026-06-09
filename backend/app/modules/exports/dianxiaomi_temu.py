@@ -11,6 +11,10 @@ from typing import Any
 from openpyxl import load_workbook
 
 from app.core.config import DIANXIAOMI_TEMU_TEMPLATE_PATH, EXPORTS_DIR, ensure_runtime_dirs
+from app.modules.creative_generation.listing_title_optimizer import (
+    optimize_listing_titles,
+    translate_variant_values_to_english,
+)
 from app.modules.image_storage.aliyun_oss import ImageStorageError, mirror_export_image
 
 TEMPLATE_SHEET_NAME = "导入模板"
@@ -23,7 +27,6 @@ DEFAULT_LENGTH_CM = 10
 DEFAULT_WIDTH_CM = 10
 DEFAULT_HEIGHT_CM = 5
 DEFAULT_WEIGHT_G = 200
-DEFAULT_PRICE = 200
 DEFAULT_DECLARED_PRICE = 300
 DEFAULT_STOCK = 0
 DEFAULT_DELIVERY_DAYS = ""
@@ -230,11 +233,18 @@ def build_rows_for_record(record: dict[str, Any], export_mode: str = EXPORT_MODE
     sku_entries = record.get("skuEntries") or []
     product_title = clean_text(record.get("productTitle")) or "未命名商品"
     product_title_en = normalize_english_title(record.get("productTitleEn"), product_title)
+    optimized_titles = optimize_listing_titles(
+        record,
+        fallback_title_cn=product_title,
+        fallback_title_en=product_title_en,
+    )
+    product_title = optimized_titles["title_cn"]
+    product_title_en = optimized_titles["title_en"]
     product_id = clean_text(record.get("productId")) or uuid.uuid4().hex[:10]
     raw_main_image_url = pick_record_main_image(record, export_mode)
-    main_image_url = mirror_image_url(raw_main_image_url, product_id, "main", 1)
+    main_image_url = export_image_url(raw_main_image_url, product_id, "main", 1, record)
     material_image_urls = unique_http_urls([
-        mirror_image_url(image_url, product_id, "material", index)
+        export_image_url(image_url, product_id, "material", index, record)
         for index, image_url in enumerate(pick_product_material_images(record, export_mode, raw_main_image_url), start=1)
     ])
     source_url = pick_record_source_url(record)
@@ -244,13 +254,24 @@ def build_rows_for_record(record: dict[str, Any], export_mode: str = EXPORT_MODE
     product_material_images = "\n".join(material_image_urls[:MAX_PRODUCT_MATERIAL_IMAGE_COUNT])
     description = build_description_from_images(carousel_image_urls)
 
-    rows: list[list[Any]] = []
+    prepared_skus: list[tuple[dict[str, Any], str, list[tuple[str, str]]]] = []
+    raw_variant_values: list[str] = []
     for index, sku_entry in enumerate(sku_entries, start=1):
         sku_name = clean_text(sku_entry.get("name")) or f"SKU {index}"
-        sku_image_url = mirror_image_url(pick_sku_image(sku_entry, export_mode), product_id, "sku", index) or main_image_url
-        price = positive_number(sku_entry.get("price")) or DEFAULT_PRICE
-        weight_g = weight_to_grams(sku_entry.get("weight")) or DEFAULT_WEIGHT_G
         variant_pairs = derive_variant_pairs(sku_entry, sku_name)
+        prepared_skus.append((sku_entry, sku_name, variant_pairs))
+        raw_variant_values.extend(value for _name, value in variant_pairs)
+
+    variant_value_translations = translate_variant_values_to_english(raw_variant_values)
+
+    rows: list[list[Any]] = []
+    for index, (sku_entry, sku_name, raw_variant_pairs) in enumerate(prepared_skus, start=1):
+        sku_image_url = export_image_url(pick_sku_image(sku_entry, export_mode), product_id, "sku", index, record) or main_image_url
+        weight_g = weight_to_grams(sku_entry.get("weight")) or DEFAULT_WEIGHT_G
+        variant_pairs = [
+            (name, variant_value_translations.get(value, value))
+            for name, value in raw_variant_pairs
+        ]
         variant_one = variant_pairs[0]
         variant_two = variant_pairs[1] if len(variant_pairs) > 1 else ("", "")
 
@@ -279,7 +300,7 @@ def build_rows_for_record(record: dict[str, Any], export_mode: str = EXPORT_MODE
                 "不规则",  # U 外包装形状
                 "硬包装",  # V 外包装类型
                 "",  # W 外包装图片
-                price,  # X 建议售价（USD）
+                "",  # X 建议售价（USD）
                 DEFAULT_STOCK,  # Y 库存
                 DEFAULT_DELIVERY_DAYS,  # Z 发货时效（天）
                 source_url,  # AA 真实详情页URL
@@ -638,13 +659,74 @@ def pick_asset_curated_url(image_asset: dict[str, Any]) -> str:
     )
 
 
-def mirror_image_url(image_url: str, product_id: str, role: str, index: int) -> str:
-    if not clean_text(image_url):
+def export_image_url(image_url: str, product_id: str, role: str, index: int, record: dict[str, Any]) -> str:
+    clean_url = clean_text(image_url)
+    if not clean_url:
         return ""
+    if is_http_url(clean_url) and not is_processed_image_url(record, clean_url):
+        return clean_url
     try:
-        return mirror_export_image(image_url, f"{build_image_key_product_part(product_id)}/{role}-{index}")
+        return mirror_export_image(clean_url, f"{build_image_key_product_part(product_id)}/{role}-{index}")
     except ImageStorageError as exc:
+        if is_http_url(clean_url):
+            return clean_url
         raise DianxiaomiExportError(str(exc)) from exc
+
+
+def is_processed_image_url(record: dict[str, Any], image_url: str) -> bool:
+    clean_url = clean_text(image_url)
+    if not clean_url:
+        return False
+
+    for asset in iter_record_image_assets(record):
+        if not isinstance(asset, dict):
+            continue
+        if clean_url in processed_asset_urls(asset):
+            return True
+    return False
+
+
+def iter_record_image_assets(record: dict[str, Any]) -> list[dict[str, Any]]:
+    assets: list[dict[str, Any]] = []
+
+    def add_asset(asset: Any) -> None:
+        if isinstance(asset, dict):
+            assets.append(asset)
+
+    add_asset(record.get("mainImage"))
+    for asset in record.get("productMaterialImages") or []:
+        add_asset(asset)
+    for sku_entry in record.get("skuEntries") or []:
+        if isinstance(sku_entry, dict):
+            add_asset(sku_entry.get("imageAsset"))
+    for job in record.get("creativeJobs") or []:
+        if not isinstance(job, dict):
+            continue
+        result_image_url = clean_text(job.get("resultImageUrl"))
+        if result_image_url:
+            add_asset(
+                {
+                    "editedUrl": result_image_url,
+                    "editedCloudUrl": result_image_url,
+                    "storageKey": job.get("resultStorageKey") or "",
+                }
+            )
+    return assets
+
+
+def processed_asset_urls(asset: dict[str, Any]) -> set[str]:
+    urls = {
+        clean_text(asset.get("editedCloudUrl")),
+        clean_text(asset.get("editedUrl")),
+    }
+    if clean_text(asset.get("storageKey")):
+        urls.update(
+            {
+                clean_text(asset.get("displayCloudUrl")),
+                clean_text(asset.get("displayUrl")),
+            }
+        )
+    return {url for url in urls if url}
 
 
 def build_image_key_product_part(product_id: str) -> str:

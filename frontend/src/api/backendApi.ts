@@ -1,7 +1,71 @@
 import type { Product } from '../types/product';
 import type { LinkListRecord } from '../types/linkList';
 
-export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000';
+function resolveApiBaseUrl() {
+  const configured = import.meta.env.VITE_API_BASE_URL?.trim();
+  if (configured) return configured.replace(/\/$/, '');
+  if (typeof window !== 'undefined') {
+    return `${window.location.protocol}//${window.location.hostname}:8000`;
+  }
+  return 'http://localhost:8000';
+}
+
+export const API_BASE_URL = resolveApiBaseUrl();
+const LEGACY_AUTH_TOKEN_STORAGE_KEY = 'temuListingWorkbenchAuthToken';
+
+export type CurrentUser = {
+  id: string;
+  username: string;
+  displayName: string;
+  role: string;
+  status?: string;
+};
+
+export type AuthResponse = {
+  user: CurrentUser;
+};
+
+export type AdminUser = {
+  id: string;
+  username: string;
+  displayName: string;
+  role: 'admin' | 'user';
+  status: 'active' | 'disabled';
+  createdAt: string;
+  updatedAt: string;
+  activeSessionCount: number;
+};
+
+export type AdminSetting = {
+  key: string;
+  category: 'ai' | 'oss' | '1688' | string;
+  label: string;
+  description: string;
+  value: string;
+  maskedValue: string;
+  isSecret: boolean;
+  configured: boolean;
+  source: 'database' | 'env' | 'default' | string;
+  updatedAt?: string | null;
+};
+
+export type AdminSettingsUpdateItem = {
+  key: string;
+  value?: string | null;
+  clear?: boolean;
+};
+
+export function clearLegacyAuthToken() {
+  localStorage.removeItem(LEGACY_AUTH_TOKEN_STORAGE_KEY);
+}
+
+function authHeaders(headers: HeadersInit = {}): HeadersInit {
+  return headers;
+}
+
+function withSession(init: RequestInit = {}): RequestInit {
+  return { ...init, credentials: 'include' };
+}
 
 export type BackendProduct = {
   id: string;
@@ -46,6 +110,8 @@ export type ProductListParams = {
   salesRange?: string;
   gmvRange?: string;
   scope?: 'pool' | 'all';
+  sortBy?: 'price' | 'gmv';
+  sortOrder?: 'asc' | 'desc';
 };
 
 export type ProductStats = {
@@ -127,6 +193,15 @@ export type YunqiImportResponse = {
   imported_count: number;
   failed_count: number;
   errors: string[];
+};
+
+export type YunqiSyncResponse = YunqiImportResponse & {
+  ok: boolean;
+  source: string;
+  created_count: number;
+  updated_count: number;
+  keyword_count: number;
+  excel_path?: string;
 };
 
 export type Link1688ImportResponse = YunqiImportResponse;
@@ -232,14 +307,94 @@ export type ImageSearch1688Response = {
   items: ImageSearch1688Item[];
 };
 
+export async function loginUser(username: string, password: string): Promise<AuthResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/auth/login`, withSession({
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body: AuthResponse = await response.json();
+  clearLegacyAuthToken();
+  return body;
+}
+
+export async function registerUser(username: string, password: string, displayName?: string): Promise<AuthResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/auth/register`, withSession({
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password, display_name: displayName }),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body: AuthResponse = await response.json();
+  clearLegacyAuthToken();
+  return body;
+}
+
+export async function fetchCurrentUser(): Promise<CurrentUser> {
+  const response = await fetch(`${API_BASE_URL}/api/auth/me`, withSession({
+    headers: authHeaders(),
+  }));
+  if (!response.ok) {
+    if (response.status === 401) clearLegacyAuthToken();
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body: { user: CurrentUser } = await response.json();
+  return body.user;
+}
+
+export async function logoutUser(): Promise<void> {
+  await fetch(`${API_BASE_URL}/api/auth/logout`, withSession({
+    method: 'POST',
+    headers: authHeaders(),
+  })).catch(() => undefined);
+  clearLegacyAuthToken();
+}
+
 export async function uploadYunqiFile(file: File): Promise<YunqiImportResponse> {
   const formData = new FormData();
   formData.append('file', file);
 
-  const response = await fetch(`${API_BASE_URL}/api/uploads/yunqi`, {
+  const response = await fetch(`${API_BASE_URL}/api/uploads/yunqi`, withSession({
     method: 'POST',
+    headers: authHeaders(),
     body: formData,
-  });
+  }));
+
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json();
+}
+
+export async function syncYunqiFile(
+  file: File,
+  token?: string,
+  options: { limit?: number; rebuildKeywords?: boolean } = {},
+): Promise<YunqiSyncResponse> {
+  const formData = new FormData();
+  formData.append('file', file);
+  const search = new URLSearchParams();
+  if (options.limit) search.set('limit', String(options.limit));
+  if (options.rebuildKeywords === false) search.set('rebuild_keywords', 'false');
+
+  const headers: HeadersInit = {};
+  if (token) headers['X-Workbench-Sync-Token'] = token;
+
+  const query = search.toString();
+  const response = await fetch(`${API_BASE_URL}/api/sync/yunqi/file${query ? `?${query}` : ''}`, withSession({
+    method: 'POST',
+    headers,
+    body: formData,
+  }));
 
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
@@ -249,11 +404,11 @@ export async function uploadYunqiFile(file: File): Promise<YunqiImportResponse> 
 }
 
 export async function upload1688Links(productUrls: string[]): Promise<Link1688ImportResponse> {
-  const response = await fetch(`${API_BASE_URL}/api/uploads/1688`, {
+  const response = await fetch(`${API_BASE_URL}/api/uploads/1688`, withSession({
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ product_urls: productUrls }),
-  });
+  }));
 
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
@@ -270,11 +425,15 @@ export async function fetchProducts(params: ProductListParams): Promise<ProductL
   if (params.period && params.period !== '全部') search.set('period', params.period);
   if (params.category && params.category !== '全部类目') search.set('category', params.category);
   if (params.scope) search.set('scope', params.scope);
+  if (params.sortBy) search.set('sort_by', params.sortBy);
+  if (params.sortOrder) search.set('sort_order', params.sortOrder);
   appendRangeParams(search, 'price', params.priceRange);
   appendRangeParams(search, 'sales', params.salesRange);
   appendRangeParams(search, 'gmv', params.gmvRange);
 
-  const response = await fetch(`${API_BASE_URL}/api/products?${search.toString()}`);
+  const response = await fetch(`${API_BASE_URL}/api/products?${search.toString()}`, withSession({
+    headers: authHeaders(),
+  }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -284,7 +443,9 @@ export async function fetchProducts(params: ProductListParams): Promise<ProductL
 
 export async function fetchProductStats(scope: 'pool' | 'all' = 'pool'): Promise<ProductStats> {
   const search = new URLSearchParams({ scope });
-  const response = await fetch(`${API_BASE_URL}/api/products/stats?${search.toString()}`);
+  const response = await fetch(`${API_BASE_URL}/api/products/stats?${search.toString()}`, withSession({
+    headers: authHeaders(),
+  }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -293,11 +454,11 @@ export async function fetchProductStats(scope: 'pool' | 'all' = 'pool'): Promise
 }
 
 export async function addProductsToPool(productIds: string[]): Promise<AddProductsToPoolResponse> {
-  const response = await fetch(`${API_BASE_URL}/api/products/pool`, {
+  const response = await fetch(`${API_BASE_URL}/api/products/pool`, withSession({
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ product_ids: productIds }),
-  });
+  }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -306,7 +467,9 @@ export async function addProductsToPool(productIds: string[]): Promise<AddProduc
 }
 
 export async function fetchProductCategories(): Promise<ProductCategoryOption[]> {
-  const response = await fetch(`${API_BASE_URL}/api/products/categories`);
+  const response = await fetch(`${API_BASE_URL}/api/products/categories`, withSession({
+    headers: authHeaders(),
+  }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -315,11 +478,11 @@ export async function fetchProductCategories(): Promise<ProductCategoryOption[]>
 }
 
 export async function setActive1688CaptureSession(temuProductId: string) {
-  const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/active-session`, {
+  const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/active-session`, withSession({
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ temu_product_id: temuProductId }),
-  });
+  }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -329,7 +492,9 @@ export async function setActive1688CaptureSession(temuProductId: string) {
 
 export async function fetchCaptured1688Candidates(temuProductId: string): Promise<Captured1688Candidate[]> {
   const search = new URLSearchParams({ temu_product_id: temuProductId });
-  const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/candidates?${search.toString()}`);
+  const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/candidates?${search.toString()}`, withSession({
+    headers: authHeaders(),
+  }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -339,16 +504,19 @@ export async function fetchCaptured1688Candidates(temuProductId: string): Promis
 }
 
 export async function deleteCaptured1688Candidate(candidateId: string): Promise<void> {
-  const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/candidates/${encodeURIComponent(candidateId)}`, {
+  const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/candidates/${encodeURIComponent(candidateId)}`, withSession({
     method: 'DELETE',
-  });
+    headers: authHeaders(),
+  }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
 }
 
 export async function fetchCaptured1688Materials(): Promise<Captured1688Material[]> {
-  const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/materials?limit=100`);
+  const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/materials?limit=100`, withSession({
+    headers: authHeaders(),
+  }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -358,11 +526,11 @@ export async function fetchCaptured1688Materials(): Promise<Captured1688Material
 }
 
 export async function assignCaptured1688Material(materialId: string, temuProductId: string): Promise<Captured1688Candidate> {
-  const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/materials/${encodeURIComponent(materialId)}/assign`, {
+  const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/materials/${encodeURIComponent(materialId)}/assign`, withSession({
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ temu_product_id: temuProductId }),
-  });
+  }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -371,9 +539,10 @@ export async function assignCaptured1688Material(materialId: string, temuProduct
 }
 
 export async function addCaptured1688MaterialToProductList(materialId: string): Promise<BackendProduct> {
-  const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/materials/${encodeURIComponent(materialId)}/add-to-products`, {
+  const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/materials/${encodeURIComponent(materialId)}/add-to-products`, withSession({
     method: 'POST',
-  });
+    headers: authHeaders(),
+  }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -382,9 +551,10 @@ export async function addCaptured1688MaterialToProductList(materialId: string): 
 }
 
 export async function deleteCaptured1688Material(materialId: string): Promise<void> {
-  const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/materials/${encodeURIComponent(materialId)}`, {
+  const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/materials/${encodeURIComponent(materialId)}`, withSession({
     method: 'DELETE',
-  });
+    headers: authHeaders(),
+  }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -392,9 +562,10 @@ export async function deleteCaptured1688Material(materialId: string): Promise<vo
 
 export async function deleteProduct(productId: string, scope: 'pool' | 'all' = 'pool'): Promise<void> {
   const search = new URLSearchParams({ scope });
-  const response = await fetch(`${API_BASE_URL}/api/products/${productId}?${search.toString()}`, {
+  const response = await fetch(`${API_BASE_URL}/api/products/${productId}?${search.toString()}`, withSession({
     method: 'DELETE',
-  });
+    headers: authHeaders(),
+  }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -404,11 +575,11 @@ export async function exportDianxiaomiTemuTemplate(
   records: LinkListRecord[],
   exportMode: DianxiaomiExportMode = 'curated',
 ): Promise<Blob> {
-  const response = await fetch(`${API_BASE_URL}/api/exports/dianxiaomi/temu-semi-managed`, {
+  const response = await fetch(`${API_BASE_URL}/api/exports/dianxiaomi/temu-semi-managed`, withSession({
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ records, export_mode: exportMode }),
-  });
+  }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -417,7 +588,9 @@ export async function exportDianxiaomiTemuTemplate(
 }
 
 export async function fetchLinkListRecords(): Promise<LinkListRecord[]> {
-  const response = await fetch(`${API_BASE_URL}/api/link-records`);
+  const response = await fetch(`${API_BASE_URL}/api/link-records`, withSession({
+    headers: authHeaders(),
+  }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -427,11 +600,11 @@ export async function fetchLinkListRecords(): Promise<LinkListRecord[]> {
 }
 
 export async function saveLinkListRecord(record: LinkListRecord): Promise<LinkListRecord> {
-  const response = await fetch(`${API_BASE_URL}/api/link-records`, {
+  const response = await fetch(`${API_BASE_URL}/api/link-records`, withSession({
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ record }),
-  });
+  }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -440,11 +613,11 @@ export async function saveLinkListRecord(record: LinkListRecord): Promise<LinkLi
 }
 
 export async function saveLinkListRecords(records: LinkListRecord[]): Promise<LinkListRecord[]> {
-  const response = await fetch(`${API_BASE_URL}/api/link-records/batch`, {
+  const response = await fetch(`${API_BASE_URL}/api/link-records/batch`, withSession({
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ records }),
-  });
+  }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -454,9 +627,10 @@ export async function saveLinkListRecords(records: LinkListRecord[]): Promise<Li
 }
 
 export async function deleteLinkListRecord(recordId: string): Promise<void> {
-  const response = await fetch(`${API_BASE_URL}/api/link-records/${encodeURIComponent(recordId)}`, {
+  const response = await fetch(`${API_BASE_URL}/api/link-records/${encodeURIComponent(recordId)}`, withSession({
     method: 'DELETE',
-  });
+    headers: authHeaders(),
+  }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -466,11 +640,11 @@ export async function generateChatgptListingPackage(
   record: LinkListRecord,
   generateImages = true,
 ): Promise<ChatgptListingPackageResponse> {
-  const response = await fetch(`${API_BASE_URL}/api/creative/chatgpt/listing-package`, {
+  const response = await fetch(`${API_BASE_URL}/api/creative/chatgpt/listing-package`, withSession({
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ record, generate_images: generateImages }),
-  });
+  }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -483,11 +657,11 @@ export async function fetchSmart1688Recommendations(
   limit = 6,
   keywords: Smart1688Keyword[] = [],
 ): Promise<Smart1688RecommendationsResponse> {
-  const response = await fetch(`${API_BASE_URL}/api/creative/1688-smart-recommendations`, {
+  const response = await fetch(`${API_BASE_URL}/api/creative/1688-smart-recommendations`, withSession({
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ product, keywords, limit }),
-  });
+  }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -496,11 +670,11 @@ export async function fetchSmart1688Recommendations(
 }
 
 export async function fetchSmart1688Keywords(product: Product): Promise<Omit<Smart1688RecommendationsResponse, 'items'>> {
-  const response = await fetch(`${API_BASE_URL}/api/creative/1688-smart-keywords`, {
+  const response = await fetch(`${API_BASE_URL}/api/creative/1688-smart-keywords`, withSession({
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ product, limit: 6 }),
-  });
+  }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -513,11 +687,11 @@ export async function search1688ByImage(
   keyword = '',
   limit = 20,
 ): Promise<ImageSearch1688Response> {
-  const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/image-search`, {
+  const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/image-search`, withSession({
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ image_url: imageUrl, keyword, limit }),
-  });
+  }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -526,11 +700,11 @@ export async function search1688ByImage(
 }
 
 export async function createPluginCreativeJobs(records: LinkListRecord[]): Promise<PluginCreativeJobsResponse> {
-  const response = await fetch(`${API_BASE_URL}/api/creative/plugin/jobs`, {
+  const response = await fetch(`${API_BASE_URL}/api/creative/plugin/jobs`, withSession({
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ records, provider: 'plugin_chatgpt_web' }),
-  });
+  }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -539,16 +713,105 @@ export async function createPluginCreativeJobs(records: LinkListRecord[]): Promi
 }
 
 export async function syncPluginCreativeJobs(records: LinkListRecord[]): Promise<PluginCreativeSyncResponse> {
-  const response = await fetch(`${API_BASE_URL}/api/creative/plugin/jobs/sync`, {
+  const response = await fetch(`${API_BASE_URL}/api/creative/plugin/jobs/sync`, withSession({
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ records, provider: 'plugin_chatgpt_web' }),
-  });
+  }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
 
   return response.json();
+}
+
+export async function fetchAdminUsers(): Promise<AdminUser[]> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/users`, withSession({
+    headers: authHeaders(),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.items || [];
+}
+
+export async function createAdminUser(payload: {
+  username: string;
+  password: string;
+  displayName?: string;
+  role: 'admin' | 'user';
+  status: 'active' | 'disabled';
+}): Promise<AdminUser> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/users`, withSession({
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.user;
+}
+
+export async function updateAdminUser(
+  userId: string,
+  payload: { displayName?: string; role?: 'admin' | 'user'; status?: 'active' | 'disabled' },
+): Promise<AdminUser> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/users/${encodeURIComponent(userId)}`, withSession({
+    method: 'PATCH',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.user;
+}
+
+export async function resetAdminUserPassword(userId: string, password: string): Promise<AdminUser> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/users/${encodeURIComponent(userId)}/password`, withSession({
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ password }),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.user;
+}
+
+export async function fetchAdminSettings(): Promise<AdminSetting[]> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/settings`, withSession({
+    headers: authHeaders(),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.items || [];
+}
+
+export async function updateAdminSettings(items: AdminSettingsUpdateItem[]): Promise<AdminSetting[]> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/settings`, withSession({
+    method: 'PUT',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ items }),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.items || [];
 }
 
 export function mapBackendProduct(product: BackendProduct): Product {
@@ -581,6 +844,9 @@ export function mapBackendProduct(product: BackendProduct): Product {
 }
 
 async function readErrorMessage(response: Response): Promise<string> {
+  if (response.status === 401) {
+    clearLegacyAuthToken();
+  }
   try {
     const body = await response.json();
     return body.detail || response.statusText;

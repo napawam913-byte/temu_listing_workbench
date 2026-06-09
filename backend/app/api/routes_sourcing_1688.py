@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
+from app.api.auth import require_current_user
 from app.core.database import (
     assign_sourcing_material_1688,
     create_product_from_sourcing_material_1688,
@@ -106,9 +107,9 @@ def assign_1688_material(material_id: str, payload: AssignMaterialRequest):
 
 
 @router.post("/materials/{material_id}/add-to-products")
-def add_1688_material_to_products(material_id: str):
+def add_1688_material_to_products(material_id: str, current_user: dict[str, Any] = Depends(require_current_user)):
     try:
-        return create_product_from_sourcing_material_1688(material_id)
+        return create_product_from_sourcing_material_1688(material_id, add_to_pool_user_id=current_user["id"])
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

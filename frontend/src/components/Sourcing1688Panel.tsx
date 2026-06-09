@@ -14,12 +14,15 @@ import type {
   Captured1688Sku,
   Smart1688Keyword,
   Smart1688Recommendation,
+  Smart1688RecommendationsResponse,
 } from '../api/backendApi';
 import type { LinkListImageAsset, LinkListImageSlot, LinkListRecord, LinkListSource } from '../types/linkList';
 import type { Product, SourcingCandidate } from '../types/product';
 
 const { Text } = Typography;
 const DEFAULT_IMAGE_PROVIDER = 'chatgpt';
+const SMART_RECOMMEND_CACHE_STORAGE_KEY = 'temuListingWorkbenchSmart1688CacheV2';
+const SMART_RECOMMEND_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_STYLE_PROMPT =
   '先分析，再执行。先分析商品品类、主体组件、SKU/组合售卖内容、可复用画风和禁用元素；再统一光线、背景、色温、质感和构图。保留 SKU 的真实款式、颜色、数量和关键细节，组合 SKU 必须把购买会收到的所有组件同框展示，生成干净一致的 Temu 电商商品图。';
 
@@ -67,12 +70,63 @@ type FinalSkuEntry = {
 
 type PanelTab = 'search' | 'recommend' | 'combo' | 'preview';
 
+type SmartRecommendCacheEntry = {
+  productKey: string;
+  summary: string;
+  strategy: string;
+  keywords: Smart1688Keyword[];
+  selectedKeywords: string[];
+  items: Smart1688Recommendation[];
+  updatedAt: number;
+};
+
 function buildKeyword(product: Product) {
   return (product.title || product.titleEn || '')
     .replace(/家用|便携|批发款/g, '')
     .split(/\s+/)
     .slice(0, 8)
     .join(' ');
+}
+
+function getSmartRecommendProductKey(product: Product) {
+  return [
+    product.sourceType || 'product',
+    product.sourceProductId || product.id,
+    product.title || product.titleEn || '',
+    product.mainImageUrl || '',
+  ].join('::');
+}
+
+function readSmartRecommendCache(product: Product): SmartRecommendCacheEntry | undefined {
+  try {
+    const productKey = getSmartRecommendProductKey(product);
+    const cache = JSON.parse(localStorage.getItem(SMART_RECOMMEND_CACHE_STORAGE_KEY) || '{}') as Record<
+      string,
+      SmartRecommendCacheEntry
+    >;
+    const entry = cache[productKey];
+    if (!entry || Date.now() - Number(entry.updatedAt || 0) > SMART_RECOMMEND_CACHE_MAX_AGE_MS) return undefined;
+    return entry;
+  } catch {
+    return undefined;
+  }
+}
+
+function writeSmartRecommendCache(product: Product, entry: Omit<SmartRecommendCacheEntry, 'productKey' | 'updatedAt'>) {
+  try {
+    const productKey = getSmartRecommendProductKey(product);
+    const cache = JSON.parse(localStorage.getItem(SMART_RECOMMEND_CACHE_STORAGE_KEY) || '{}') as Record<
+      string,
+      SmartRecommendCacheEntry
+    >;
+    cache[productKey] = { ...entry, productKey, updatedAt: Date.now() };
+    const entries = Object.entries(cache)
+      .sort(([, left], [, right]) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0))
+      .slice(0, 120);
+    localStorage.setItem(SMART_RECOMMEND_CACHE_STORAGE_KEY, JSON.stringify(Object.fromEntries(entries)));
+  } catch {
+    // Cache failure should not block sourcing work.
+  }
 }
 
 function formatPrice(candidate: Captured1688Candidate) {
@@ -251,26 +305,52 @@ function Smart1688KeywordRecommendations({ product }: { product: Product }) {
   const [customKeyword, setCustomKeyword] = useState('');
   const [items, setItems] = useState<Smart1688Recommendation[]>([]);
   const [previewItem, setPreviewItem] = useState<Smart1688Recommendation | null>(null);
+  const [cacheLoaded, setCacheLoaded] = useState(false);
+  const smartCacheKey = useMemo(() => getSmartRecommendProductKey(product), [product]);
 
   useEffect(() => {
-    setSummary('');
-    setStrategy('');
-    setKeywords([]);
-    setSelectedKeywords([]);
+    const cached = readSmartRecommendCache(product);
+    if (cached) {
+      setSummary(cached.summary);
+      setStrategy(cached.strategy);
+      setKeywords(cached.keywords);
+      setSelectedKeywords(cached.selectedKeywords);
+      setItems(cached.items);
+      setCacheLoaded(true);
+    } else {
+      setSummary('');
+      setStrategy('');
+      setKeywords([]);
+      setSelectedKeywords([]);
+      setItems([]);
+      setCacheLoaded(false);
+    }
     setCustomKeyword('');
-    setItems([]);
     setPreviewItem(null);
-  }, [product.id]);
+  }, [smartCacheKey]);
+
+  const persistRecommendationCache = (patch: Partial<Smart1688RecommendationsResponse> & { selectedKeywords?: string[] }) => {
+    writeSmartRecommendCache(product, {
+      summary: patch.summary ?? summary,
+      strategy: patch.strategy ?? strategy,
+      keywords: patch.keywords ?? keywords,
+      selectedKeywords: patch.selectedKeywords ?? selectedKeywords,
+      items: patch.items ?? items,
+    });
+    setCacheLoaded(true);
+  };
 
   const analyzeKeywords = async () => {
     setKeywordLoading(true);
     setItems([]);
     try {
       const result = await fetchSmart1688Keywords(product);
+      const nextSelectedKeywords = result.keywords.map((item) => item.keyword);
       setSummary(result.summary);
       setStrategy(result.strategy);
       setKeywords(result.keywords);
-      setSelectedKeywords(result.keywords.map((item) => item.keyword));
+      setSelectedKeywords(nextSelectedKeywords);
+      persistRecommendationCache({ ...result, selectedKeywords: nextSelectedKeywords, items: [] });
       if (result.keywords.length === 0) {
         message.info('暂时没有分析出可用关键词');
       }
@@ -316,10 +396,14 @@ function Smart1688KeywordRecommendations({ product }: { product: Product }) {
     setRecommendLoading(true);
     try {
       const result = await fetchSmart1688Recommendations(product, 12, selectedKeywordObjects);
+      const nextSelectedKeywords = result.keywords
+        .map((item) => item.keyword)
+        .filter((keyword) => selectedKeywords.includes(keyword));
       setStrategy(result.strategy || strategy);
       setKeywords(result.keywords);
-      setSelectedKeywords(result.keywords.map((item) => item.keyword).filter((keyword) => selectedKeywords.includes(keyword)));
+      setSelectedKeywords(nextSelectedKeywords);
       setItems(result.items);
+      persistRecommendationCache({ ...result, selectedKeywords: nextSelectedKeywords });
       if (result.items.length === 0) {
         message.info('本地商品列表暂时没有匹配到推荐商品');
       }
@@ -345,6 +429,7 @@ function Smart1688KeywordRecommendations({ product }: { product: Product }) {
           <Space size={6}>
             <BulbOutlined />
             <Text strong>智能推荐</Text>
+            {cacheLoaded ? <Tag color="green">已缓存</Tag> : null}
           </Space>
           <Text className="smart-recommend-subtitle" type="secondary">
             先筛选 GPT 分析关键词，再从你的本地商品列表中回显可参考商品

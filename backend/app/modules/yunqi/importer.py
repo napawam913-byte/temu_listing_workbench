@@ -16,7 +16,7 @@ class YunqiImportError(Exception):
     pass
 
 
-def import_yunqi_file(file_obj: BinaryIO, filename: str) -> dict[str, object]:
+def import_yunqi_file(file_obj: BinaryIO, filename: str, *, add_to_pool_user_id: str | None = None) -> dict[str, object]:
     ensure_runtime_dirs()
     batch_id = uuid.uuid4().hex
     safe_filename = Path(filename).name
@@ -40,7 +40,7 @@ def import_yunqi_file(file_obj: BinaryIO, filename: str) -> dict[str, object]:
         status="imported",
         error_message="\n".join(errors[:20]) if errors else None,
     )
-    replace_products(batch_id, products)
+    replace_products(batch_id, products, add_to_pool_user_id=add_to_pool_user_id)
 
     return {
         "batch_id": batch_id,

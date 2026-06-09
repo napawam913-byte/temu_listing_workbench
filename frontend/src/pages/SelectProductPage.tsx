@@ -1,14 +1,13 @@
 import {
   Button,
   Card,
-  Checkbox,
   Empty,
   Form,
   Image,
   Input,
-  InputNumber,
   Layout,
   Modal,
+  Popover,
   Select,
   Space,
   Statistic,
@@ -18,6 +17,7 @@ import {
 } from 'antd';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { Key } from 'react';
+import type { SortOrder } from 'antd/es/table/interface';
 import {
   addProductsToPool,
   deleteProduct as deleteBackendProduct,
@@ -25,6 +25,7 @@ import {
   createPluginCreativeJobs,
   exportDianxiaomiTemuTemplate,
   fetchLinkListRecords,
+  fetchProductCategories,
   fetchProductStats,
   fetchProducts,
   mapBackendProduct,
@@ -34,20 +35,23 @@ import {
   upload1688Links,
   uploadYunqiFile,
 } from '../api/backendApi';
-import type { ProductStats } from '../api/backendApi';
+import type { CurrentUser, ProductCategoryOption, ProductStats } from '../api/backendApi';
 import { DataImportModal } from '../components/DataImportModal';
 import { ProductDetailDrawer } from '../components/ProductDetailDrawer';
 import { ProductTable } from '../components/ProductTable';
+import { AdminPage } from './AdminPage';
 import { mockProducts } from '../mock/products';
 import type { LinkListImageAsset, LinkListImageSlot, LinkListRecord } from '../types/linkList';
 import type { Product, ProductSourceType, SourcingCandidate } from '../types/product';
 
 const { Header, Content } = Layout;
 const { Text } = Typography;
+const ALL_CATEGORY_VALUE = '全部类目';
 
 type Filters = {
   keyword?: string;
   period?: Product['period'] | '全部';
+  category?: string;
   priceRange?: string;
   salesRange?: string;
   gmvRange?: string;
@@ -55,6 +59,7 @@ type Filters = {
 
 const defaultFilters: Filters = {
   period: '全部',
+  category: ALL_CATEGORY_VALUE,
 };
 
 const PRODUCT_ROUTE_PREFIX = '#/products/';
@@ -64,68 +69,27 @@ type ProductRoute = {
   sourceProductId: string;
 };
 
-type WorkbenchTab = 'sourcing' | 'data' | 'links' | 'automation';
-
-type AutomationTemplate = {
-  id: string;
-  name: string;
-  siteName: string;
-  warehouseNames: string[];
-  freightTemplateName: string;
-  promisedShipDays: string;
-  imageRootDir: string;
-  batchProductCount: number;
-  createTimestampFolder: boolean;
-  remark?: string;
-  updatedAt: string;
-};
+type WorkbenchTab = 'data' | 'sourcing' | 'links' | 'admin';
 
 const LINK_LIST_STORAGE_KEY = 'temuListingWorkbenchLinkListRecords';
-const AUTOMATION_TEMPLATE_STORAGE_KEY = 'temuListingWorkbenchAutomationTemplates';
 const CURATED_EXPORT_IMAGE_COUNT = 8;
 const MAX_EXPORT_CAROUSEL_IMAGE_COUNT = 10;
 
-function createDefaultAutomationTemplate(): AutomationTemplate {
-  return {
-    id: `automation-template-${Date.now()}`,
-    name: '默认上架模板',
-    siteName: '美国站',
-    warehouseNames: ['美中仓库'],
-    freightTemplateName: '默认',
-    promisedShipDays: '',
-    imageRootDir: 'C:/Users/AA/Desktop/新建文件夹',
-    batchProductCount: 1,
-    createTimestampFolder: true,
-    remark: 'Excel 导入店小秘后，由机器人按此参数轮询检查并补全站点配置。',
-    updatedAt: new Date().toISOString(),
-  };
+function getLinkListStorageKey(userId: string) {
+  return `${LINK_LIST_STORAGE_KEY}:${userId}`;
 }
 
-function readAutomationTemplates(): AutomationTemplate[] {
+function readLinkListRecords(userId: string): LinkListRecord[] {
   try {
-    const value = JSON.parse(localStorage.getItem(AUTOMATION_TEMPLATE_STORAGE_KEY) || '[]');
-    if (Array.isArray(value) && value.length > 0) return value;
-  } catch {
-    // Ignore localStorage corruption and rebuild a usable default template.
-  }
-  return [createDefaultAutomationTemplate()];
-}
-
-function writeAutomationTemplates(templates: AutomationTemplate[]) {
-  localStorage.setItem(AUTOMATION_TEMPLATE_STORAGE_KEY, JSON.stringify(templates));
-}
-
-function readLinkListRecords(): LinkListRecord[] {
-  try {
-    const value = JSON.parse(localStorage.getItem(LINK_LIST_STORAGE_KEY) || '[]');
+    const value = JSON.parse(localStorage.getItem(getLinkListStorageKey(userId)) || '[]');
     return Array.isArray(value) ? value : [];
   } catch {
     return [];
   }
 }
 
-function writeLinkListRecords(records: LinkListRecord[]) {
-  localStorage.setItem(LINK_LIST_STORAGE_KEY, JSON.stringify(records));
+function writeLinkListRecords(records: LinkListRecord[], userId: string) {
+  localStorage.setItem(getLinkListStorageKey(userId), JSON.stringify(records));
 }
 
 function formatRecordTime(value: string) {
@@ -212,6 +176,207 @@ function toOptionalNumber(value?: string) {
   if (!value) return undefined;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function toBackendPriceSortOrder(order?: SortOrder) {
+  if (order === 'ascend') return 'asc';
+  if (order === 'descend') return 'desc';
+  return undefined;
+}
+
+function matchesCategoryQuery(category: ProductCategoryOption, query: string, parentLabel = '') {
+  if (!query) return true;
+  const haystack = `${parentLabel} ${category.label} ${category.value}`.toLowerCase();
+  return haystack.includes(query.toLowerCase());
+}
+
+function getCategoryDisplayLabel(categories: ProductCategoryOption[], value?: string) {
+  if (!value || value === ALL_CATEGORY_VALUE) return ALL_CATEGORY_VALUE;
+  for (const category of categories) {
+    if (category.value === value) return category.label;
+    const child = (category.children || []).find((item) => item.value === value);
+    if (child) return `${category.label} / ${child.label}`;
+  }
+  return value;
+}
+
+function getSelectedLevel1Value(categories: ProductCategoryOption[], value?: string) {
+  if (!value || value === ALL_CATEGORY_VALUE) return undefined;
+  const direct = categories.find((category) => category.value === value);
+  if (direct) return direct.value;
+  return categories.find((category) => (category.children || []).some((child) => child.value === value))?.value;
+}
+
+function CategoryCascaderFilter({
+  categories,
+  onChange,
+  value,
+}: {
+  categories: ProductCategoryOption[];
+  onChange?: (value?: string) => void;
+  value?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [searchText, setSearchText] = useState('');
+  const [activeLevel1Value, setActiveLevel1Value] = useState<string>();
+  const selectedLevel1Value = getSelectedLevel1Value(categories, value);
+  const selectedDisplayLabel = getCategoryDisplayLabel(categories, value);
+  const normalizedSearchText = searchText.trim();
+
+  const filteredCategories = useMemo(() => {
+    if (!normalizedSearchText) return categories;
+    return categories
+      .map((category) => {
+        const children = (category.children || []).filter((child) =>
+          matchesCategoryQuery(child, normalizedSearchText, category.label),
+        );
+        if (matchesCategoryQuery(category, normalizedSearchText) || children.length > 0) {
+          return { ...category, children: children.length > 0 ? children : category.children };
+        }
+        return undefined;
+      })
+      .filter(Boolean) as ProductCategoryOption[];
+  }, [categories, normalizedSearchText]);
+
+  const activeLevel1 =
+    filteredCategories.find((category) => category.value === activeLevel1Value) ||
+    filteredCategories.find((category) => category.value === selectedLevel1Value) ||
+    filteredCategories[0];
+
+  useEffect(() => {
+    const nextActiveValue =
+      filteredCategories.find((category) => category.value === activeLevel1Value)?.value ||
+      filteredCategories.find((category) => category.value === selectedLevel1Value)?.value ||
+      filteredCategories[0]?.value;
+    if (nextActiveValue && nextActiveValue !== activeLevel1Value) {
+      setActiveLevel1Value(nextActiveValue);
+    }
+  }, [activeLevel1Value, filteredCategories, selectedLevel1Value]);
+
+  const selectCategory = (nextValue?: string) => {
+    onChange?.(nextValue || ALL_CATEGORY_VALUE);
+    setOpen(false);
+  };
+
+  const panel = (
+    <div className="category-cascader-panel">
+      <div className="category-cascader-search">
+        <Input
+          allowClear
+          placeholder="搜索一级/二级类目"
+          size="small"
+          value={searchText}
+          onChange={(event) => setSearchText(event.target.value)}
+        />
+      </div>
+      <div className="category-cascader-body">
+        <div className="category-cascader-column category-cascader-level1">
+          <button
+            className={`category-cascader-row ${!value || value === ALL_CATEGORY_VALUE ? 'category-cascader-selected' : ''}`}
+            type="button"
+            onClick={() => selectCategory(ALL_CATEGORY_VALUE)}
+          >
+            <span className="category-check" />
+            <span className="category-cascader-name">全分类</span>
+          </button>
+          {filteredCategories.map((category) => {
+            const active = activeLevel1?.value === category.value;
+            const selected = value === category.value || selectedLevel1Value === category.value;
+            return (
+              <button
+                className={`category-cascader-row ${active ? 'category-cascader-active' : ''} ${
+                  selected ? 'category-cascader-selected' : ''
+                }`}
+                key={category.value}
+                type="button"
+                onClick={() => {
+                  setActiveLevel1Value(category.value);
+                }}
+                onMouseEnter={() => setActiveLevel1Value(category.value)}
+              >
+                <span className="category-check" />
+                <span className="category-cascader-name">{category.label}</span>
+                <span className="category-cascader-count">{category.count}</span>
+                <span className="category-cascader-arrow">›</span>
+              </button>
+            );
+          })}
+        </div>
+        <div className="category-cascader-column">
+          {activeLevel1 ? (
+            <>
+              <div className="category-cascader-group-title">{activeLevel1.label}</div>
+              <button
+                className={`category-cascader-row ${value === activeLevel1.value ? 'category-cascader-selected' : ''}`}
+                type="button"
+                onClick={() => selectCategory(activeLevel1.value)}
+              >
+                <span className="category-check" />
+                <span className="category-cascader-name">全部 {activeLevel1.label}</span>
+                <span className="category-cascader-count">{activeLevel1.count}</span>
+              </button>
+              {(activeLevel1.children || []).map((child) => (
+                <button
+                  className={`category-cascader-row ${value === child.value ? 'category-cascader-selected' : ''}`}
+                  key={child.value}
+                  type="button"
+                  onClick={() => selectCategory(child.value)}
+                >
+                  <span className="category-check" />
+                  <span className="category-cascader-name">{child.label}</span>
+                  <span className="category-cascader-count">{child.count}</span>
+                </button>
+              ))}
+              {(activeLevel1.children || []).length === 0 ? (
+                <div className="category-cascader-empty">暂无二级类目</div>
+              ) : null}
+            </>
+          ) : (
+            <div className="category-cascader-empty">暂无匹配类目</div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <Popover
+      arrow={false}
+      content={panel}
+      open={open}
+      overlayClassName="category-cascader-popover"
+      placement="bottomLeft"
+      trigger="click"
+      onOpenChange={setOpen}
+    >
+      <button className="category-cascader-trigger" type="button">
+        <span className={value && value !== ALL_CATEGORY_VALUE ? 'category-cascader-trigger-value' : 'category-cascader-placeholder'}>
+          {selectedDisplayLabel}
+        </span>
+        {value && value !== ALL_CATEGORY_VALUE ? (
+          <span
+            className="category-cascader-clear"
+            role="button"
+            tabIndex={0}
+            onClick={(event) => {
+              event.stopPropagation();
+              selectCategory(ALL_CATEGORY_VALUE);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                event.stopPropagation();
+                selectCategory(ALL_CATEGORY_VALUE);
+              }
+            }}
+          >
+            ×
+          </span>
+        ) : null}
+        <span className="category-cascader-trigger-arrow">▾</span>
+      </button>
+    </Popover>
+  );
 }
 
 function getAssetDisplayUrl(asset?: LinkListRecord['mainImage']) {
@@ -950,11 +1115,20 @@ function DataDeskPanel({
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(20);
   const [selectedRowKeys, setSelectedRowKeys] = useState<Key[]>([]);
+  const [priceSortOrder, setPriceSortOrder] = useState<SortOrder>();
+  const [gmvSortOrder, setGmvSortOrder] = useState<SortOrder>();
+  const [categories, setCategories] = useState<ProductCategoryOption[]>([]);
   const [loading, setLoading] = useState(false);
   const [addingToPool, setAddingToPool] = useState(false);
 
   const loadDataDeskProducts = useCallback(
-    async (nextPage = page, nextPageSize = pageSize, nextFilters: Filters | string = filters) => {
+    async (
+      nextPage = page,
+      nextPageSize = pageSize,
+      nextFilters: Filters | string = filters,
+      nextPriceSortOrder = priceSortOrder,
+      nextGmvSortOrder = gmvSortOrder,
+    ) => {
       const normalizedFilters = typeof nextFilters === 'string' ? { keyword: nextFilters } : nextFilters;
       setLoading(true);
       try {
@@ -962,6 +1136,8 @@ function DataDeskPanel({
           page: nextPage,
           pageSize: nextPageSize,
           scope: 'all',
+          sortBy: nextPriceSortOrder ? 'price' : nextGmvSortOrder ? 'gmv' : undefined,
+          sortOrder: toBackendPriceSortOrder(nextPriceSortOrder || nextGmvSortOrder),
           ...normalizedFilters,
           keyword: normalizedFilters.keyword?.trim() || undefined,
         });
@@ -973,7 +1149,7 @@ function DataDeskPanel({
         setLoading(false);
       }
     },
-    [filters, page, pageSize],
+    [filters, gmvSortOrder, page, pageSize, priceSortOrder],
   );
 
   const loadDataDeskStats = useCallback(async () => {
@@ -987,6 +1163,9 @@ function DataDeskPanel({
   useEffect(() => {
     void loadDataDeskProducts(1, pageSize, filters);
     void loadDataDeskStats();
+    fetchProductCategories()
+      .then(setCategories)
+      .catch(() => setCategories([]));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -1040,6 +1219,9 @@ function DataDeskPanel({
         >
           <Form.Item label="关键词" name="keyword">
             <Input allowClear placeholder="搜索商品标题 / ID" />
+          </Form.Item>
+          <Form.Item label="类目" name="category">
+            <CategoryCascaderFilter categories={categories} />
           </Form.Item>
           <Form.Item label="时间范围" name="period">
             <Select
@@ -1113,6 +1295,20 @@ function DataDeskPanel({
             setPageSize(nextPageSize);
             void loadDataDeskProducts(nextPage, nextPageSize, filters);
           }}
+          priceSortOrder={priceSortOrder}
+          onPriceSortChange={(order) => {
+            setPriceSortOrder(order);
+            setGmvSortOrder(undefined);
+            setPage(1);
+            void loadDataDeskProducts(1, pageSize, filters, order, undefined);
+          }}
+          gmvSortOrder={gmvSortOrder}
+          onGmvSortChange={(order) => {
+            setGmvSortOrder(order);
+            setPriceSortOrder(undefined);
+            setPage(1);
+            void loadDataDeskProducts(1, pageSize, filters, undefined, order);
+          }}
           onView={onViewProduct}
           onDelete={(product) => {
             deleteBackendProduct(product.id, 'all')
@@ -1130,245 +1326,14 @@ function DataDeskPanel({
   );
 }
 
-function AutomationTemplatePanel({ records }: { records: LinkListRecord[] }) {
-  const [templates, setTemplates] = useState<AutomationTemplate[]>(() => readAutomationTemplates());
-  const [activeTemplateId, setActiveTemplateId] = useState(() => readAutomationTemplates()[0]?.id || '');
-  const activeTemplate = templates.find((template) => template.id === activeTemplateId) || templates[0];
-  const robotPayload = useMemo(
-    () => ({
-      schemaVersion: 1,
-      source: 'temu_listing_workbench',
-      generatedAt: new Date().toISOString(),
-      template: activeTemplate,
-      batch: {
-        linkRecordCount: records.length,
-        skuCount: records.reduce((total, record) => total + record.skuEntries.length, 0),
-        recordIds: records.map((record) => record.id),
-      },
-      workflow: {
-        stage: 'after_dianxiaomi_excel_import',
-        action: 'poll_and_fill_site_parameters',
-        robotLinked: false,
-      },
-    }),
-    [activeTemplate, records],
-  );
-
-  const persistTemplates = (nextTemplates: AutomationTemplate[]) => {
-    setTemplates(nextTemplates);
-    writeAutomationTemplates(nextTemplates);
-  };
-
-  const updateActiveTemplate = (patch: Partial<AutomationTemplate>) => {
-    if (!activeTemplate) return;
-    const nextTemplates = templates.map((template) =>
-      template.id === activeTemplate.id
-        ? {
-            ...template,
-            ...patch,
-            updatedAt: new Date().toISOString(),
-          }
-        : template,
-    );
-    persistTemplates(nextTemplates);
-  };
-
-  const addTemplate = () => {
-    const nextTemplate = {
-      ...createDefaultAutomationTemplate(),
-      id: `automation-template-${Date.now()}`,
-      name: `上架模板 ${templates.length + 1}`,
-    };
-    const nextTemplates = [...templates, nextTemplate];
-    persistTemplates(nextTemplates);
-    setActiveTemplateId(nextTemplate.id);
-  };
-
-  const deleteTemplate = () => {
-    if (!activeTemplate || templates.length <= 1) {
-      message.warning('至少保留一个自动化模板');
-      return;
-    }
-    const nextTemplates = templates.filter((template) => template.id !== activeTemplate.id);
-    persistTemplates(nextTemplates);
-    setActiveTemplateId(nextTemplates[0]?.id || '');
-  };
-
-  const copyPayload = async () => {
-    try {
-      await navigator.clipboard.writeText(JSON.stringify(robotPayload, null, 2));
-      message.success('机器人参数 JSON 已复制');
-    } catch {
-      message.error('复制失败，请手动复制右侧 JSON');
-    }
-  };
-
-  if (!activeTemplate) {
-    return (
-      <Card>
-        <Empty description="暂无自动化模板">
-          <Button type="primary" onClick={addTemplate}>
-            新建模板
-          </Button>
-        </Empty>
-      </Card>
-    );
-  }
-
-  return (
-    <div className="automation-page">
-      <div className="automation-hero">
-        <div>
-          <Typography.Title level={3}>店小秘自动化参数模板</Typography.Title>
-          <Text type="secondary">
-            先把不同站点的仓库、运费模板、承诺发货等参数沉淀成模板。当前阶段只在前端保存，后续再把 JSON 交给机器人执行。
-          </Text>
-        </div>
-        <Space>
-          <Button onClick={addTemplate}>新建模板</Button>
-          <Button danger onClick={deleteTemplate}>
-            删除当前模板
-          </Button>
-          <Button type="primary" onClick={copyPayload}>
-            复制机器人参数
-          </Button>
-        </Space>
-      </div>
-
-      <div className="automation-summary-grid">
-        <Card className="automation-summary-card">
-          <Statistic title="参数模板" value={templates.length} />
-        </Card>
-        <Card className="automation-summary-card">
-          <Statistic title="待上架链接" value={records.length} />
-        </Card>
-        <Card className="automation-summary-card">
-          <Statistic title="销售 SKU" value={records.reduce((total, record) => total + record.skuEntries.length, 0)} />
-        </Card>
-      </div>
-
-      <div className="automation-layout">
-        <Card
-          className="automation-card"
-          title={
-            <Space>
-              <span>模板编辑</span>
-              <Tag color="blue">{activeTemplate.siteName || '未设置站点'}</Tag>
-            </Space>
-          }
-        >
-          <Space direction="vertical" size={14} className="automation-form">
-            <label className="automation-field">
-              <Text strong>选择模板</Text>
-              <Select
-                value={activeTemplate.id}
-                options={templates.map((template) => ({ value: template.id, label: template.name }))}
-                onChange={setActiveTemplateId}
-              />
-            </label>
-            <label className="automation-field">
-              <Text strong>模板名称</Text>
-              <Input value={activeTemplate.name} onChange={(event) => updateActiveTemplate({ name: event.target.value })} />
-            </label>
-            <label className="automation-field">
-              <Text strong>站点</Text>
-              <Input
-                placeholder="例如：美国站 / 欧洲站 / 加拿大站"
-                value={activeTemplate.siteName}
-                onChange={(event) => updateActiveTemplate({ siteName: event.target.value })}
-              />
-            </label>
-            <label className="automation-field">
-              <Text strong>仓库</Text>
-              <Select
-                mode="tags"
-                placeholder="可输入多个仓库，回车确认"
-                value={activeTemplate.warehouseNames}
-                options={[
-                  { value: '美中仓库', label: '美中仓库' },
-                  { value: '美西仓库', label: '美西仓库' },
-                  { value: '美东仓库', label: '美东仓库' },
-                  { value: '美南仓库', label: '美南仓库' },
-                ]}
-                onChange={(warehouseNames) => updateActiveTemplate({ warehouseNames })}
-              />
-            </label>
-            <label className="automation-field">
-              <Text strong>运费模板</Text>
-              <Input
-                placeholder="例如：默认 / 标准运费 / 美区包邮模板"
-                value={activeTemplate.freightTemplateName}
-                onChange={(event) => updateActiveTemplate({ freightTemplateName: event.target.value })}
-              />
-            </label>
-            <div className="automation-field-row">
-              <label className="automation-field">
-                <Text strong>承诺发货</Text>
-                <Input
-                  placeholder="置空表示不填"
-                  suffix="工作日内发货"
-                  value={activeTemplate.promisedShipDays}
-                  onChange={(event) => updateActiveTemplate({ promisedShipDays: event.target.value })}
-                />
-              </label>
-              <label className="automation-field">
-                <Text strong>每轮商品数</Text>
-                <InputNumber
-                  min={1}
-                  max={200}
-                  value={activeTemplate.batchProductCount}
-                  onChange={(value) => updateActiveTemplate({ batchProductCount: Number(value) || 1 })}
-                />
-              </label>
-            </div>
-            <label className="automation-field">
-              <Text strong>图片根目录</Text>
-              <Input
-                placeholder="机器人下载/上传图片时使用的本地目录"
-                value={activeTemplate.imageRootDir}
-                onChange={(event) => updateActiveTemplate({ imageRootDir: event.target.value })}
-              />
-            </label>
-            <Checkbox
-              checked={activeTemplate.createTimestampFolder}
-              onChange={(event) => updateActiveTemplate({ createTimestampFolder: event.target.checked })}
-            >
-              每次自动新建时间戳子文件夹，避免混入旧图
-            </Checkbox>
-            <label className="automation-field">
-              <Text strong>备注</Text>
-              <Input.TextArea
-                autoSize={{ minRows: 3, maxRows: 5 }}
-                value={activeTemplate.remark}
-                onChange={(event) => updateActiveTemplate({ remark: event.target.value })}
-              />
-            </label>
-          </Space>
-        </Card>
-
-        <Card className="automation-card" title="机器人参数预览">
-          <div className="automation-flow">
-            <div>
-              <Tag color="default">1</Tag>
-              <Text>导出店小秘 Excel</Text>
-            </div>
-            <div>
-              <Tag color="blue">2</Tag>
-              <Text>店小秘导入待发布</Text>
-            </div>
-            <div>
-              <Tag color="green">3</Tag>
-              <Text>机器人轮询检查并补全参数</Text>
-            </div>
-          </div>
-          <pre className="automation-json">{JSON.stringify(robotPayload, null, 2)}</pre>
-        </Card>
-      </div>
-    </div>
-  );
-}
-
-export function SelectProductPage() {
+export function SelectProductPage({
+  currentUser,
+  onLogout,
+}: {
+  currentUser: CurrentUser;
+  onLogout: () => void;
+}) {
+  const isAdminUser = currentUser.role === 'admin';
   const [form] = Form.useForm<Filters>();
   const [products, setProducts] = useState<Product[]>(mockProducts);
   const [productTotal, setProductTotal] = useState(mockProducts.length);
@@ -1379,6 +1344,9 @@ export function SelectProductPage() {
   const [pageSize, setPageSize] = useState(10);
   const [selectedRowKeys, setSelectedRowKeys] = useState<Key[]>([]);
   const [filters, setFilters] = useState<Filters>(defaultFilters);
+  const [priceSortOrder, setPriceSortOrder] = useState<SortOrder>();
+  const [gmvSortOrder, setGmvSortOrder] = useState<SortOrder>();
+  const [categories, setCategories] = useState<ProductCategoryOption[]>([]);
   const [importOpen, setImportOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [exportingTemplate, setExportingTemplate] = useState(false);
@@ -1388,16 +1356,26 @@ export function SelectProductPage() {
   const [sourcingSearched, setSourcingSearched] = useState(false);
   const [activeCandidate, setActiveCandidate] = useState<SourcingCandidate | undefined>();
   const [activeTab, setActiveTab] = useState<'search' | 'detail'>('search');
-  const [activeWorkbenchTab, setActiveWorkbenchTab] = useState<WorkbenchTab>('sourcing');
-  const [linkListRecords, setLinkListRecords] = useState<LinkListRecord[]>(() => readLinkListRecords());
+  const [activeWorkbenchTab, setActiveWorkbenchTab] = useState<WorkbenchTab>(() =>
+    isAdminUser ? 'admin' : 'sourcing',
+  );
+  const [linkListRecords, setLinkListRecords] = useState<LinkListRecord[]>(() => readLinkListRecords(currentUser.id));
 
   const loadProducts = useCallback(
-    async (nextPage = currentPage, nextPageSize = pageSize, nextFilters = filters) => {
+    async (
+      nextPage = currentPage,
+      nextPageSize = pageSize,
+      nextFilters = filters,
+      nextPriceSortOrder = priceSortOrder,
+      nextGmvSortOrder = gmvSortOrder,
+    ) => {
       setLoadingProducts(true);
       try {
         const response = await fetchProducts({
           page: nextPage,
           pageSize: nextPageSize,
+          sortBy: nextPriceSortOrder ? 'price' : nextGmvSortOrder ? 'gmv' : undefined,
+          sortOrder: toBackendPriceSortOrder(nextPriceSortOrder || nextGmvSortOrder),
           ...nextFilters,
         });
         setProducts(response.items.map(mapBackendProduct));
@@ -1407,6 +1385,16 @@ export function SelectProductPage() {
         setBackendReady(false);
         const fallbackProducts = mockProducts.filter((product) => {
           if (nextFilters.period && nextFilters.period !== '全部' && product.period !== nextFilters.period) {
+            return false;
+          }
+          if (
+            nextFilters.category &&
+            nextFilters.category !== ALL_CATEGORY_VALUE &&
+            product.category !== nextFilters.category &&
+            product.categoryLevel1 !== nextFilters.category &&
+            product.categoryLevel2 !== nextFilters.category &&
+            product.categoryPath !== nextFilters.category
+          ) {
             return false;
           }
           if (
@@ -1422,13 +1410,24 @@ export function SelectProductPage() {
           if (!matchesRange(product.gmv, nextFilters.gmvRange)) return false;
           return product.status !== 'deleted';
         });
-        setProducts(fallbackProducts.slice((nextPage - 1) * nextPageSize, nextPage * nextPageSize));
+        const sortedFallbackProducts = nextPriceSortOrder || nextGmvSortOrder
+          ? [...fallbackProducts].sort((left, right) =>
+              nextPriceSortOrder
+                ? nextPriceSortOrder === 'ascend'
+                  ? left.price - right.price
+                  : right.price - left.price
+                : nextGmvSortOrder === 'ascend'
+                  ? left.gmv - right.gmv
+                  : right.gmv - left.gmv,
+            )
+          : fallbackProducts;
+        setProducts(sortedFallbackProducts.slice((nextPage - 1) * nextPageSize, nextPage * nextPageSize));
         setProductTotal(fallbackProducts.length);
       } finally {
         setLoadingProducts(false);
       }
     },
-    [currentPage, filters, pageSize],
+    [currentPage, filters, gmvSortOrder, pageSize, priceSortOrder],
   );
 
   const loadStats = useCallback(async () => {
@@ -1447,31 +1446,36 @@ export function SelectProductPage() {
   }, []);
 
   useEffect(() => {
+    if (isAdminUser) return;
     void loadProducts(1, pageSize, filters);
     void loadStats();
+    fetchProductCategories()
+      .then(setCategories)
+      .catch(() => setCategories([]));
     setCurrentPage(1);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
+    if (isAdminUser) return undefined;
     let active = true;
 
     const loadLinkRecords = async () => {
-      const localRecords = readLinkListRecords();
+      const localRecords = readLinkListRecords(currentUser.id);
       try {
         const backendRecords = await fetchLinkListRecords();
         if (!active) return;
 
         if (backendRecords.length > 0 || localRecords.length === 0) {
           setLinkListRecords(backendRecords);
-          writeLinkListRecords(backendRecords);
+          writeLinkListRecords(backendRecords, currentUser.id);
           return;
         }
 
         await saveLinkListRecords(localRecords);
         if (!active) return;
         setLinkListRecords(localRecords);
-        writeLinkListRecords(localRecords);
+        writeLinkListRecords(localRecords, currentUser.id);
       } catch (error) {
         if (!active) return;
         if (localRecords.length > 0) {
@@ -1487,7 +1491,7 @@ export function SelectProductPage() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [currentUser.id, isAdminUser]);
 
   const activeCount = productStats.active_count;
   const deletedCount = productStats.deleted_count;
@@ -1511,7 +1515,7 @@ export function SelectProductPage() {
     (record: LinkListRecord) => {
       setLinkListRecords((current) => {
         const next = [record, ...current.filter((item) => item.id !== record.id)].slice(0, 200);
-        writeLinkListRecords(next);
+        writeLinkListRecords(next, currentUser.id);
         return next;
       });
       void saveLinkListRecord(record).catch(warnLinkPersistenceFailure);
@@ -1519,13 +1523,13 @@ export function SelectProductPage() {
       setActiveWorkbenchTab('links');
       message.success('已录入链接列表');
     },
-    [closeProduct, warnLinkPersistenceFailure],
+    [closeProduct, currentUser.id, warnLinkPersistenceFailure],
   );
 
   const deleteLinkEntry = useCallback((recordId: string) => {
     setLinkListRecords((current) => {
       const next = current.filter((record) => record.id !== recordId);
-      writeLinkListRecords(next);
+      writeLinkListRecords(next, currentUser.id);
       return next;
     });
     void deleteLinkListRecord(recordId).catch(warnLinkPersistenceFailure);
@@ -1535,15 +1539,15 @@ export function SelectProductPage() {
   const updateLinkEntry = useCallback((record: LinkListRecord) => {
     setLinkListRecords((current) => {
       const next = current.map((item) => (item.id === record.id ? record : item));
-      writeLinkListRecords(next);
+      writeLinkListRecords(next, currentUser.id);
       return next;
     });
     void saveLinkListRecord(record).catch(warnLinkPersistenceFailure);
-  }, [warnLinkPersistenceFailure]);
+  }, [currentUser.id, warnLinkPersistenceFailure]);
 
   const exportTemplate = useCallback(async () => {
     if (linkListRecords.length === 0) {
-      message.warning('请先在商品池中录入链接列表，再导出店小秘模板');
+      message.warning('请先在商品池中录入链接列表，再导出 Excel');
       return;
     }
 
@@ -1553,22 +1557,28 @@ export function SelectProductPage() {
       const recordsForExport = syncResult.records;
       if (syncResult.records.length > 0) {
         setLinkListRecords(syncResult.records);
-        writeLinkListRecords(syncResult.records);
+        writeLinkListRecords(syncResult.records, currentUser.id);
         void saveLinkListRecords(syncResult.records).catch(warnLinkPersistenceFailure);
       }
 
       const blob = await exportDianxiaomiTemuTemplate(recordsForExport);
       downloadBlob(blob, `店小秘_TEMU半托管_${new Date().toISOString().slice(0, 10)}.xlsx`);
       setExportOpen(false);
-      message.success('店小秘 TEMU 半托管模板已生成');
+      message.success('Excel 已生成，请手动导入店小秘');
     } catch (error) {
-      message.error(error instanceof Error ? error.message : '模板导出失败');
+      message.error(error instanceof Error ? error.message : 'Excel 导出失败');
     } finally {
       setExportingTemplate(false);
     }
-  }, [linkListRecords, warnLinkPersistenceFailure]);
+  }, [currentUser.id, linkListRecords, warnLinkPersistenceFailure]);
 
   const openProductFromRoute = useCallback(async () => {
+    if (isAdminUser) {
+      setDrawerOpen(false);
+      clearProductRoute();
+      return;
+    }
+
     const route = parseProductRoute();
     if (!route) {
       setDrawerOpen(false);
@@ -1600,7 +1610,7 @@ export function SelectProductPage() {
       const fallbackProduct = mockProducts.find((product) => matchesProductRoute(product, route));
       if (fallbackProduct) openProduct(fallbackProduct, { syncUrl: false });
     }
-  }, [openProduct, pageSize, products]);
+  }, [isAdminUser, openProduct, pageSize, products]);
 
   useEffect(() => {
     void openProductFromRoute();
@@ -1655,47 +1665,61 @@ export function SelectProductPage() {
   };
 
   return (
-    <Layout className="app-layout">
-      <Header className="app-header">
+    <Layout className={`app-layout ${isAdminUser ? 'admin-layout' : ''}`}>
+      <Header className={`app-header ${isAdminUser ? 'admin-app-header' : ''}`}>
         <div className="app-header-inner">
           <div className="brand">Temu 选品上架工作台</div>
-          <nav aria-label="主导航" className="main-nav">
-            <button
-              className={`main-nav-item ${activeWorkbenchTab === 'data' ? 'main-nav-active' : ''}`}
-              type="button"
-              onClick={() => setActiveWorkbenchTab('data')}
-            >
-              数据台
-            </button>
-            <button
-              className={`main-nav-item ${activeWorkbenchTab === 'sourcing' ? 'main-nav-active' : ''}`}
-              type="button"
-              onClick={() => setActiveWorkbenchTab('sourcing')}
-            >
-              商品池
-            </button>
-            <button
-              className={`main-nav-item ${activeWorkbenchTab === 'links' ? 'main-nav-active' : ''}`}
-              type="button"
-              onClick={() => setActiveWorkbenchTab('links')}
-            >
-              链接列表
-            </button>
-            <button
-              className={`main-nav-item ${activeWorkbenchTab === 'automation' ? 'main-nav-active' : ''}`}
-              type="button"
-              onClick={() => setActiveWorkbenchTab('automation')}
-            >
-              自动化模板
-            </button>
+          <nav aria-label="主导航" className={`main-nav ${isAdminUser ? 'admin-main-nav' : ''}`}>
+            {!isAdminUser ? (
+              <>
+                <button
+                  className={`main-nav-item ${activeWorkbenchTab === 'data' ? 'main-nav-active' : ''}`}
+                  type="button"
+                  onClick={() => setActiveWorkbenchTab('data')}
+                >
+                  数据台
+                </button>
+                <button
+                  className={`main-nav-item ${activeWorkbenchTab === 'sourcing' ? 'main-nav-active' : ''}`}
+                  type="button"
+                  onClick={() => setActiveWorkbenchTab('sourcing')}
+                >
+                  商品池
+                </button>
+                <button
+                  className={`main-nav-item ${activeWorkbenchTab === 'links' ? 'main-nav-active' : ''}`}
+                  type="button"
+                  onClick={() => setActiveWorkbenchTab('links')}
+                >
+                  链接列表
+                </button>
+              </>
+            ) : null}
+            {isAdminUser ? (
+              <button
+                className={`main-nav-item ${activeWorkbenchTab === 'admin' ? 'main-nav-active' : ''}`}
+                type="button"
+                onClick={() => setActiveWorkbenchTab('admin')}
+              >
+                管理员后台
+              </button>
+            ) : null}
           </nav>
           <Space className="header-actions">
-            <span className="batch-pill">当前批次：云启 0522</span>
-            <Button className="header-button" type="primary" onClick={() => setImportOpen(true)}>
-              数据导入
-            </Button>
-            <Button className="header-button" onClick={() => setExportOpen(true)}>
-              清单导出
+            {!isAdminUser ? <span className="batch-pill">当前批次：云启 0522</span> : null}
+            <span className="user-pill">{currentUser.displayName || currentUser.username}</span>
+            {!isAdminUser ? (
+              <>
+                <Button className="header-button" type="primary" onClick={() => setImportOpen(true)}>
+                  数据导入
+                </Button>
+                <Button className="header-button" onClick={() => setExportOpen(true)}>
+                  清单导出
+                </Button>
+              </>
+            ) : null}
+            <Button className="header-button" onClick={onLogout}>
+              退出
             </Button>
           </Space>
         </div>
@@ -1703,10 +1727,16 @@ export function SelectProductPage() {
 
       <Content className="page-content">
         <div className="page-shell">
-          {activeWorkbenchTab === 'links' ? (
-            <LinkListPanel records={linkListRecords} onDelete={deleteLinkEntry} onUpdate={updateLinkEntry} />
-          ) : activeWorkbenchTab === 'automation' ? (
-            <AutomationTemplatePanel records={linkListRecords} />
+          {isAdminUser ? (
+            <AdminPage />
+          ) : activeWorkbenchTab === 'links' ? (
+            <LinkListPanel
+              records={linkListRecords}
+              onDelete={deleteLinkEntry}
+              onUpdate={updateLinkEntry}
+            />
+          ) : activeWorkbenchTab === 'admin' ? (
+            <AdminPage />
           ) : activeWorkbenchTab === 'data' ? (
             <DataDeskPanel
               onProductsAddedToPool={() => {
@@ -1745,6 +1775,9 @@ export function SelectProductPage() {
             >
               <Form.Item label="关键词" name="keyword">
                 <Input allowClear placeholder="搜索商品标题 / ID" />
+              </Form.Item>
+              <Form.Item label="类目" name="category">
+                <CategoryCascaderFilter categories={categories} />
               </Form.Item>
               <Form.Item label="时间范围" name="period">
                 <Select
@@ -1796,6 +1829,20 @@ export function SelectProductPage() {
                 setCurrentPage(page);
                 setPageSize(nextPageSize);
                 void loadProducts(page, nextPageSize, filters);
+              }}
+              priceSortOrder={priceSortOrder}
+              onPriceSortChange={(order) => {
+                setPriceSortOrder(order);
+                setGmvSortOrder(undefined);
+                setCurrentPage(1);
+                void loadProducts(1, pageSize, filters, order, undefined);
+              }}
+              gmvSortOrder={gmvSortOrder}
+              onGmvSortChange={(order) => {
+                setGmvSortOrder(order);
+                setPriceSortOrder(undefined);
+                setCurrentPage(1);
+                void loadProducts(1, pageSize, filters, undefined, order);
               }}
               onView={openProduct}
               onDelete={deleteProduct}
@@ -1850,17 +1897,17 @@ export function SelectProductPage() {
       />
 
       <Modal
-        title="店小秘 TEMU 半托管模板导出"
+        title="店小秘 TEMU 半托管 Excel 导出"
         open={exportOpen}
         confirmLoading={exportingTemplate}
         onCancel={() => setExportOpen(false)}
         onOk={exportTemplate}
-        okText="开始导出"
+        okText="导出 Excel"
         cancelText="取消"
       >
         <Space direction="vertical" size={16} className="export-modal-content">
           <Text type="secondary">
-            按店小秘 TEMU 半托管模板直接导出；如果商品已经改图，会优先使用云端改图结果，否则使用原始采集图片。
+            这里只生成店小秘 TEMU 半托管 Excel 文件；导出后请手动进入店小秘后台上传导入。
           </Text>
           <Card size="small" title="导出范围">
             <Space direction="vertical">

@@ -6,6 +6,7 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -14,6 +15,7 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from app.core.config import BACKEND_DIR, STORAGE_DIR, ensure_runtime_dirs
+from app.modules.yunqi.export_files import rename_export_for_filter_config
 
 
 DEFAULT_PROFILE_DIR = BACKEND_DIR / "runtime" / "yunqi_robot_browser_profile"
@@ -21,6 +23,8 @@ DEFAULT_DOWNLOAD_DIR = STORAGE_DIR / "yunqi_exports"
 DEFAULT_CATEGORY_DIR = STORAGE_DIR / "yunqi_categories"
 DEFAULT_PLAYWRIGHT_BROWSERS_DIR = Path.home() / "AppData" / "Local" / "ms-playwright"
 RPA_RUN_STEPS = {"full", "open_browser", "crawl_categories", "site", "category", "listing_date", "search", "export"}
+YUNQI_EXPORT_RECORD_TIME_RE = re.compile(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?")
+YUNQI_EXPORT_RECORD_TIME_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M")
 
 
 class YunqiRpaError(Exception):
@@ -253,7 +257,9 @@ def export_yunqi_excel_via_rpa(
             else:
                 download = export_yunqi_download_via_modal(page, config=config, filter_config=filter_config)
             saved_path = save_download(download, config.download_dir)
-            return {
+            original_download_path = saved_path
+            saved_path = rename_export_for_filter_config(saved_path, filter_config)
+            result = {
                 "status": "exported",
                 "start_url": config.start_url,
                 "run_step": resolved_step,
@@ -263,15 +269,16 @@ def export_yunqi_excel_via_rpa(
                 "download_path": str(saved_path),
                 "suggested_filename": download.suggested_filename,
             }
+            if str(original_download_path) != str(saved_path):
+                result["original_download_path"] = str(original_download_path)
+            return result
         except PlaywrightTimeoutError as exc:
             screenshot_path = save_error_screenshot(page, config.download_dir)
-            if keep_open_on_error and not config.headless:
-                input("RPA failed. Inspect the robot browser, then press Enter to close it...")
+            wait_for_user_on_error(keep_open_on_error=keep_open_on_error, config=config)
             raise YunqiRpaError(f"Yunqi RPA timed out: {exc}. Screenshot: {screenshot_path}") from exc
         except Exception as exc:
             screenshot_path = save_error_screenshot(page, config.download_dir)
-            if keep_open_on_error and not config.headless:
-                input("RPA failed. Inspect the robot browser, then press Enter to close it...")
+            wait_for_user_on_error(keep_open_on_error=keep_open_on_error, config=config)
             if isinstance(exc, YunqiRpaError):
                 raise YunqiRpaError(f"{exc}. Screenshot: {screenshot_path}") from exc
             raise YunqiRpaError(f"Yunqi RPA failed: {exc}. Screenshot: {screenshot_path}") from exc
@@ -724,8 +731,39 @@ def resolve_locator(page: Any, action: dict[str, Any]) -> Any:
 def assert_min_viewport(page: Any, width: int) -> None:
     viewport = read_viewport_info(page)
     actual_width = to_int(viewport.get("innerWidth"))
-    if actual_width and actual_width < width:
-        raise YunqiRpaError(f"Robot browser viewport is too narrow: {actual_width}px < {width}px.")
+    if not actual_width or actual_width >= width:
+        return
+
+    try_expand_viewport(page, width=width)
+    viewport = read_viewport_info(page)
+    actual_width = to_int(viewport.get("innerWidth"))
+    if not actual_width or actual_width >= width:
+        return
+
+    minimum_workable_width = to_int(os.getenv("YUNQI_RPA_MIN_WORKABLE_WIDTH")) or 1180
+    if actual_width >= minimum_workable_width:
+        return
+
+    raise YunqiRpaError(
+        "Robot browser viewport is too narrow after resize attempt: "
+        f"{actual_width}px < {width}px. Minimum workable width is {minimum_workable_width}px."
+    )
+
+
+def try_expand_viewport(page: Any, *, width: int) -> None:
+    viewport = read_viewport_info(page)
+    current_height = to_int(viewport.get("innerHeight")) or 800
+    target_height = max(current_height, 800)
+    try:
+        page.set_viewport_size({"width": width, "height": target_height})
+        page.wait_for_timeout(300)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        center_browser_window(page, width + 120, target_height + 120)
+        page.wait_for_timeout(300)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def crawl_category_tree(
@@ -1554,12 +1592,83 @@ def click_text_via_dom(page: Any, *, text: str, selector: str, exact: bool) -> N
         raise YunqiRpaError(f"Could not click text via DOM: {result}")
 
 
+def parse_yunqi_export_record_time(value: Any) -> datetime | None:
+    match = YUNQI_EXPORT_RECORD_TIME_RE.search(str(value or ""))
+    if not match:
+        return None
+    text = match.group(0)
+    for time_format in YUNQI_EXPORT_RECORD_TIME_FORMATS:
+        try:
+            return datetime.strptime(text, time_format)
+        except ValueError:
+            continue
+    return None
+
+
+def select_yunqi_export_download_record(
+    records: list[dict[str, Any]],
+    *,
+    previous_records: set[str],
+    requested_at: datetime,
+    timestamp_tolerance_seconds: int = 5,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    min_record_time = requested_at - timedelta(seconds=max(timestamp_tolerance_seconds, 0))
+    candidates: list[tuple[datetime, int, dict[str, Any]]] = []
+    rejected: list[dict[str, Any]] = []
+
+    for index, record in enumerate(records):
+        if not record.get("has_download"):
+            continue
+
+        fingerprint = str(record.get("fingerprint") or record.get("text") or "").strip()
+        time_text = str(record.get("time_text") or "").strip()
+        record_time = parse_yunqi_export_record_time(time_text or fingerprint)
+        summary = {
+            "index": record.get("index", index),
+            "fingerprint": fingerprint,
+            "time_text": time_text,
+        }
+
+        if fingerprint in previous_records:
+            rejected.append({**summary, "reason": "already_existed_before_export"})
+            continue
+        if record_time is None:
+            rejected.append({**summary, "reason": "missing_or_unparseable_timestamp"})
+            continue
+        if record_time < min_record_time:
+            rejected.append(
+                {
+                    **summary,
+                    "reason": "timestamp_before_current_export",
+                    "record_time": record_time.isoformat(sep=" "),
+                    "min_record_time": min_record_time.isoformat(sep=" "),
+                }
+            )
+            continue
+
+        selected = dict(record)
+        selected["record_time"] = record_time.isoformat(sep=" ")
+        selected["min_record_time"] = min_record_time.isoformat(sep=" ")
+        candidates.append((record_time, int(record.get("index", index) or 0), selected))
+
+    if not candidates:
+        return None, rejected
+
+    candidates.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+    return candidates[0][2], rejected
+
+
 def export_yunqi_download_via_modal(page: Any, *, config: YunqiRpaConfig, filter_config: dict[str, Any]) -> Any:
     modal_config = filter_config.get("export_modal") if isinstance(filter_config.get("export_modal"), dict) else {}
-    modal_timeout_ms = to_int(modal_config.get("timeout_ms")) or 120000
-    fallback_existing_after_ms = to_int(modal_config.get("fallback_existing_after_ms")) or 30000
+    modal_timeout_ms = to_int(modal_config.get("timeout_ms")) or 300000
     confirm_timeout_ms = to_int(modal_config.get("confirm_timeout_ms")) or 15000
     download_response_timeout_ms = to_int(modal_config.get("download_response_timeout_ms")) or 60000
+    raw_timestamp_tolerance_seconds = modal_config.get("timestamp_tolerance_seconds")
+    timestamp_tolerance_seconds = (
+        to_int(raw_timestamp_tolerance_seconds)
+        if raw_timestamp_tolerance_seconds is not None
+        else 5
+    )
     start_text = str(modal_config.get("start_text") or "立即导出")
     download_text = str(modal_config.get("download_text") or "下载")
 
@@ -1572,13 +1681,15 @@ def export_yunqi_download_via_modal(page: Any, *, config: YunqiRpaConfig, filter
         state = wait_for_yunqi_export_modal(page, timeout_ms=30000)
 
     previous_records = set(str(record.get("fingerprint") or "") for record in state.get("records") or [])
+    export_requested_at = datetime.now()
     click_yunqi_export_dialog_text(page, start_text, timeout_ms=30000)
     confirm_yunqi_export_if_prompted(page, timeout_ms=confirm_timeout_ms)
     ready_state = wait_for_new_yunqi_export_download_record(
         page,
         previous_records=previous_records,
+        requested_at=export_requested_at,
         timeout_ms=modal_timeout_ms,
-        fallback_existing_after_ms=fallback_existing_after_ms,
+        timestamp_tolerance_seconds=timestamp_tolerance_seconds or 0,
         reopen_button_names=config.export_button_names,
     )
     confirm_yunqi_export_if_prompted(page, timeout_ms=3000)
@@ -1586,6 +1697,7 @@ def export_yunqi_download_via_modal(page: Any, *, config: YunqiRpaConfig, filter
         page,
         download_text=download_text,
         timeout_ms=min(download_response_timeout_ms, config.download_timeout_ms),
+        selected_record=ready_state.get("selected_download_record") or {},
     )
 
 
@@ -1604,13 +1716,12 @@ def wait_for_new_yunqi_export_download_record(
     page: Any,
     *,
     previous_records: set[str],
+    requested_at: datetime,
     timeout_ms: int,
-    fallback_existing_after_ms: int,
+    timestamp_tolerance_seconds: int,
     reopen_button_names: tuple[str, ...],
 ) -> dict[str, Any]:
-    started_at = datetime.now()
     deadline = datetime.now() + timedelta(milliseconds=timeout_ms)
-    fallback_deadline = started_at + timedelta(milliseconds=fallback_existing_after_ms)
     latest_state: dict[str, Any] = {}
     while datetime.now() < deadline:
         confirm_yunqi_export_if_prompted(page, timeout_ms=1000)
@@ -1623,21 +1734,23 @@ def wait_for_new_yunqi_export_download_record(
                 page.wait_for_timeout(1000)
                 continue
         records = latest_state.get("records") or []
-        existing_ready_records = [record for record in records if record.get("has_download")]
-        ready_records = [
-            record
-            for record in existing_ready_records
-            if record.get("has_download") and str(record.get("fingerprint") or "") not in previous_records
-        ]
-        if ready_records:
-            latest_state["selected_download_record"] = ready_records[0]
-            return latest_state
-        if existing_ready_records and datetime.now() >= fallback_deadline:
-            latest_state["selected_download_record"] = existing_ready_records[0]
-            latest_state["used_existing_download_record"] = True
+        ready_record, rejected_records = select_yunqi_export_download_record(
+            records,
+            previous_records=previous_records,
+            requested_at=requested_at,
+            timestamp_tolerance_seconds=timestamp_tolerance_seconds,
+        )
+        latest_state["export_requested_at"] = requested_at.isoformat(sep=" ")
+        latest_state["timestamp_tolerance_seconds"] = timestamp_tolerance_seconds
+        latest_state["rejected_download_records"] = rejected_records[-10:]
+        if ready_record:
+            latest_state["selected_download_record"] = ready_record
             return latest_state
         page.wait_for_timeout(1000)
-    raise YunqiRpaError(f"Yunqi export did not produce a new downloadable record: {latest_state}")
+    raise YunqiRpaError(
+        "Yunqi export did not produce a downloadable record with a timestamp matching this export request: "
+        f"{latest_state}"
+    )
 
 
 def read_yunqi_export_modal_state(page: Any) -> dict[str, Any]:
@@ -1668,12 +1781,18 @@ def read_yunqi_export_modal_state(page: Any) -> dict[str, Any]:
             const rows = Array.from(dialog.querySelectorAll('tbody tr, .el-table__body tr, table tr'))
                 .map((row, index) => {
                     const text = normalize(row.innerText || row.textContent);
+                    const cells = Array.from(row.querySelectorAll('td, .cell'))
+                        .map((cell) => normalize(cell.innerText || cell.textContent))
+                        .filter(Boolean);
+                    const timeText = cells.find((cellText) => /\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}/.test(cellText))
+                        || (text.match(/\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}(?::\\d{2})?/) || [''])[0];
                     const hasDownload = Array.from(row.querySelectorAll('a, button, span, div')).some(
                         (node) => normalize(node.innerText || node.textContent || node.value) === '下载'
                     );
                     return {
                         index,
                         text,
+                        time_text: timeText,
                         fingerprint: text,
                         has_download: hasDownload,
                     };
@@ -1767,14 +1886,124 @@ def click_yunqi_export_dialog_text(
         raise YunqiRpaError(f"Could not click Yunqi export dialog text `{text}`: {result}")
 
 
-def click_yunqi_export_download_and_capture(page: Any, *, download_text: str, timeout_ms: int) -> Any:
+def click_yunqi_export_record_download(
+    page: Any,
+    *,
+    download_text: str,
+    selected_record: dict[str, Any] | None,
+    timeout_ms: int,
+) -> None:
+    record = selected_record or {}
+    fingerprint = str(record.get("fingerprint") or record.get("text") or "").strip()
+    time_text = str(record.get("time_text") or "").strip()
+    if not fingerprint and not time_text:
+        raise YunqiRpaError("Refusing to download Yunqi export without a selected timestamped download record.")
+    if not parse_yunqi_export_record_time(time_text or fingerprint):
+        raise YunqiRpaError(f"Refusing to download Yunqi export with an invalid timestamped record: {record}")
+
+    result = evaluate_dom_action(
+        page,
+        """
+        ({ downloadText, fingerprint, timeText }) => {
+            const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+            const isVisible = (el) => {
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+            };
+            const targetDownloadText = normalize(downloadText);
+            const targetFingerprint = normalize(fingerprint);
+            const targetTimeText = normalize(timeText);
+            const dialogs = Array.from(document.querySelectorAll('.el-dialog, [role="dialog"], .el-message-box'))
+                .filter(isVisible);
+            const dialog = dialogs.find((node) => normalize(node.innerText || node.textContent).includes('鏁版嵁瀵煎嚭'));
+            if (false && !dialog) {
+                return { ok: false, reason: 'export dialog not found', targetFingerprint, targetTimeText };
+            }
+            const rows = Array.from(document.querySelectorAll('tbody tr, .el-table__body tr, table tr, .el-table__row'))
+                .filter(isVisible)
+                .map((row, index) => ({
+                    node: row,
+                    index,
+                    text: normalize(row.innerText || row.textContent),
+                }))
+                .filter((row) => row.text);
+            const row = rows.find((item) => targetFingerprint && item.text === targetFingerprint)
+                || rows.find((item) => targetFingerprint && item.text.includes(targetFingerprint))
+                || rows.find((item) => targetTimeText && item.text.includes(targetTimeText));
+            if (!row) {
+                return {
+                    ok: false,
+                    reason: 'selected download record row not found',
+                    targetFingerprint,
+                    targetTimeText,
+                    candidates: rows.slice(0, 20).map((item) => item.text),
+                };
+            }
+            const findByText = (nodes) => nodes.find((item) => {
+                const current = normalize(item.innerText || item.textContent || item.value);
+                return current === targetDownloadText;
+            }) || nodes.find((item) => {
+                const current = normalize(item.innerText || item.textContent || item.value);
+                return current.includes(targetDownloadText);
+            });
+            const clickableNodes = Array.from(row.node.querySelectorAll('button, a, [role="button"], .el-button'))
+                .filter(isVisible);
+            const fallbackNodes = Array.from(row.node.querySelectorAll('span, div')).filter(isVisible);
+            const node = findByText(clickableNodes) || findByText(fallbackNodes);
+            if (!node) {
+                return {
+                    ok: false,
+                    reason: 'download target not found in selected row',
+                    rowText: row.text,
+                    targetDownloadText,
+                    candidates: [...clickableNodes, ...fallbackNodes]
+                        .slice(0, 20)
+                        .map((item) => normalize(item.innerText || item.textContent || item.value)),
+                };
+            }
+            node.scrollIntoView({ block: 'center', inline: 'center' });
+            if (node.focus) node.focus();
+            for (const eventName of ['mouseenter', 'mouseover', 'mousemove', 'mousedown', 'mouseup', 'click']) {
+                node.dispatchEvent(new MouseEvent(eventName, { bubbles: true, cancelable: true, view: window }));
+            }
+            if (node.click) node.click();
+            return {
+                ok: true,
+                rowText: row.text,
+                targetFingerprint,
+                targetTimeText,
+                clickedTag: node.tagName,
+                clickedClassName: String(node.className || ''),
+                clickedText: normalize(node.innerText || node.textContent || node.value),
+            };
+        }
+        """,
+        {"downloadText": download_text, "fingerprint": fingerprint, "timeText": time_text},
+    )
+    if not result.get("ok"):
+        raise YunqiRpaError(f"Could not click selected Yunqi export download record: {result}")
+
+
+def click_yunqi_export_download_and_capture(
+    page: Any,
+    *,
+    download_text: str,
+    timeout_ms: int,
+    selected_record: dict[str, Any] | None = None,
+) -> Any:
     response_error: Exception | None = None
     try:
         with page.expect_response(
             lambda response: "/api/proxytemu/export/download/" in response.url,
             timeout=timeout_ms,
         ) as response_info:
-            click_yunqi_export_dialog_text(page, download_text, timeout_ms=30000, prefer_download_row=True)
+            click_yunqi_export_record_download(
+                page,
+                download_text=download_text,
+                selected_record=selected_record,
+                timeout_ms=30000,
+            )
         response = response_info.value
         return response_to_download(page, response)
     except Exception as exc:  # noqa: BLE001
@@ -1782,7 +2011,12 @@ def click_yunqi_export_download_and_capture(page: Any, *, download_text: str, ti
 
     try:
         with page.expect_download(timeout=timeout_ms) as download_info:
-            click_yunqi_export_dialog_text(page, download_text, timeout_ms=30000, prefer_download_row=True)
+            click_yunqi_export_record_download(
+                page,
+                download_text=download_text,
+                selected_record=selected_record,
+                timeout_ms=30000,
+            )
         return download_info.value
     except Exception as exc:  # noqa: BLE001
         raise YunqiRpaError(
@@ -2000,6 +2234,8 @@ def repair_download_extension_for_content(path: Path) -> Path:
         target = path.with_name(f"{path.stem}_{counter}{inferred_suffix}")
         counter += 1
     path.rename(target)
+    if path.exists() and path.is_file():
+        path.unlink()
     return target
 
 
@@ -2018,6 +2254,18 @@ def save_error_screenshot(page: Any, download_dir: Path) -> str:
         return str(path)
     except Exception:  # noqa: BLE001
         return "screenshot-unavailable"
+
+
+def wait_for_user_on_error(*, keep_open_on_error: bool, config: YunqiRpaConfig) -> None:
+    if not keep_open_on_error or config.headless:
+        return
+    stdin = getattr(sys, "stdin", None)
+    if not stdin or not getattr(stdin, "isatty", lambda: False)():
+        return
+    try:
+        input("RPA failed. Inspect the robot browser, then press Enter to close it...")
+    except (EOFError, RuntimeError, OSError):
+        return
 
 
 def read_viewport_info(page: Any) -> dict[str, Any]:

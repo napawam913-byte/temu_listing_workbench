@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from typing import Any
 from urllib.parse import quote
@@ -8,11 +9,13 @@ from urllib.parse import quote
 from app.core.database import get_connection
 from app.modules.creative_generation.chatgpt_listing import build_openai_client, get_openai_settings
 from app.modules.creative_generation.safety import sanitize_marketplace_text
+from app.modules.recommendation.keyword_index import ensure_recommendation_schema
 from app.modules.sourcing_1688.search_url import build_1688_search_url
 
 
 DEFAULT_LIMIT = 6
 IMAGE_SEARCH_1688_URL = "https://s.1688.com/youyuan/index.htm"
+CACHE_SCHEMA_VERSION = "1688-smart-analysis-v2"
 DOMAIN_MATCH_TERMS = [
     "钥匙扣",
     "钥匙链",
@@ -35,6 +38,68 @@ DOMAIN_MATCH_TERMS = [
     "发饰",
     "发圈",
     "吊牌",
+]
+SPECIFIC_MATCH_TERMS = [
+    "情侣",
+    "一对",
+    "双人",
+    "男女",
+    "爱心",
+    "心形",
+    "首字母",
+    "字母",
+    "流苏",
+    "滴胶",
+    "树脂",
+    "亚克力",
+    "金属",
+    "合金",
+    "皮革",
+    "硅胶",
+    "陶瓷",
+    "可爱",
+    "卡通",
+    "儿童",
+    "少女",
+    "男士",
+    "女士",
+    "钥匙包",
+    "钥匙盒",
+    "收纳",
+    "分格",
+    "圆形",
+    "方形",
+    "长方形",
+    "透明",
+    "兔",
+    "猫",
+    "狗",
+    "车钥匙",
+]
+GENERIC_RECOMMENDATION_TERMS = {
+    "钥匙扣",
+    "钥匙链",
+    "钥匙圈",
+    "挂件",
+    "挂饰",
+    "吊坠",
+    "汽车",
+    "包包",
+    "配饰",
+    "饰品",
+    "礼物",
+    "批发",
+    "不同款",
+}
+SYNONYM_TERM_GROUPS = [
+    {"钥匙扣", "钥匙链", "钥匙圈", "钥匙环", "钥匙挂件"},
+    {"情侣", "一对", "双人", "男女"},
+    {"爱心", "心形"},
+    {"字母", "首字母"},
+    {"滴胶", "树脂"},
+    {"汽车钥匙", "车钥匙", "汽车"},
+    {"包包", "包饰", "挂包"},
+    {"药盒", "药片盒", "分药盒"},
 ]
 STOP_TERMS = {
     "1688",
@@ -154,14 +219,103 @@ def analyze_product_for_1688(product: dict[str, Any]) -> dict[str, Any]:
     title = clean_text(product.get("title") or product.get("titleEn"))
     category = clean_text(product.get("category") or product.get("categoryPath"))
     main_image_url = clean_text(product.get("mainImageUrl") or product.get("main_image_url"))
+    cache_key = build_analysis_cache_key(product, title=title, category=category, main_image_url=main_image_url)
+    title_hash = build_analysis_title_hash(title=title, category=category, main_image_url=main_image_url)
+
+    cached_analysis = load_cached_analysis(cache_key, title_hash)
+    if cached_analysis:
+        return {**cached_analysis, "cache": {"hit": True, "key": cache_key}}
 
     if settings.api_key:
         try:
-            return analyze_with_chatgpt(title=title, category=category, main_image_url=main_image_url, settings=settings)
+            analysis = analyze_with_chatgpt(title=title, category=category, main_image_url=main_image_url, settings=settings)
+            save_cached_analysis(cache_key, title_hash, analysis, model=settings.text_model)
+            return {**analysis, "cache": {"hit": False, "key": cache_key}}
         except Exception:
             pass
 
-    return build_fallback_analysis(title, category)
+    analysis = build_fallback_analysis(title, category)
+    save_cached_analysis(cache_key, title_hash, analysis, model="rule-fallback")
+    return {**analysis, "cache": {"hit": False, "key": cache_key}}
+
+
+def build_analysis_cache_key(product: dict[str, Any], *, title: str, category: str, main_image_url: str) -> str:
+    source_type = clean_text(product.get("sourceType") or product.get("source_type"))
+    source_product_id = clean_text(product.get("sourceProductId") or product.get("source_product_id"))
+    product_id = clean_text(product.get("id"))
+    if source_type and source_product_id:
+        return f"{source_type}:{source_product_id}"
+    if product_id:
+        return product_id
+    digest = hashlib.sha256(
+        json.dumps([title, category, main_image_url], ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return f"adhoc:{digest[:24]}"
+
+
+def build_analysis_title_hash(*, title: str, category: str, main_image_url: str) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "schema": CACHE_SCHEMA_VERSION,
+                "title": title,
+                "category": category,
+                "main_image_url": main_image_url,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def load_cached_analysis(cache_key: str, title_hash: str) -> dict[str, Any] | None:
+    if not cache_key:
+        return None
+    with get_connection() as conn:
+        ensure_recommendation_schema(conn)
+        row = conn.execute(
+            """
+            SELECT analysis_json
+            FROM product_ai_analysis_cache
+            WHERE product_id = ? AND title_hash = ?
+            """,
+            (cache_key, title_hash),
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        analysis = json.loads(row["analysis_json"])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(analysis, dict) or not isinstance(analysis.get("keywords"), list):
+        return None
+    return analysis
+
+
+def save_cached_analysis(cache_key: str, title_hash: str, analysis: dict[str, Any], *, model: str) -> None:
+    if not cache_key:
+        return
+    safe_analysis = {
+        "summary": clean_text(analysis.get("summary")),
+        "strategy": clean_text(analysis.get("strategy")),
+        "keywords": analysis.get("keywords") if isinstance(analysis.get("keywords"), list) else [],
+    }
+    with get_connection() as conn:
+        ensure_recommendation_schema(conn)
+        now = conn.execute("SELECT datetime('now') AS now").fetchone()["now"]
+        conn.execute(
+            """
+            INSERT INTO product_ai_analysis_cache (
+                product_id, title_hash, analysis_json, model, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(product_id) DO UPDATE SET
+                title_hash = excluded.title_hash,
+                analysis_json = excluded.analysis_json,
+                model = excluded.model,
+                updated_at = excluded.updated_at
+            """,
+            (cache_key, title_hash, json.dumps(safe_analysis, ensure_ascii=False), model, now, now),
+        )
 
 
 def analyze_with_chatgpt(*, title: str, category: str, main_image_url: str, settings: Any) -> dict[str, Any]:
@@ -399,7 +553,8 @@ def build_local_candidate_query_terms(product: dict[str, Any], keywords: list[di
     )
     product_terms = expand_match_terms(f"{product.get('title', '')} {product.get('titleEn', '')} {product_category}")
     keyword_terms = [term for keyword in keywords for term in expand_match_terms(keyword.get("keyword", ""))]
-    return unique_strings([*keyword_terms, *product_terms])[:48]
+    specific_terms = build_specific_relevance_terms(product, keywords)
+    return unique_strings([*specific_terms, *keyword_terms, *product_terms])[:48]
 
 
 def score_local_candidates(
@@ -413,7 +568,10 @@ def score_local_candidates(
     )
     product_terms = expand_match_terms(f"{product.get('title', '')} {product.get('titleEn', '')} {product_category}")
     keyword_terms = [term for keyword in keywords for term in expand_match_terms(keyword["keyword"])]
+    selected_specific_terms = build_specific_relevance_terms({}, keywords)
+    product_specific_terms = build_specific_relevance_terms(product, [])
     query_terms = unique_strings([*product_terms, *keyword_terms])
+    required_terms = unique_strings([*selected_specific_terms, *product_specific_terms])
 
     scored: list[dict[str, Any]] = []
     for candidate in candidates:
@@ -425,6 +583,8 @@ def score_local_candidates(
         title_terms = expand_match_terms(searchable_text)
         score = float(candidate.get("keyword_score") or 0)
         matched_keyword = ""
+        matched_selected_terms: list[str] = []
+        matched_specific_terms: list[str] = []
         matched_keywords = [
             clean_text(keyword)
             for keyword in str(candidate.get("matched_keywords") or "").split(",")
@@ -432,28 +592,52 @@ def score_local_candidates(
         ]
         if matched_keywords:
             matched_keyword = matched_keywords[0]
-        for term in keyword_terms:
-            if term and (term in searchable_text or any(term in title_term for title_term in title_terms)):
+        for term in selected_specific_terms:
+            if term_matches_text(term, searchable_text, title_terms):
+                matched_selected_terms.append(term)
+                score += 12
+                if not matched_keyword:
+                    matched_keyword = term
+
+        for term in required_terms:
+            if term_matches_text(term, searchable_text, title_terms):
+                matched_specific_terms.append(term)
                 score += 5
                 if not matched_keyword:
                     matched_keyword = term
+
+        for term in keyword_terms:
+            if term and term_matches_text(term, searchable_text, title_terms):
+                score += 2 if is_generic_recommendation_term(term) else 4
+                if not matched_keyword:
+                    matched_keyword = term
+
         for term in product_terms:
-            if term and (term in searchable_text or any(term in title_term for title_term in title_terms)):
-                score += 1
+            if term and term_matches_text(term, searchable_text, title_terms):
+                score += 0.5 if is_generic_recommendation_term(term) else 1
                 if not matched_keyword:
                     matched_keyword = term
         if product_category and category_text and (product_category in category_text or category_text in product_category):
             score += 3
             if not matched_keyword:
                 matched_keyword = keywords[0]["keyword"] if "采集素材" in category_text else category_text
-        if score <= 0:
+
+        if selected_specific_terms and not matched_selected_terms:
             continue
+        if required_terms and not matched_specific_terms:
+            continue
+
+        min_score = 10 if selected_specific_terms else 6
+        if score < min_score:
+            continue
+
+        match_label = matched_keyword or next(iter(matched_selected_terms + matched_specific_terms), "相关关键词")
         scored.append(
             {
                 **candidate,
                 "score": score,
-                "matched_keyword": matched_keyword,
-                "reason": f"本地商品列表命中“{matched_keyword}”，可作为相邻差异化参考。",
+                "matched_keyword": match_label,
+                "reason": f"本地商品列表命中“{match_label}”，与当前商品方向更接近。",
             }
         )
 
@@ -467,6 +651,62 @@ def score_local_candidates(
         ),
         reverse=True,
     )
+
+
+def build_specific_relevance_terms(product: dict[str, Any], keywords: list[dict[str, str]]) -> list[str]:
+    product_text = clean_text(
+        f"{product.get('title', '')} {product.get('titleEn', '')} "
+        f"{product.get('categoryPath') or product.get('category') or ''} "
+        f"{product.get('categoryLevel1') or ''} {product.get('categoryLevel2') or ''}"
+    )
+    keyword_text = clean_text(" ".join(keyword.get("keyword", "") for keyword in keywords))
+    raw_terms = [
+        *find_known_relevance_terms(product_text),
+        *find_known_relevance_terms(keyword_text),
+        *extract_terms(keyword_text),
+    ]
+    return unique_strings([term for term in raw_terms if is_specific_relevance_term(term)])[:18]
+
+
+def find_known_relevance_terms(text: str) -> list[str]:
+    clean = clean_text(text).lower()
+    known_terms = unique_strings([*SPECIFIC_MATCH_TERMS, *DOMAIN_MATCH_TERMS])
+    return [term for term in known_terms if term.lower() in clean]
+
+
+def is_specific_relevance_term(term: str) -> bool:
+    value = clean_text(term).lower()
+    if not value or value in STOP_TERMS or is_generic_recommendation_term(value):
+        return False
+    if any(stop_term in value for stop_term in STOP_TERMS if len(stop_term) >= 2):
+        return False
+    return 2 <= len(value) <= 12
+
+
+def is_generic_recommendation_term(term: str) -> bool:
+    value = clean_text(term).lower()
+    return value in {item.lower() for item in GENERIC_RECOMMENDATION_TERMS}
+
+
+def term_matches_text(term: str, text: str, expanded_terms: list[str]) -> bool:
+    value = clean_text(term).lower()
+    target_text = clean_text(text).lower()
+    if not value:
+        return False
+    if value in target_text or any(value in expanded_term for expanded_term in expanded_terms):
+        return True
+    aliases = get_term_aliases(value)
+    return any(alias in target_text for alias in aliases)
+
+
+def get_term_aliases(term: str) -> set[str]:
+    value = clean_text(term).lower()
+    aliases = {value}
+    for group in SYNONYM_TERM_GROUPS:
+        normalized_group = {item.lower() for item in group}
+        if value in normalized_group:
+            aliases.update(normalized_group)
+    return aliases
 
 
 def dedupe_sources(items: list[dict[str, Any]]) -> list[dict[str, Any]]:

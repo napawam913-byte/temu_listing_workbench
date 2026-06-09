@@ -34,8 +34,10 @@ def build_yunqi_category_filter_payload(
     return {
         "_name": f"yunqi_db_category_{stable_filter_key(resolved_path_text)}",
         "_description": f"从 yunqi_categories 表动态生成：{resolved_path_text}",
+        "_category_path": clean_path,
+        "_path_text": resolved_path_text,
         "start_url": start_url,
-        "setup_actions": [{"type": "assert_min_viewport", "width": 1400}],
+        "setup_actions": [{"type": "assert_min_viewport", "width": 1200}],
         "site_actions": [
             {
                 "type": "select_labeled_option",
@@ -77,10 +79,10 @@ def build_yunqi_category_filter_payload(
         "export_modal": {
             "start_text": "立即导出",
             "download_text": "下载",
-            "timeout_ms": 120000,
+            "timeout_ms": 300000,
             "confirm_timeout_ms": 15000,
             "download_response_timeout_ms": 60000,
-            "fallback_existing_after_ms": 30000,
+            "timestamp_tolerance_seconds": 5,
         },
     }
 

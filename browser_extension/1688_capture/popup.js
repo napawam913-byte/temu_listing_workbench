@@ -97,7 +97,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
 async function loadActiveSession() {
   try {
-    const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/active-session`);
+    const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/active-session`, { credentials: "include" });
     if (!response.ok) throw new Error("读取当前商品失败");
     const body = await response.json();
     activeSession = body?.temu_product_id ? body : null;
@@ -347,7 +347,7 @@ function sendCollectMessage(tabId) {
 }
 
 async function getJson(url) {
-  const response = await fetch(url);
+  const response = await fetch(url, { credentials: "include" });
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     throw new Error(body.detail || "工作台接口请求失败");
@@ -358,6 +358,7 @@ async function getJson(url) {
 async function postJson(url, payload) {
   const response = await fetch(url, {
     method: "POST",
+    credentials: "include",
     headers: payload ? { "Content-Type": "application/json" } : undefined,
     body: payload ? JSON.stringify(payload) : undefined,
   });
@@ -369,7 +370,7 @@ async function postJson(url, payload) {
 }
 
 async function deleteJson(url) {
-  const response = await fetch(url, { method: "DELETE" });
+  const response = await fetch(url, { method: "DELETE", credentials: "include" });
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     throw new Error(body.detail || "工作台接口请求失败");

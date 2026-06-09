@@ -22,12 +22,16 @@ type Props = {
   onRecordLinkEntry: (record: LinkListRecord) => void;
 };
 
-function formatMoney(value: number) {
-  return Number.isFinite(value) ? `¥${value.toFixed(2)}` : '-';
+function formatProductPrice(product: Product) {
+  if (!Number.isFinite(product.price)) return '-';
+  const symbol = product.sourceType === '1688' ? '¥' : '$';
+  return `${symbol}${product.price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 function formatUsd(value: number) {
-  return Number.isFinite(value) ? `$${(value / 1000).toFixed(1)}k` : '-';
+  return Number.isFinite(value)
+    ? `$${value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+    : '-';
 }
 
 function formatNumber(value?: number) {
@@ -101,9 +105,9 @@ export function ProductDetailDrawer({
             原始行：{product.sourceRow} · {product.category}
           </Text>
           <Descriptions column={2} className="product-descriptions">
-            <Descriptions.Item label="价格">¥{product.price.toFixed(2)}</Descriptions.Item>
+            <Descriptions.Item label="价格">{formatProductPrice(product)}</Descriptions.Item>
             <Descriptions.Item label="销量">{product.sales.toLocaleString()}</Descriptions.Item>
-            <Descriptions.Item label="GMV">${(product.gmv / 1000).toFixed(1)}k</Descriptions.Item>
+            <Descriptions.Item label="GMV">{formatUsd(product.gmv)}</Descriptions.Item>
             <Descriptions.Item label="评论数">{product.reviewCount.toLocaleString()}</Descriptions.Item>
             <Descriptions.Item label="上架时间">{product.listedAt}</Descriptions.Item>
             <Descriptions.Item label="增长率">+{product.growthRate}%</Descriptions.Item>
@@ -145,7 +149,7 @@ export function ProductDetailDrawer({
               </div>
 
               <Descriptions bordered column={2} className="drawer-sales-descriptions">
-                <Descriptions.Item label="商品价格">{formatMoney(product.price)}</Descriptions.Item>
+                <Descriptions.Item label="商品价格">{formatProductPrice(product)}</Descriptions.Item>
                 <Descriptions.Item label="增长率">+{product.growthRate}%</Descriptions.Item>
                 <Descriptions.Item label="上架时间">{product.listedAt || '-'}</Descriptions.Item>
                 <Descriptions.Item label="来源行">{product.sourceRow || '-'}</Descriptions.Item>

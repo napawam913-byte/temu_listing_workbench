@@ -10,6 +10,7 @@ from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 from app.core import config as app_config
+from app.core.database import get_app_setting_value
 
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 HTTP_TIMEOUT_SECONDS = 20
@@ -143,14 +144,21 @@ def upload_image_bytes(image_bytes: bytes, content_type: str, key_hint: str) -> 
 
 def get_oss_settings() -> dict[str, str]:
     return {
-        "enabled": os.getenv("ALIYUN_OSS_ENABLED", "1" if app_config.ALIYUN_OSS_ENABLED else ""),
-        "access_key_id": os.getenv("ALIYUN_OSS_ACCESS_KEY_ID", app_config.ALIYUN_OSS_ACCESS_KEY_ID).strip(),
-        "access_key_secret": os.getenv("ALIYUN_OSS_ACCESS_KEY_SECRET", app_config.ALIYUN_OSS_ACCESS_KEY_SECRET).strip(),
-        "endpoint": os.getenv("ALIYUN_OSS_ENDPOINT", app_config.ALIYUN_OSS_ENDPOINT).strip().rstrip("/"),
-        "bucket": os.getenv("ALIYUN_OSS_BUCKET", app_config.ALIYUN_OSS_BUCKET).strip(),
-        "public_base_url": os.getenv("ALIYUN_OSS_PUBLIC_BASE_URL", app_config.ALIYUN_OSS_PUBLIC_BASE_URL).strip().rstrip("/"),
-        "object_prefix": os.getenv("ALIYUN_OSS_OBJECT_PREFIX", app_config.ALIYUN_OSS_OBJECT_PREFIX).strip().strip("/"),
+        "enabled": get_runtime_setting("ALIYUN_OSS_ENABLED", "1" if app_config.ALIYUN_OSS_ENABLED else ""),
+        "access_key_id": get_runtime_setting("ALIYUN_OSS_ACCESS_KEY_ID", app_config.ALIYUN_OSS_ACCESS_KEY_ID).strip(),
+        "access_key_secret": get_runtime_setting("ALIYUN_OSS_ACCESS_KEY_SECRET", app_config.ALIYUN_OSS_ACCESS_KEY_SECRET).strip(),
+        "endpoint": get_runtime_setting("ALIYUN_OSS_ENDPOINT", app_config.ALIYUN_OSS_ENDPOINT).strip().rstrip("/"),
+        "bucket": get_runtime_setting("ALIYUN_OSS_BUCKET", app_config.ALIYUN_OSS_BUCKET).strip(),
+        "public_base_url": get_runtime_setting("ALIYUN_OSS_PUBLIC_BASE_URL", app_config.ALIYUN_OSS_PUBLIC_BASE_URL).strip().rstrip("/"),
+        "object_prefix": get_runtime_setting("ALIYUN_OSS_OBJECT_PREFIX", app_config.ALIYUN_OSS_OBJECT_PREFIX).strip().strip("/"),
     }
+
+
+def get_runtime_setting(key: str, default: str = "") -> str:
+    saved_value = get_app_setting_value(key, "")
+    if saved_value != "":
+        return saved_value
+    return os.getenv(key, default).strip()
 
 
 def is_enabled(value: str) -> bool:

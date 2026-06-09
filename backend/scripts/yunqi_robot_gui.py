@@ -81,17 +81,29 @@ STEP_DEFINITIONS = [
 def acquire_single_instance_lock() -> bool:
     global APP_LOCK_FILE
     lock_dir = BACKEND_DIR / "runtime"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = lock_dir / "yunqi_robot_gui.lock"
-    APP_LOCK_FILE = lock_path.open("a+", encoding="utf-8")
-    APP_LOCK_FILE.seek(0)
-    APP_LOCK_FILE.truncate()
-    APP_LOCK_FILE.write(str(os.getpid()))
-    APP_LOCK_FILE.flush()
     try:
-        msvcrt.locking(APP_LOCK_FILE.fileno(), msvcrt.LK_NBLCK, 1)
+        lock_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
         return False
+    lock_path = lock_dir / "yunqi_robot_gui.lock"
+    try:
+        lock_file = lock_path.open("a+", encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        lock_file.close()
+        return False
+    try:
+        lock_file.seek(0)
+        lock_file.truncate()
+        lock_file.write(str(os.getpid()))
+        lock_file.flush()
+    except OSError:
+        pass
+    APP_LOCK_FILE = lock_file
     return True
 
 

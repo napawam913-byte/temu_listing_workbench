@@ -6,6 +6,7 @@ from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from app.core.config import TMAPI_API_TOKEN, TMAPI_BASE_URL
+from app.core.database import get_app_setting_value
 
 
 class ImageSearchConfigError(Exception):
@@ -74,17 +75,26 @@ def tmapi_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     return tmapi_request("POST", path, payload=payload)
 
 
+def get_runtime_setting(key: str, default: str = "") -> str:
+    saved_value = get_app_setting_value(key, "")
+    if saved_value != "":
+        return saved_value
+    return default
+
+
 def tmapi_request(method: str, path: str, query: dict[str, Any] | None = None, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    if not TMAPI_API_TOKEN:
+    api_token = get_runtime_setting("TMAPI_API_TOKEN", TMAPI_API_TOKEN)
+    base_url = get_runtime_setting("TMAPI_BASE_URL", TMAPI_BASE_URL).rstrip("/")
+    if not api_token:
         raise ImageSearchConfigError("未配置 TMAPI_API_TOKEN，无法直接调用 1688 搜图 API")
-    if not TMAPI_BASE_URL:
+    if not base_url:
         raise ImageSearchConfigError("未配置 TMAPI_BASE_URL")
 
-    query_params = {"apiToken": TMAPI_API_TOKEN}
+    query_params = {"apiToken": api_token}
     if query:
         query_params.update({key: value for key, value in query.items() if value is not None and value != ""})
 
-    url = f"{TMAPI_BASE_URL}{path}?{urlencode(query_params)}"
+    url = f"{base_url}{path}?{urlencode(query_params)}"
     data = None
     headers = {"Accept": "application/json"}
     if payload is not None:

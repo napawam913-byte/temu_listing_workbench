@@ -1,6 +1,9 @@
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from typing import Any
+
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
+from app.api.auth import require_current_user
 from app.modules.sourcing_1688.link_importer import Link1688ImportError, import_1688_links
 from app.modules.yunqi.importer import YunqiImportError, import_yunqi_file
 
@@ -12,12 +15,15 @@ class Import1688LinksRequest(BaseModel):
 
 
 @router.post("/yunqi")
-async def upload_yunqi_file(file: UploadFile = File(...)):
+async def upload_yunqi_file(
+    file: UploadFile = File(...),
+    current_user: dict[str, Any] = Depends(require_current_user),
+):
     if not file.filename:
         raise HTTPException(status_code=400, detail="缺少文件名")
 
     try:
-        return import_yunqi_file(file.file, file.filename)
+        return import_yunqi_file(file.file, file.filename, add_to_pool_user_id=current_user["id"])
     except YunqiImportError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
@@ -25,9 +31,9 @@ async def upload_yunqi_file(file: UploadFile = File(...)):
 
 
 @router.post("/1688")
-def upload_1688_links(payload: Import1688LinksRequest):
+def upload_1688_links(payload: Import1688LinksRequest, current_user: dict[str, Any] = Depends(require_current_user)):
     try:
-        return import_1688_links(payload.product_urls)
+        return import_1688_links(payload.product_urls, add_to_pool_user_id=current_user["id"])
     except Link1688ImportError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import traceback
 from datetime import datetime
@@ -18,6 +19,7 @@ from app.modules.yunqi.rpa_exporter import YunqiRpaError, export_yunqi_excel_via
 
 BATCH_RUN_DIR = STORAGE_DIR / "yunqi_exports" / "batch_runs"
 BatchLogCallback = Callable[[str], None]
+INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
 
 
 def list_yunqi_leaf_categories(
@@ -127,7 +129,19 @@ def export_yunqi_all_categories(
             item["status"] = "exported"
             item["finished_at"] = now_text()
             item["rpa"] = export_result
-            item["download_path"] = export_result.get("download_path")
+            download_path = export_result.get("download_path")
+            if download_path:
+                renamed_path = rename_export_for_category(
+                    download_path,
+                    category_path=path,
+                    path_text=path_text,
+                )
+                if str(renamed_path) != str(download_path):
+                    export_result["original_download_path"] = str(download_path)
+                    export_result["download_path"] = str(renamed_path)
+                    item["original_download_path"] = str(download_path)
+                download_path = str(renamed_path)
+            item["download_path"] = download_path
             item["suggested_filename"] = export_result.get("suggested_filename")
             manifest["success_count"] += 1
             consecutive_errors = 0
@@ -186,6 +200,72 @@ def export_yunqi_all_categories(
 def write_manifest(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def rename_export_for_category(
+    download_path: str | Path,
+    *,
+    category_path: list[str],
+    path_text: str = "",
+    date_text: str | None = None,
+) -> Path:
+    source_path = Path(download_path)
+    if not source_path.exists() or not source_path.is_file():
+        return source_path
+
+    suffix = source_path.suffix or ".xlsx"
+    resolved_date = date_text or datetime.now().strftime("%Y-%m-%d")
+    raw_name = path_text or " > ".join(category_path)
+    stem = safe_category_export_stem(raw_name, max_length=180 - len(resolved_date) - len(suffix) - 1)
+    target_path = next_available_export_path(source_path.parent / f"{stem}_{resolved_date}{suffix}", source_path)
+    if target_path == source_path:
+        return source_path
+    source_path.rename(target_path)
+    remove_source_export_file(source_path, target_path)
+    return target_path
+
+
+def safe_category_export_stem(value: str, *, max_length: int = 160) -> str:
+    raw_parts = [part.strip() for part in re.split(r"\s*>\s*", str(value or "").strip()) if part.strip()]
+    safe_parts = []
+    for part in raw_parts:
+        cleaned = INVALID_FILENAME_CHARS.sub("_", part)
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        cleaned = re.sub(r"_+", "_", cleaned).strip(" ._")
+        if cleaned:
+            safe_parts.append(cleaned)
+    text = "__".join(safe_parts)
+    if len(text) > max_length:
+        text = text[:max_length].rstrip(" ._")
+    return text or "yunqi_category"
+
+
+def next_available_export_path(target_path: Path, source_path: Path) -> Path:
+    if same_path(target_path, source_path):
+        return source_path
+    if not target_path.exists():
+        return target_path
+
+    suffix = target_path.suffix
+    stem = target_path.stem
+    for counter in range(2, 10000):
+        candidate = target_path.with_name(f"{stem}_{counter}{suffix}")
+        if same_path(candidate, source_path):
+            return source_path
+        if not candidate.exists():
+            return candidate
+    raise YunqiCollectorError(f"无法为导出文件生成不冲突的类目文件名：{target_path}")
+
+
+def same_path(left: Path, right: Path) -> bool:
+    return str(left.resolve()).lower() == str(right.resolve()).lower()
+
+
+def remove_source_export_file(source_path: Path, target_path: Path) -> None:
+    if same_path(source_path, target_path):
+        return
+    if source_path.exists() and source_path.is_file():
+        source_path.unlink()
 
 
 def normalize_filter_text(value: str) -> str:

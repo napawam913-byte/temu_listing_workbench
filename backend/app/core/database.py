@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import sqlite3
+import secrets
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
@@ -11,7 +14,10 @@ from typing import Any, Iterator
 from app.modules.creative_generation.sensitive_terms_catalog import DEFAULT_SENSITIVE_TERMS
 from app.modules.recommendation.keyword_index import ensure_recommendation_schema, replace_product_keyword_index
 
-from .config import DATABASE_PATH, UPLOADS_DIR, ensure_runtime_dirs
+from .config import DATABASE_PATH, UPLOADS_DIR, WORKBENCH_DEFAULT_PASSWORD, WORKBENCH_DEFAULT_USERNAME, ensure_runtime_dirs
+
+
+DEFAULT_USER_ID = "default-user"
 
 
 def utc_now_text() -> str:
@@ -46,6 +52,44 @@ def init_db() -> None:
                 error_message TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE,
+                display_name TEXT,
+                password_hash TEXT NOT NULL,
+                password_salt TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'user',
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                token TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_seen_at TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_user_sessions_user
+                ON user_sessions(user_id, status);
+
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT 'general',
+                label TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                is_secret INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                updated_by TEXT,
+                FOREIGN KEY(updated_by) REFERENCES users(id)
             );
 
             CREATE TABLE IF NOT EXISTS products (
@@ -118,6 +162,22 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_product_pool_source_id ON product_pool_products(source_product_id);
             CREATE INDEX IF NOT EXISTS idx_product_pool_listing_time ON product_pool_products(listing_time);
             CREATE INDEX IF NOT EXISTS idx_product_pool_category ON product_pool_products(category_path);
+
+            CREATE TABLE IF NOT EXISTS product_pool_memberships (
+                user_id TEXT NOT NULL,
+                product_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(user_id, product_id),
+                FOREIGN KEY(user_id) REFERENCES users(id),
+                FOREIGN KEY(product_id) REFERENCES products(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_product_pool_memberships_user_status
+                ON product_pool_memberships(user_id, status);
+            CREATE INDEX IF NOT EXISTS idx_product_pool_memberships_product
+                ON product_pool_memberships(product_id);
 
             CREATE TABLE IF NOT EXISTS sourcing_capture_sessions (
                 id TEXT PRIMARY KEY,
@@ -205,9 +265,11 @@ def init_db() -> None:
         ensure_column(conn, "products", "source_type", "source_type TEXT NOT NULL DEFAULT 'yunqi'")
         ensure_column(conn, "products", "in_product_pool", "in_product_pool INTEGER NOT NULL DEFAULT 1")
         ensure_link_list_schema(conn)
+        seed_default_user(conn)
         ensure_product_identity_index(conn)
         ensure_yunqi_category_schema(conn)
         seed_product_pool_from_legacy_flag(conn)
+        seed_product_pool_memberships_from_legacy(conn)
         ensure_recommendation_schema(conn)
         seed_default_sensitive_terms(conn)
 
@@ -223,6 +285,7 @@ def ensure_link_list_schema(conn: sqlite3.Connection) -> None:
         """
         CREATE TABLE IF NOT EXISTS link_list_records (
             id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL DEFAULT 'default-user',
             product_id TEXT,
             product_title TEXT,
             product_title_en TEXT,
@@ -242,6 +305,13 @@ def ensure_link_list_schema(conn: sqlite3.Connection) -> None:
             ON link_list_records(product_id);
         CREATE INDEX IF NOT EXISTS idx_link_list_records_updated
             ON link_list_records(updated_at);
+        """
+    )
+    ensure_column(conn, "link_list_records", "user_id", "user_id TEXT NOT NULL DEFAULT 'default-user'")
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_link_list_records_user_status
+            ON link_list_records(user_id, status)
         """
     )
 
@@ -313,6 +383,479 @@ def ensure_yunqi_category_schema(conn: sqlite3.Connection) -> None:
     )
     ensure_column(conn, "yunqi_categories", "is_active", "is_active INTEGER NOT NULL DEFAULT 1")
     ensure_column(conn, "yunqi_categories", "source_snapshot_path", "source_snapshot_path TEXT")
+
+
+def seed_default_user(conn: sqlite3.Connection) -> None:
+    existing = conn.execute("SELECT id FROM users LIMIT 1").fetchone()
+    if existing:
+        return
+
+    salt, password_hash = hash_password(WORKBENCH_DEFAULT_PASSWORD)
+    now = utc_now_text()
+    conn.execute(
+        """
+        INSERT INTO users (
+            id, username, display_name, password_hash, password_salt, role, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, 'admin', 'active', ?, ?)
+        """,
+        (
+            DEFAULT_USER_ID,
+            WORKBENCH_DEFAULT_USERNAME,
+            WORKBENCH_DEFAULT_USERNAME,
+            password_hash,
+            salt,
+            now,
+            now,
+        ),
+    )
+
+
+def hash_password(password: str, salt: str | None = None) -> tuple[str, str]:
+    clean_password = str(password or "")
+    password_salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", clean_password.encode("utf-8"), password_salt.encode("utf-8"), 120_000)
+    return password_salt, digest.hex()
+
+
+def verify_password(password: str, *, salt: str, password_hash: str) -> bool:
+    _, candidate_hash = hash_password(password, salt)
+    return hmac.compare_digest(candidate_hash, password_hash)
+
+
+def public_user(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "username": row["username"],
+        "displayName": row["display_name"] or row["username"],
+        "role": row["role"],
+        "status": row["status"],
+    }
+
+
+def create_user(username: str, password: str, display_name: str | None = None) -> dict[str, Any]:
+    clean_username = " ".join(str(username or "").split()).strip()
+    if len(clean_username) < 2:
+        raise ValueError("用户名至少需要 2 个字符")
+    if len(str(password or "")) < 6:
+        raise ValueError("密码至少需要 6 个字符")
+
+    salt, password_hash = hash_password(password)
+    now = utc_now_text()
+    user_id = uuid.uuid4().hex
+    try:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO users (
+                    id, username, display_name, password_hash, password_salt, role, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'user', 'active', ?, ?)
+                """,
+                (
+                    user_id,
+                    clean_username,
+                    " ".join(str(display_name or clean_username).split()).strip(),
+                    password_hash,
+                    salt,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    except sqlite3.IntegrityError as exc:
+        raise ValueError("用户名已存在") from exc
+
+    return public_user(row)
+
+
+def list_users() -> list[dict[str, Any]]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                users.*,
+                COUNT(CASE WHEN user_sessions.status = 'active' THEN 1 END) AS active_session_count
+            FROM users
+            LEFT JOIN user_sessions ON user_sessions.user_id = users.id
+            GROUP BY users.id
+            ORDER BY users.created_at ASC
+            """
+        ).fetchall()
+    return [admin_public_user(row) for row in rows]
+
+
+def admin_public_user(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "username": row["username"],
+        "displayName": row["display_name"] or row["username"],
+        "role": row["role"],
+        "status": row["status"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+        "activeSessionCount": int(row["active_session_count"] or 0) if "active_session_count" in row.keys() else 0,
+    }
+
+
+def create_managed_user(
+    *,
+    username: str,
+    password: str,
+    display_name: str | None = None,
+    role: str = "user",
+    status: str = "active",
+) -> dict[str, Any]:
+    clean_username = " ".join(str(username or "").split()).strip()
+    if len(clean_username) < 2:
+        raise ValueError("用户名至少需要 2 个字符")
+    if len(str(password or "")) < 6:
+        raise ValueError("密码至少需要 6 个字符")
+    clean_role = normalize_user_role(role)
+    clean_status = normalize_user_status(status)
+
+    salt, password_hash = hash_password(password)
+    now = utc_now_text()
+    user_id = uuid.uuid4().hex
+    try:
+        with get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO users (
+                    id, username, display_name, password_hash, password_salt, role, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    clean_username,
+                    " ".join(str(display_name or clean_username).split()).strip(),
+                    password_hash,
+                    salt,
+                    clean_role,
+                    clean_status,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT users.*, 0 AS active_session_count
+                FROM users
+                WHERE id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+    except sqlite3.IntegrityError as exc:
+        raise ValueError("用户名已存在") from exc
+
+    return admin_public_user(row)
+
+
+def update_managed_user(
+    user_id: str,
+    *,
+    display_name: str | None = None,
+    role: str | None = None,
+    status: str | None = None,
+) -> dict[str, Any]:
+    clean_user_id = str(user_id or "").strip()
+    if not clean_user_id:
+        raise ValueError("缺少用户 ID")
+
+    updates: list[str] = []
+    params: list[Any] = []
+    if display_name is not None:
+        updates.append("display_name = ?")
+        params.append(" ".join(str(display_name).split()).strip())
+    if role is not None:
+        clean_role = normalize_user_role(role)
+        updates.append("role = ?")
+        params.append(clean_role)
+    if status is not None:
+        clean_status = normalize_user_status(status)
+        updates.append("status = ?")
+        params.append(clean_status)
+    if not updates:
+        with get_connection() as conn:
+            row = fetch_admin_user_row(conn, clean_user_id)
+        if not row:
+            raise ValueError("用户不存在")
+        return admin_public_user(row)
+
+    now = utc_now_text()
+    updates.append("updated_at = ?")
+    params.append(now)
+    params.append(clean_user_id)
+
+    with get_connection() as conn:
+        existing = conn.execute("SELECT * FROM users WHERE id = ?", (clean_user_id,)).fetchone()
+        if not existing:
+            raise ValueError("用户不存在")
+        next_role = normalize_user_role(role) if role is not None else existing["role"]
+        next_status = normalize_user_status(status) if status is not None else existing["status"]
+        if existing["role"] == "admin" and (next_role != "admin" or next_status != "active"):
+            active_admin_count = conn.execute(
+                "SELECT COUNT(*) FROM users WHERE role = 'admin' AND status = 'active'"
+            ).fetchone()[0]
+            if active_admin_count <= 1:
+                raise ValueError("至少需要保留一个启用中的管理员")
+
+        conn.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = ?", params)
+        if status is not None and next_status != "active":
+            conn.execute(
+                "UPDATE user_sessions SET status = 'revoked', updated_at = ? WHERE user_id = ? AND status = 'active'",
+                (now, clean_user_id),
+            )
+        row = fetch_admin_user_row(conn, clean_user_id)
+    return admin_public_user(row)
+
+
+def reset_managed_user_password(user_id: str, password: str) -> dict[str, Any]:
+    clean_user_id = str(user_id or "").strip()
+    if len(str(password or "")) < 6:
+        raise ValueError("密码至少需要 6 个字符")
+
+    salt, password_hash = hash_password(password)
+    now = utc_now_text()
+    with get_connection() as conn:
+        existing = conn.execute("SELECT id FROM users WHERE id = ?", (clean_user_id,)).fetchone()
+        if not existing:
+            raise ValueError("用户不存在")
+        conn.execute(
+            """
+            UPDATE users
+            SET password_salt = ?, password_hash = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (salt, password_hash, now, clean_user_id),
+        )
+        conn.execute(
+            "UPDATE user_sessions SET status = 'revoked', updated_at = ? WHERE user_id = ? AND status = 'active'",
+            (now, clean_user_id),
+        )
+        row = fetch_admin_user_row(conn, clean_user_id)
+    return admin_public_user(row)
+
+
+def fetch_admin_user_row(conn: sqlite3.Connection, user_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT
+            users.*,
+            COUNT(CASE WHEN user_sessions.status = 'active' THEN 1 END) AS active_session_count
+        FROM users
+        LEFT JOIN user_sessions ON user_sessions.user_id = users.id
+        WHERE users.id = ?
+        GROUP BY users.id
+        """,
+        (user_id,),
+    ).fetchone()
+
+
+def normalize_user_role(value: str) -> str:
+    clean_value = str(value or "user").strip().lower()
+    if clean_value not in {"admin", "user"}:
+        raise ValueError("角色只能是 admin 或 user")
+    return clean_value
+
+
+def normalize_user_status(value: str) -> str:
+    clean_value = str(value or "active").strip().lower()
+    if clean_value not in {"active", "disabled"}:
+        raise ValueError("状态只能是 active 或 disabled")
+    return clean_value
+
+
+def get_app_settings_map() -> dict[str, dict[str, Any]]:
+    with get_connection() as conn:
+        rows = conn.execute("SELECT * FROM app_settings").fetchall()
+    return {
+        row["key"]: {
+            "key": row["key"],
+            "value": row["value"],
+            "category": row["category"],
+            "label": row["label"],
+            "description": row["description"],
+            "isSecret": bool(row["is_secret"]),
+            "updatedAt": row["updated_at"],
+            "updatedBy": row["updated_by"],
+        }
+        for row in rows
+    }
+
+
+def get_app_setting_value(key: str, default: str = "") -> str:
+    clean_key = str(key or "").strip()
+    if not clean_key:
+        return default
+    try:
+        with get_connection() as conn:
+            row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (clean_key,)).fetchone()
+    except sqlite3.Error:
+        return default
+    return str(row["value"]) if row else default
+
+
+def upsert_app_setting(
+    *,
+    key: str,
+    value: str,
+    category: str = "general",
+    label: str = "",
+    description: str = "",
+    is_secret: bool = False,
+    updated_by: str | None = None,
+) -> dict[str, Any]:
+    clean_key = str(key or "").strip()
+    if not clean_key:
+        raise ValueError("缺少配置 key")
+    now = utc_now_text()
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO app_settings (key, value, category, label, description, is_secret, created_at, updated_at, updated_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                category = excluded.category,
+                label = excluded.label,
+                description = excluded.description,
+                is_secret = excluded.is_secret,
+                updated_at = excluded.updated_at,
+                updated_by = excluded.updated_by
+            """,
+            (
+                clean_key,
+                str(value or ""),
+                str(category or "general"),
+                str(label or ""),
+                str(description or ""),
+                1 if is_secret else 0,
+                now,
+                now,
+                updated_by,
+            ),
+        )
+        row = conn.execute("SELECT * FROM app_settings WHERE key = ?", (clean_key,)).fetchone()
+    return {
+        "key": row["key"],
+        "value": row["value"],
+        "category": row["category"],
+        "label": row["label"],
+        "description": row["description"],
+        "isSecret": bool(row["is_secret"]),
+        "updatedAt": row["updated_at"],
+        "updatedBy": row["updated_by"],
+    }
+
+
+def authenticate_user(username: str, password: str) -> dict[str, Any] | None:
+    clean_username = " ".join(str(username or "").split()).strip()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE username = ? AND status = 'active'",
+            (clean_username,),
+        ).fetchone()
+    if not row:
+        return None
+    if not verify_password(password, salt=row["password_salt"], password_hash=row["password_hash"]):
+        return None
+    return public_user(row)
+
+
+def create_user_session(user_id: str) -> dict[str, Any]:
+    token = secrets.token_urlsafe(32)
+    now = utc_now_text()
+    with get_connection() as conn:
+        user_row = conn.execute(
+            "SELECT * FROM users WHERE id = ? AND status = 'active'",
+            (user_id,),
+        ).fetchone()
+        if not user_row:
+            raise ValueError("用户不存在或已停用")
+        conn.execute(
+            """
+            INSERT INTO user_sessions (token, user_id, status, created_at, updated_at, last_seen_at)
+            VALUES (?, ?, 'active', ?, ?, ?)
+            """,
+            (token, user_id, now, now, now),
+        )
+    return {"token": token, "user": public_user(user_row)}
+
+
+def get_user_by_session_token(token: str) -> dict[str, Any] | None:
+    clean_token = str(token or "").strip()
+    if not clean_token:
+        return None
+
+    now = utc_now_text()
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT users.*
+            FROM user_sessions
+            JOIN users ON users.id = user_sessions.user_id
+            WHERE user_sessions.token = ?
+                AND user_sessions.status = 'active'
+                AND users.status = 'active'
+            """,
+            (clean_token,),
+        ).fetchone()
+        if row:
+            conn.execute(
+                """
+                UPDATE user_sessions
+                SET last_seen_at = ?, updated_at = ?
+                WHERE token = ?
+                """,
+                (now, now, clean_token),
+            )
+    return public_user(row) if row else None
+
+
+def revoke_user_session(token: str) -> bool:
+    clean_token = str(token or "").strip()
+    if not clean_token:
+        return False
+    now = utc_now_text()
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE user_sessions
+            SET status = 'revoked', updated_at = ?
+            WHERE token = ? AND status = 'active'
+            """,
+            (now, clean_token),
+        )
+    return cursor.rowcount > 0
+
+
+def seed_product_pool_memberships_from_legacy(conn: sqlite3.Connection) -> None:
+    existing_count = conn.execute("SELECT COUNT(*) FROM product_pool_memberships").fetchone()[0]
+    if existing_count:
+        return
+
+    legacy_ids = [
+        row["id"]
+        for row in conn.execute(
+            """
+            SELECT id
+            FROM product_pool_products
+            WHERE status != 'deleted'
+            """
+        ).fetchall()
+    ]
+    if not legacy_ids:
+        legacy_ids = [
+            row["id"]
+            for row in conn.execute(
+                """
+                SELECT id
+                FROM products
+                WHERE status != 'deleted'
+                    AND COALESCE(in_product_pool, 0) = 1
+                """
+            ).fetchall()
+        ]
+    copy_products_to_pool(conn, legacy_ids, user_id=DEFAULT_USER_ID)
 
 
 def seed_product_pool_from_legacy_flag(conn: sqlite3.Connection) -> None:
@@ -493,7 +1036,7 @@ def insert_upload_batch(
         )
 
 
-def replace_products(batch_id: str, products: list[dict[str, Any]]) -> None:
+def replace_products(batch_id: str, products: list[dict[str, Any]], *, add_to_pool_user_id: str | None = DEFAULT_USER_ID) -> None:
     now = utc_now_text()
     with get_connection() as conn:
         conn.executemany(
@@ -530,20 +1073,37 @@ def replace_products(batch_id: str, products: list[dict[str, Any]]) -> None:
             ],
         )
         replace_product_keyword_index(conn, products, now=now)
-        copy_products_to_pool(conn, [product["id"] for product in products], now=now)
+        if add_to_pool_user_id:
+            copy_products_to_pool(conn, [product["id"] for product in products], user_id=add_to_pool_user_id, now=now)
 
 
 def product_table_for_scope(scope: str) -> str:
     return "products" if scope == "all" else "product_pool_products"
 
 
-def copy_products_to_pool(conn: sqlite3.Connection, product_ids: list[str], *, now: str | None = None) -> int:
+def copy_products_to_pool(
+    conn: sqlite3.Connection,
+    product_ids: list[str],
+    *,
+    user_id: str = DEFAULT_USER_ID,
+    now: str | None = None,
+) -> int:
     clean_ids = [product_id.strip() for product_id in product_ids if product_id and product_id.strip()]
     if not clean_ids:
         return 0
 
     timestamp = now or utc_now_text()
     placeholders = ",".join("?" for _ in clean_ids)
+    membership_cursor = conn.executemany(
+        """
+        INSERT INTO product_pool_memberships (user_id, product_id, status, created_at, updated_at)
+        VALUES (?, ?, 'active', ?, ?)
+        ON CONFLICT(user_id, product_id) DO UPDATE SET
+            status = 'active',
+            updated_at = excluded.updated_at
+        """,
+        [(user_id, product_id, timestamp, timestamp) for product_id in clean_ids],
+    )
     cursor = conn.execute(
         f"""
         INSERT OR REPLACE INTO product_pool_products (
@@ -565,12 +1125,21 @@ def copy_products_to_pool(conn: sqlite3.Connection, product_ids: list[str], *, n
         """,
         [timestamp, timestamp, *clean_ids],
     )
-    return cursor.rowcount
+    return membership_cursor.rowcount if membership_cursor.rowcount != -1 else cursor.rowcount
 
 
-def list_link_list_records(*, include_deleted: bool = False, limit: int = 500) -> list[dict[str, Any]]:
+def list_link_list_records(
+    *,
+    user_id: str = DEFAULT_USER_ID,
+    include_deleted: bool = False,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
     safe_limit = max(1, min(int(limit or 500), 1000))
-    where_sql = "" if include_deleted else "WHERE status != 'deleted'"
+    where = ["user_id = ?"]
+    params: list[Any] = [user_id]
+    if not include_deleted:
+        where.append("status != 'deleted'")
+    where_sql = f"WHERE {' AND '.join(where)}"
     with get_connection() as conn:
         ensure_link_list_schema(conn)
         rows = conn.execute(
@@ -581,17 +1150,19 @@ def list_link_list_records(*, include_deleted: bool = False, limit: int = 500) -
             ORDER BY datetime(created_at) DESC, datetime(updated_at) DESC
             LIMIT ?
             """,
-            (safe_limit,),
+            [*params, safe_limit],
         ).fetchall()
 
     return [link_list_record_row_to_api(row) for row in rows]
 
 
-def upsert_link_list_record(record: dict[str, Any]) -> dict[str, Any]:
+def upsert_link_list_record(record: dict[str, Any], *, user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
     if not isinstance(record, dict):
         raise ValueError("链接记录格式不正确")
 
     normalized = normalize_link_list_record(record)
+    normalized["userId"] = user_id
+    db_record_id = scoped_link_record_id(user_id, normalized["id"])
     now = utc_now_text()
     created_at = _clean_record_text(normalized.get("createdAt")) or now
     metadata = link_list_record_metadata(normalized)
@@ -600,11 +1171,12 @@ def upsert_link_list_record(record: dict[str, Any]) -> dict[str, Any]:
         conn.execute(
             """
             INSERT INTO link_list_records (
-                id, product_id, product_title, product_title_en, source_product_url,
+                id, user_id, product_id, product_title, product_title_en, source_product_url,
                 source_count, sku_count, component_sku_count, record_json, status,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
             ON CONFLICT(id) DO UPDATE SET
+                user_id = excluded.user_id,
                 product_id = excluded.product_id,
                 product_title = excluded.product_title,
                 product_title_en = excluded.product_title_en,
@@ -617,7 +1189,8 @@ def upsert_link_list_record(record: dict[str, Any]) -> dict[str, Any]:
                 updated_at = excluded.updated_at
             """,
             (
-                normalized["id"],
+                db_record_id,
+                user_id,
                 metadata["product_id"],
                 metadata["product_title"],
                 metadata["product_title_en"],
@@ -630,22 +1203,26 @@ def upsert_link_list_record(record: dict[str, Any]) -> dict[str, Any]:
                 now,
             ),
         )
-        row = conn.execute("SELECT * FROM link_list_records WHERE id = ?", (normalized["id"],)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM link_list_records WHERE id = ? AND user_id = ?",
+            (db_record_id, user_id),
+        ).fetchone()
 
     return link_list_record_row_to_api(row)
 
 
-def upsert_link_list_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def upsert_link_list_records(records: list[dict[str, Any]], *, user_id: str = DEFAULT_USER_ID) -> list[dict[str, Any]]:
     if not isinstance(records, list):
         raise ValueError("链接记录列表格式不正确")
-    return [upsert_link_list_record(record) for record in records if isinstance(record, dict)]
+    return [upsert_link_list_record(record, user_id=user_id) for record in records if isinstance(record, dict)]
 
 
-def soft_delete_link_list_record(record_id: str) -> bool:
+def soft_delete_link_list_record(record_id: str, *, user_id: str = DEFAULT_USER_ID) -> bool:
     clean_id = _clean_record_text(record_id)
     if not clean_id:
         return False
 
+    db_record_id = scoped_link_record_id(user_id, clean_id)
     now = utc_now_text()
     with get_connection() as conn:
         ensure_link_list_schema(conn)
@@ -653,11 +1230,19 @@ def soft_delete_link_list_record(record_id: str) -> bool:
             """
             UPDATE link_list_records
             SET status = 'deleted', updated_at = ?
-            WHERE id = ? AND status != 'deleted'
+            WHERE id = ? AND user_id = ? AND status != 'deleted'
             """,
-            (now, clean_id),
+            (now, db_record_id, user_id),
         )
     return cursor.rowcount > 0
+
+
+def scoped_link_record_id(user_id: str, record_id: str) -> str:
+    clean_user_id = _clean_record_text(user_id) or DEFAULT_USER_ID
+    clean_record_id = _clean_record_text(record_id)
+    if clean_user_id == DEFAULT_USER_ID:
+        return clean_record_id
+    return f"{clean_user_id}:{clean_record_id}"
 
 
 def normalize_link_list_record(record: dict[str, Any]) -> dict[str, Any]:
@@ -706,6 +1291,7 @@ def link_list_record_row_to_api(row: sqlite3.Row | None) -> dict[str, Any]:
     if not isinstance(record, dict):
         record = {}
     record.setdefault("id", row["id"])
+    record.setdefault("userId", row["user_id"] if "user_id" in row.keys() else DEFAULT_USER_ID)
     record.setdefault("createdAt", row["created_at"])
     record.setdefault("productId", row["product_id"] or "")
     record.setdefault("productTitle", row["product_title"] or "")
@@ -741,9 +1327,11 @@ def list_products(
     gmv_min: float | None = None,
     gmv_max: float | None = None,
     scope: str = "pool",
+    sort_by: str | None = None,
+    sort_order: str | None = None,
     include_deleted: bool = False,
+    user_id: str = DEFAULT_USER_ID,
 ) -> dict[str, Any]:
-    table_name = product_table_for_scope(scope)
     where, params = build_product_where(
         keyword=keyword,
         period=period,
@@ -756,19 +1344,32 @@ def list_products(
         gmv_max=gmv_max,
         include_deleted=include_deleted,
     )
+    if scope == "pool":
+        where.append("membership.user_id = ?")
+        where.append("membership.status != 'deleted'")
+        params.append(user_id)
+        from_sql = """
+            products
+            JOIN product_pool_memberships AS membership
+                ON membership.product_id = products.id
+        """
+    else:
+        from_sql = "products"
 
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     safe_page = max(1, page)
     safe_page_size = max(1, min(100, page_size))
     offset = (safe_page - 1) * safe_page_size
+    order_sql = build_product_order_sql(sort_by, sort_order)
 
     with get_connection() as conn:
-        total = conn.execute(f"SELECT COUNT(*) FROM {table_name} {where_sql}", params).fetchone()[0]
+        total = conn.execute(f"SELECT COUNT(*) FROM {from_sql} {where_sql}", params).fetchone()[0]
         rows = conn.execute(
             f"""
-            SELECT * FROM {table_name}
+            SELECT products.*
+            FROM {from_sql}
             {where_sql}
-            ORDER BY datetime(listing_time) DESC, gmv_usd DESC
+            ORDER BY {order_sql}
             LIMIT ? OFFSET ?
             """,
             [*params, safe_page_size, offset],
@@ -782,34 +1383,57 @@ def list_products(
     }
 
 
-def get_product_stats(scope: str = "pool") -> dict[str, int]:
-    table_name = product_table_for_scope(scope)
+def build_product_order_sql(sort_by: str | None, sort_order: str | None) -> str:
+    direction = "ASC" if sort_order == "asc" else "DESC"
+    if sort_by == "price":
+        return f"products.price_usd {direction}, datetime(products.listing_time) DESC, products.gmv_usd DESC"
+    if sort_by == "gmv":
+        return f"products.gmv_usd {direction}, datetime(products.listing_time) DESC, products.price_usd ASC"
+    return "datetime(products.listing_time) DESC, products.gmv_usd DESC"
+
+
+def get_product_stats(scope: str = "pool", *, user_id: str = DEFAULT_USER_ID) -> dict[str, int]:
+    if scope == "pool":
+        from_sql = """
+            products
+            JOIN product_pool_memberships AS membership
+                ON membership.product_id = products.id
+        """
+        user_filter = "AND membership.user_id = ? AND membership.status != 'deleted'"
+        params: list[Any] = [user_id]
+    else:
+        from_sql = "products"
+        user_filter = ""
+        params = []
+
     with get_connection() as conn:
         row = conn.execute(
             f"""
             SELECT
-                SUM(CASE WHEN status != 'deleted' THEN 1 ELSE 0 END) AS active_count,
+                SUM(CASE WHEN products.status != 'deleted' THEN 1 ELSE 0 END) AS active_count,
                 SUM(
                     CASE
-                        WHEN status != 'deleted'
-                            AND listing_time IS NOT NULL
-                            AND weekly_sales > 0
-                            AND datetime(listing_time) >= datetime('now', '-7 days')
+                        WHEN products.status != 'deleted'
+                            AND products.listing_time IS NOT NULL
+                            AND products.weekly_sales > 0
+                            AND datetime(products.listing_time) >= datetime('now', '-7 days')
                         THEN 1 ELSE 0
                     END
                 ) AS recent_7_count,
                 SUM(
                     CASE
-                        WHEN status != 'deleted'
-                            AND listing_time IS NOT NULL
-                            AND monthly_sales > 0
-                            AND datetime(listing_time) >= datetime('now', '-30 days')
+                        WHEN products.status != 'deleted'
+                            AND products.listing_time IS NOT NULL
+                            AND products.monthly_sales > 0
+                            AND datetime(products.listing_time) >= datetime('now', '-30 days')
                         THEN 1 ELSE 0
                     END
                 ) AS recent_30_count,
-                SUM(CASE WHEN status = 'deleted' THEN 1 ELSE 0 END) AS deleted_count
-            FROM {table_name}
-            """
+                SUM(CASE WHEN products.status = 'deleted' THEN 1 ELSE 0 END) AS deleted_count
+            FROM {from_sql}
+            WHERE 1 = 1 {user_filter}
+            """,
+            params,
         ).fetchone()
 
     return {
@@ -821,6 +1445,115 @@ def get_product_stats(scope: str = "pool") -> dict[str, int]:
 
 
 def get_product_categories() -> list[dict[str, Any]]:
+    yunqi_options = get_yunqi_category_options()
+    if yunqi_options:
+        return yunqi_options
+    return get_product_categories_from_products()
+
+
+def get_yunqi_category_options() -> list[dict[str, Any]]:
+    with get_connection() as conn:
+        category_rows = conn.execute(
+            """
+            SELECT category_key, parent_key, level, label, label_cn, path_text, path_json
+            FROM yunqi_categories
+            WHERE source_type = 'yunqi' AND is_active = 1
+            ORDER BY level ASC, path_text ASC
+            """
+        ).fetchall()
+        if not category_rows:
+            return []
+
+        product_rows = conn.execute(
+            """
+            SELECT category_level1, category_level2, category_path, COUNT(*) AS count
+            FROM products
+            WHERE status != 'deleted'
+                AND category_level1 IS NOT NULL
+                AND category_level1 != ''
+            GROUP BY category_level1, category_level2, category_path
+            """
+        ).fetchall()
+
+    level1_counts: dict[str, int] = {}
+    path_counts: dict[str, int] = {}
+    for row in product_rows:
+        count = int(row["count"] or 0)
+        level1 = str(row["category_level1"] or "").strip()
+        if level1:
+            level1_counts[level1] = level1_counts.get(level1, 0) + count
+        category_path = normalize_category_option_path(row["category_path"])
+        if category_path:
+            path_counts[category_path] = path_counts.get(category_path, 0) + count
+
+    top_rows: list[dict[str, Any]] = []
+    children_by_top: dict[str, list[dict[str, Any]]] = {}
+    for row in category_rows:
+        path_parts = parse_category_path_parts(row["path_json"], row["path_text"])
+        if not path_parts:
+            continue
+
+        label = str(row["label_cn"] or row["label"] or path_parts[-1]).strip()
+        value = "/".join(path_parts)
+        level = int(row["level"] or len(path_parts) or 1)
+        top_label = path_parts[0]
+        if level <= 1 or len(path_parts) == 1:
+            count = level1_counts.get(label, level1_counts.get(top_label, path_counts.get(value, 0)))
+            top_rows.append(
+                {
+                    "value": top_label,
+                    "label": label or top_label,
+                    "count": count,
+                    "level": 1,
+                    "children": [],
+                    "_top_key": top_label,
+                }
+            )
+            continue
+
+        count = path_counts.get(value, 0)
+        child_label = " / ".join(path_parts[1:])
+        children_by_top.setdefault(top_label, []).append(
+            {
+                "value": value,
+                "label": child_label or label,
+                "count": count,
+                "level": min(level, 2),
+            }
+        )
+
+    seen_top: set[str] = set()
+    options: list[dict[str, Any]] = []
+    for row in sorted(top_rows, key=lambda item: (-int(item["count"] or 0), str(item["label"]))):
+        if row["value"] in seen_top:
+            continue
+        seen_top.add(row["value"])
+        raw_children = children_by_top.get(str(row.get("_top_key") or row["label"]), [])
+        row["children"] = sorted(raw_children, key=lambda item: (-int(item["count"] or 0), str(item["label"])))
+        row.pop("_top_key", None)
+        options.append(row)
+
+    return options
+
+
+def parse_category_path_parts(path_json: str | None, path_text: str | None) -> list[str]:
+    parts: list[str] = []
+    try:
+        loaded = json.loads(path_json or "[]")
+        if isinstance(loaded, list):
+            parts = [str(item).strip() for item in loaded if str(item).strip()]
+    except (TypeError, ValueError):
+        parts = []
+    if not parts:
+        parts = [part.strip() for part in str(path_text or "").replace("/", ">").split(">") if part.strip()]
+    return parts
+
+
+def normalize_category_option_path(value: Any) -> str:
+    return "/".join(part.strip() for part in str(value or "").replace(">", "/").split("/") if part.strip())
+
+
+def get_product_categories_from_products() -> list[dict[str, Any]]:
     with get_connection() as conn:
         level1_rows = conn.execute(
             """
@@ -888,30 +1621,32 @@ def build_product_where(
     params: list[Any] = []
 
     if not include_deleted:
-        where.append("status != 'deleted'")
+        where.append("products.status != 'deleted'")
 
     if keyword:
         like = f"%{keyword.strip()}%"
-        where.append("(title LIKE ? OR title_cn LIKE ? OR title_en LIKE ? OR source_product_id LIKE ?)")
+        where.append(
+            "(products.title LIKE ? OR products.title_cn LIKE ? OR products.title_en LIKE ? OR products.source_product_id LIKE ?)"
+        )
         params.extend([like, like, like, like])
 
     if category and category != "全部类目":
         normalized_category = category.strip()
         if "/" in normalized_category:
-            where.append("category_path = ?")
+            where.append("products.category_path = ?")
             params.append(normalized_category)
         else:
-            where.append("(category_level1 = ? OR category_level2 = ?)")
+            where.append("(products.category_level1 = ? OR products.category_level2 = ?)")
             params.extend([normalized_category, normalized_category])
 
     if period == "近7天":
-        where.append("datetime(listing_time) >= datetime('now', '-7 days')")
+        where.append("datetime(products.listing_time) >= datetime('now', '-7 days')")
     elif period == "近30天":
-        where.append("datetime(listing_time) >= datetime('now', '-30 days')")
+        where.append("datetime(products.listing_time) >= datetime('now', '-30 days')")
 
-    add_range_filter(where, params, "price_usd", price_min, price_max)
-    add_range_filter(where, params, "MAX(weekly_sales, monthly_sales)", sales_min, sales_max)
-    add_range_filter(where, params, "gmv_usd", gmv_min, gmv_max)
+    add_range_filter(where, params, "products.price_usd", price_min, price_max)
+    add_range_filter(where, params, "MAX(products.weekly_sales, products.monthly_sales)", sales_min, sales_max)
+    add_range_filter(where, params, "products.gmv_usd", gmv_min, gmv_max)
 
     return where, params
 
@@ -1239,7 +1974,11 @@ def normalize_1688_category_parts(value: Any) -> list[str]:
     return parts[:5]
 
 
-def create_product_from_sourcing_material_1688(material_id: str) -> dict[str, Any]:
+def create_product_from_sourcing_material_1688(
+    material_id: str,
+    *,
+    add_to_pool_user_id: str | None = DEFAULT_USER_ID,
+) -> dict[str, Any]:
     material = get_sourcing_material_1688(material_id)
     offer_id = material.get("offer_id")
     product_url = material["product_url"]
@@ -1285,7 +2024,7 @@ def create_product_from_sourcing_material_1688(material_id: str) -> dict[str, An
         imported_count=1,
         failed_count=0,
     )
-    replace_products(batch_id, [product])
+    replace_products(batch_id, [product], add_to_pool_user_id=add_to_pool_user_id)
 
     with get_connection() as conn:
         conn.execute(
@@ -1350,24 +2089,33 @@ def sourcing_material_row_to_api(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def soft_delete_product(product_id: str, scope: str = "pool") -> bool:
+def soft_delete_product(product_id: str, scope: str = "pool", *, user_id: str = DEFAULT_USER_ID) -> bool:
     now = utc_now_text()
-    table_name = product_table_for_scope(scope)
     with get_connection() as conn:
-        cursor = conn.execute(
-            f"UPDATE {table_name} SET status = 'deleted', updated_at = ? WHERE id = ?",
-            (now, product_id),
-        )
+        if scope == "pool":
+            cursor = conn.execute(
+                """
+                UPDATE product_pool_memberships
+                SET status = 'deleted', updated_at = ?
+                WHERE user_id = ? AND product_id = ? AND status != 'deleted'
+                """,
+                (now, user_id, product_id),
+            )
+        else:
+            cursor = conn.execute(
+                "UPDATE products SET status = 'deleted', updated_at = ? WHERE id = ?",
+                (now, product_id),
+            )
         return cursor.rowcount > 0
 
 
-def add_products_to_pool(product_ids: list[str]) -> int:
+def add_products_to_pool(product_ids: list[str], *, user_id: str = DEFAULT_USER_ID) -> int:
     clean_ids = [product_id.strip() for product_id in product_ids if product_id and product_id.strip()]
     if not clean_ids:
         return 0
 
     with get_connection() as conn:
-        return copy_products_to_pool(conn, clean_ids)
+        return copy_products_to_pool(conn, clean_ids, user_id=user_id)
 
 
 def product_row_to_api(row: sqlite3.Row) -> dict[str, Any]:

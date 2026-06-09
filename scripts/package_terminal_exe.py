@@ -7,10 +7,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXE = ROOT / "DxmTemuTerminalRobot.exe"
+PACKAGE_DIR = ROOT / "dist" / "DxmTemuTerminalRobot"
+EXE = PACKAGE_DIR / "DxmTemuTerminalRobot.exe"
+ROOT_EXE = ROOT / "DxmTemuTerminalRobot.exe"
 LEGACY_CODE = ROOT / "work" / "extracted_terminal_app.pyc"
 BASE_CODE = ROOT / "work" / "terminal_app_base.pyc"
-PACKAGE_DIR = ROOT / "dist" / "DxmTemuTerminalRobot"
 PACKAGE_IGNORE_NAMES = {
     "Cache",
     "Code Cache",
@@ -25,6 +26,17 @@ PACKAGE_IGNORE_NAMES = {
     "component_crx_cache",
     "Safe Browsing",
     "GraphiteDawnCache",
+    "downloads",
+    "logs",
+    "chrome-profile",
+    "Sessions",
+    "Session Storage",
+}
+PACKAGE_IGNORE_FILE_NAMES = {
+    "Cookies",
+    "Cookies-journal",
+    "Safe Browsing Cookies",
+    "Safe Browsing Cookies-journal",
 }
 PACKAGE_IGNORE_FILE_SUFFIXES = {".tmp", ".log"}
 
@@ -32,6 +44,9 @@ PACKAGE_IGNORE_FILE_SUFFIXES = {".tmp", ".log"}
 def package_ignore(_directory: str, names: list[str]) -> set[str]:
     ignored: set[str] = set()
     for name in names:
+        if name in PACKAGE_IGNORE_FILE_NAMES:
+            ignored.add(name)
+            continue
         if name in PACKAGE_IGNORE_NAMES:
             ignored.add(name)
             continue
@@ -47,7 +62,7 @@ def main() -> None:
         raise FileNotFoundError(f"缺少机器人基座程序：{BASE_CODE}")
     build_dir = ROOT / "build" / "DxmTemuTerminalRobot"
     generated = ROOT / "dist" / "DxmTemuTerminalRobot.exe"
-    for path in (build_dir, PACKAGE_DIR):
+    for path in (build_dir,):
         if path.exists():
             shutil.rmtree(path)
     if generated.exists():
@@ -83,16 +98,32 @@ def main() -> None:
         cwd=ROOT,
         check=True,
     )
-    if EXE.exists():
-        EXE.unlink()
-    shutil.move(str(generated), str(EXE))
     if build_dir.exists():
         shutil.rmtree(build_dir)
     if spec.exists():
         spec.unlink()
     PACKAGE_DIR.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(EXE, PACKAGE_DIR / EXE.name)
+    if EXE.exists():
+        EXE.unlink()
+    shutil.move(str(generated), str(EXE))
+    if ROOT_EXE.exists():
+        ROOT_EXE.unlink()
+    preserved_state: dict[str, bytes] = {}
+    state_dir = PACKAGE_DIR / "work" / "state"
+    if state_dir.exists():
+        for path in state_dir.glob("*.json"):
+            try:
+                preserved_state[path.name] = path.read_bytes()
+            except OSError:
+                pass
     shutil.copytree(ROOT / "work", PACKAGE_DIR / "work", dirs_exist_ok=True, ignore=package_ignore)
+    if preserved_state:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        for name, content in preserved_state.items():
+            try:
+                (state_dir / name).write_bytes(content)
+            except OSError:
+                pass
     print(f"已生成: {EXE}")
     print(f"已生成运行包: {PACKAGE_DIR}")
 

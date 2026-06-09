@@ -64,6 +64,23 @@ OPENAI_IMAGE_QUALITY = os.getenv("OPENAI_IMAGE_QUALITY", "medium").strip()
 TMAPI_API_TOKEN = os.getenv("TMAPI_API_TOKEN", "").strip()
 TMAPI_BASE_URL = os.getenv("TMAPI_BASE_URL", "http://api.tmapi.top").strip().rstrip("/")
 
+WORKBENCH_SYNC_TOKEN = (
+    os.getenv("WORKBENCH_SYNC_TOKEN")
+    or os.getenv("TEMU_WORKBENCH_SYNC_TOKEN")
+    or ""
+).strip()
+
+WORKBENCH_DEFAULT_USERNAME = os.getenv("WORKBENCH_DEFAULT_USERNAME", "admin").strip() or "admin"
+WORKBENCH_DEFAULT_PASSWORD = os.getenv("WORKBENCH_DEFAULT_PASSWORD", "admin123").strip() or "admin123"
+WORKBENCH_SESSION_COOKIE_NAME = os.getenv("WORKBENCH_SESSION_COOKIE_NAME", "temu_workbench_session").strip() or "temu_workbench_session"
+WORKBENCH_SESSION_COOKIE_SECURE = (
+    os.getenv("WORKBENCH_SESSION_COOKIE_SECURE", "").strip().lower() in {"1", "true", "yes", "on"}
+)
+WORKBENCH_SESSION_COOKIE_SAMESITE = os.getenv("WORKBENCH_SESSION_COOKIE_SAMESITE", "lax").strip().lower() or "lax"
+if WORKBENCH_SESSION_COOKIE_SAMESITE not in {"lax", "strict", "none"}:
+    WORKBENCH_SESSION_COOKIE_SAMESITE = "lax"
+WORKBENCH_SESSION_COOKIE_MAX_AGE_SECONDS = int(os.getenv("WORKBENCH_SESSION_COOKIE_MAX_AGE_SECONDS", "2592000"))
+
 
 def ensure_runtime_dirs() -> None:
     for path in (DATA_DIR, DATABASE_PATH.parent, UPLOADS_DIR, EXPORTS_DIR, TEMPLATES_DIR):
