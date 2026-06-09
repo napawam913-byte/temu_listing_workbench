@@ -1023,6 +1023,7 @@ body {
   gap: 22px;
   grid-template-columns: 300px minmax(0, 1fr);
   height: calc(100vh - 122px);
+  min-height: 0;
 }
 
 .drawer-product-side,
@@ -1030,6 +1031,7 @@ body {
   border: 1px solid #e2e8f0;
   border-radius: 12px;
   box-shadow: 0 10px 24px rgba(15, 23, 42, 0.04);
+  min-height: 0;
 }
 
 .drawer-product-side {
@@ -1368,10 +1370,12 @@ body {
   min-width: 0;
   overflow: auto;
   padding: 18px 24px 22px;
+  overscroll-behavior: contain;
 }
 
 .sourcing-panel {
   height: 100%;
+  min-height: 0;
 }
 
 .sourcing-panel .ant-tabs-nav {
@@ -2218,6 +2222,16 @@ body {
 .sku-combo-result-actions {
   margin-top: 14px;
   width: 100%;
+}
+
+.sku-combo-result-actions-top {
+  background: #ffffff;
+  border-bottom: 1px solid #eef2f7;
+  margin: -4px 0 12px;
+  padding-bottom: 12px;
+  position: sticky;
+  top: 0;
+  z-index: 3;
 }
 
 .sku-combo-result-actions .ant-btn {
@@ -3849,11 +3863,14 @@ body {
 
 .drawer-sourcing-side {
   background: #ffffff;
-  overflow: hidden;
+  min-width: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
 }
 
 .sourcing-panel {
   box-shadow: none;
+  min-height: 0;
 }
 
 .sourcing-panel .ant-tabs-nav {

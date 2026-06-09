@@ -1681,6 +1681,19 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
               <Empty description="先在左侧选择货源，再勾选 SKU 加入这里。" />
             ) : (
               <>
+                <Space className="sku-combo-result-actions sku-combo-result-actions-top" direction="vertical" size={8}>
+                  <Button block onClick={() => setTab('preview')}>
+                    预览商品页
+                  </Button>
+                  <Button
+                    block
+                    className="sku-combo-confirm"
+                    type="primary"
+                    onClick={recordSelectedSkuLinks}
+                  >
+                    录入链接列表
+                  </Button>
+                </Space>
                 <div className="sku-combo-summary">
                   <div>
                     <Text type="secondary">已选项</Text>
