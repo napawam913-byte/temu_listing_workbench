@@ -2644,7 +2644,7 @@ def _basic_attr_label_key(label: str) -> str:
 
 def _is_optional_basic_attr_label(label: str) -> bool:
     key = _basic_attr_label_key(label)
-    return any(token in key for token in ("适用年龄段", "节日", "品牌名", "品牌"))
+    return any(token in key for token in ("节日", "品牌名", "品牌"))
 
 
 def _missing_required_label_text(value: Any) -> str:
@@ -2675,6 +2675,36 @@ def _text_mentions_label(text: str, label: str) -> bool:
     key = _basic_attr_label_key(label)
     haystack = _basic_attr_label_key(text)
     return bool(key and haystack and (key in haystack or haystack in key))
+
+
+def _is_power_basic_attr_label(label: str) -> bool:
+    key = _basic_attr_label_key(label)
+    return any(token in key for token in ("电源", "供电", "带电", "用电", "电池", "充电", "电压", "功率", "控制方式"))
+
+
+def _is_safe_non_electric_option(value: str) -> bool:
+    key = _basic_choice_key(value)
+    if not key:
+        return False
+    safe_tokens = (
+        "不带电",
+        "不含电",
+        "无电",
+        "无需电",
+        "无须电",
+        "不需电",
+        "不用电",
+        "非电",
+        "不带电池",
+        "不含电池",
+        "无电池",
+        "无需电池",
+        "无须电池",
+        "不需电池",
+        "手动",
+        "非电动",
+    )
+    return any(_basic_choice_key(token) in key for token in safe_tokens)
 
 
 def _frontend_error_text_for_basic_attr(page: Any) -> str:
@@ -2710,6 +2740,8 @@ def _basic_select_attr_rule_candidates(label: str, product_info: dict[str, Any] 
         defaults = ["灰色", "黑色", "白色"]
     elif "数量" in key:
         defaults = ["1"]
+    elif _is_power_basic_attr_label(label):
+        defaults = ["不带电", "无电源", "无需电源", "无须电源", "不含电池", "无电池", "无需电池", "无须电池", "手动", "非电动", "不适用", "其他"]
     elif "材料组成" in key:
         defaults = ["纺织材料"]
     elif "织造方式" in key:
@@ -2741,6 +2773,20 @@ def _basic_choice_matches(value: str, candidates: list[str]) -> bool:
         if candidate_key and (value_key == candidate_key or value_key in candidate_key or candidate_key in value_key):
             return True
     return False
+
+
+def _preferred_safe_non_electric_option(options: list[str]) -> str:
+    safe_options = [str(item).strip() for item in options if str(item).strip() and _is_safe_non_electric_option(str(item))]
+    if not safe_options:
+        return ""
+    preference = ["不带电", "无电源", "无需电源", "无须电源", "不含电池", "无电池", "无需电池", "无须电池", "不需电池", "不用电", "手动", "非电动"]
+    for keyword in preference:
+        keyword_key = _basic_choice_key(keyword)
+        for option in safe_options:
+            option_key = _basic_choice_key(option)
+            if keyword_key and option_key and (keyword_key == option_key or keyword_key in option_key or option_key in keyword_key):
+                return option
+    return safe_options[0]
 
 
 def _read_basic_attr_value(page: Any, label: str) -> str:
@@ -2929,7 +2975,7 @@ def _record_product_attr_session_cache(scan: dict[str, Any] | None, applied: lis
             if not label or component not in {"input", "ant-select", "checkbox-group"} or not _basic_attr_value_is_meaningful(value):
                 continue
             contains_redline = BASE.get("_contains_redline")
-            if callable(contains_redline) and contains_redline(value):
+            if callable(contains_redline) and contains_redline(value) and not _is_safe_non_electric_option(value):
                 continue
             key = _basic_attr_label_key(label) or label
             prior = fields.get(key) if isinstance(fields.get(key), dict) else {}
@@ -3001,7 +3047,7 @@ def _apply_product_attr_session_cache(
         if not _basic_attr_value_is_meaningful(cached_value):
             return False
         contains_redline = BASE.get("_contains_redline")
-        if callable(contains_redline) and contains_redline(cached_value):
+        if callable(contains_redline) and contains_redline(cached_value) and not _is_safe_non_electric_option(cached_value):
             return False
         if component == "input":
             result = page.evaluate(BASIC_ATTR_SET_INPUT_BY_LABEL_JS, {"label": label, "value": cached_value, "unit": ""})
@@ -3012,7 +3058,9 @@ def _apply_product_attr_session_cache(
             skipped.append({"label": label, "value": cached_value, "component": component, "reason": result, "source": "session_cache"})
             return False
         options = [str(item) for item in field.get("options") or []]
-        chosen = _matching_basic_option(cached_value, options)
+        chosen = _preferred_safe_non_electric_option(options) if _is_power_basic_attr_label(label) else ""
+        if not chosen:
+            chosen = _matching_basic_option(cached_value, options)
         if not chosen:
             skipped.append({"label": label, "value": cached_value, "component": component, "reason": "cached_value_not_in_current_options", "source": "session_cache"})
             return False
@@ -3114,12 +3162,18 @@ def _safe_basic_attr_options(options: list[str]) -> list[str]:
         cleaned.append(text)
     if callable(filter_safe):
         try:
-            return [str(item).strip() for item in filter_safe(cleaned) if str(item).strip()]
+            filtered = [str(item).strip() for item in filter_safe(cleaned) if str(item).strip()]
+            filtered_keys = {_basic_choice_key(item) for item in filtered}
+            for item in cleaned:
+                if _is_safe_non_electric_option(item) and _basic_choice_key(item) not in filtered_keys:
+                    filtered.insert(0, item)
+                    filtered_keys.add(_basic_choice_key(item))
+            return filtered
         except Exception as exc:
             _log("WARN", "AI 产品属性候选过滤失败，改用本地红线过滤", error=_safe_error_text(exc))
     contains_redline = BASE.get("_contains_redline")
     if callable(contains_redline):
-        return [item for item in cleaned if not contains_redline(item)]
+        return [item for item in cleaned if _is_safe_non_electric_option(item) or not contains_redline(item)]
     return cleaned
 
 
@@ -3223,7 +3277,7 @@ def _fallback_basic_option_from_options(
         return ""
     contains_redline = BASE.get("_contains_redline")
     if callable(contains_redline):
-        safe_options = [item for item in safe_options if not contains_redline(item)]
+        safe_options = [item for item in safe_options if _is_safe_non_electric_option(item) or not contains_redline(item)]
     if not safe_options:
         return ""
 
@@ -3233,10 +3287,17 @@ def _fallback_basic_option_from_options(
         for key in ("category", "categoryPath", "title", "englishTitle")
     )
     preference_groups: list[list[str]] = []
-    if any(word in label_key for word in ("材料", "材质", "组成", "成分")):
+    if _is_power_basic_attr_label(label):
+        preferred = _preferred_safe_non_electric_option(safe_options)
+        if preferred:
+            return preferred
+        preference_groups.append(["不带电", "无电源", "无需电源", "无须电源", "不含电池", "无电池", "无需电池", "无须电池", "不需电池", "不用电", "手动", "非电动", "不适用", "其他"])
+    elif any(word in label_key for word in ("材料", "材质", "组成", "成分")):
         if any(word in context_text for word in ("毛巾", "浴巾", "沙滩巾", "纺织", "布")):
             preference_groups.append(["超细纤维", "聚酯", "涤纶", "化纤", "纺织", "雪尼尔", "摇粒绒", "抓绒", "丝绒", "缎面", "亚麻", "羊毛", "人造皮革"])
         preference_groups.append(["其他", "超细纤维", "聚酯", "涤纶", "化纤", "纺织", "合成", "雪尼尔", "摇粒绒", "抓绒", "丝绒", "缎面", "亚麻", "羊毛", "人造皮革"])
+    elif any(word in label_key for word in ("适用年龄段", "年龄段", "年龄")):
+        preference_groups.append(["成人", "成年人", "青少年", "儿童", "幼儿", "婴儿", "通用", "全年龄", "其他"])
     elif any(word in label_key for word in ("图案", "风格", "形状", "特征", "类型")):
         preference_groups.append(["其他", "默认", "现代", "简约", "长方形", "通用", "普通"])
     else:
@@ -3267,9 +3328,73 @@ def _clean_basic_input_ai_value(label: str, value: Any) -> str:
     if text.lower() in {"null", "none", "n/a", "na", "unknown"} or text in {"不确定", "未知", "无"}:
         return ""
     contains_redline = BASE.get("_contains_redline")
-    if callable(contains_redline) and contains_redline(text):
+    if callable(contains_redline) and contains_redline(text) and not _is_safe_non_electric_option(text):
         return ""
     return text[:80].strip()
+
+
+def _merge_basic_ai_product_context(scan: dict[str, Any] | None, context: dict[str, Any] | None) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    product_info = scan.get("productInfo") if isinstance(scan, dict) and isinstance(scan.get("productInfo"), dict) else {}
+    if isinstance(product_info, dict):
+        merged.update({str(key): value for key, value in product_info.items() if value not in (None, "")})
+    if isinstance(context, dict):
+        merged.update({str(key): value for key, value in context.items() if value not in (None, "")})
+    category_path = str(merged.get("categoryPath") or merged.get("category") or "").strip()
+    title = str(merged.get("title") or "").strip()
+    english_title = str(merged.get("englishTitle") or "").strip()
+    merged["categoryPath"] = category_path
+    merged["category"] = category_path
+    merged["title"] = title
+    merged["englishTitle"] = english_title
+    merged["decisionBasis"] = "必须优先根据 categoryPath/category + title/englishTitle 判断；字段名和候选项只作为辅助。"
+    return merged
+
+
+def _decide_basic_choice_attrs_with_ai(context: dict[str, Any], fields: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    call_json = BASE.get("_call_laozhang_json")
+    if not callable(call_json) or not fields:
+        return []
+    batch_rules = BASE.get("_batch_rules_active")
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是 Temu 商品属性下拉框/复选框填写助手。"
+                "必须优先根据 productContext.categoryPath/category 和 productContext.title/englishTitle 判断商品属性；字段名、当前值和候选项只作为辅助。"
+                "每个字段只能从该字段 options 中选择一个真实候选值，不允许编造候选外的值。"
+                "有批次规则时优先参考，但如果类目或标题明显不匹配，要按当前类目和标题重新判断。"
+                "严禁选择或暗示红线属性：液体、带电、电池、锂电、棉、纯棉、棉花、棉质、含棉。"
+                "电源、供电、电池、充电、控制方式等字段，如果候选里有不带电、无电源、无需电池、手动、非电动等明确不带电选项，必须优先选择，不要选择其他。"
+                "没有足够依据且没有安全通用候选时 value 返回 null。"
+                "只返回 JSON：{\"decisions\":[{\"label\":\"字段名\",\"value\":\"候选值或null\",\"confidence\":0.0,\"reason\":\"基于类目和标题的简短理由\"}]}"
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "productContext": context,
+                    "requiredChoiceFields": fields,
+                    "localRedlineTerms": BASE.get("REDLINE_ATTR_TERMS") or [],
+                    "batchRules": batch_rules() if callable(batch_rules) else {},
+                    "preference": [
+                        "先看类目路径和商品标题，再看字段名。",
+                        "只能选择页面候选项中的原文。",
+                        "不确定时优先安全、保守、通用候选；仍不确定返回 null。",
+                        "电源相关字段尽量选择明确不带电选项。",
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+    result = call_json(messages)
+    decisions = result.get("decisions", []) if isinstance(result, dict) else []
+    return decisions if isinstance(decisions, list) else []
+
+
+BASE["_decide_basic_attrs_with_ai"] = _decide_basic_choice_attrs_with_ai
 
 
 def _decide_basic_input_attrs_with_ai(context: dict[str, Any], fields: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3284,6 +3409,7 @@ def _decide_basic_input_attrs_with_ai(context: dict[str, Any], fields: list[dict
                 "你是 Temu 商品属性文本输入框填写助手。任务是给必填文本输入框生成简短、保守、通用且安全的值。"
                 "有批次规则或字段默认规则时遵守规则；没有规则时，根据商品标题、类目、字段名、字段单位/占位自行判断。"
                 "严禁输出或暗示红线：液体、带电、电池、锂电、棉、纯棉、棉花、棉质、含棉。"
+                "电源、供电、电池、充电、控制方式等字段优先选择不带电、无电源、无需电池、手动、非电动等明确不带电表述；有这种候选时不要选择其他。"
                 "不要编造夸张参数；不确定时给保守通用值，仍不确定则 value 返回 null。"
                 "只返回 JSON：{\"decisions\":[{\"label\":\"字段名\",\"value\":\"文本值或null\",\"confidence\":0.0,\"reason\":\"简短理由\"}]}"
             ),
@@ -3300,6 +3426,7 @@ def _decide_basic_input_attrs_with_ai(context: dict[str, Any], fields: list[dict
                         "文本值要短，适合直接填入页面输入框",
                         "重量、克重、尺寸、数量等字段优先输出数字或数字+页面字段单位",
                         "材质/属性描述优先选择安全宽泛表述，避免红线词",
+                        "电源/供电/电池/控制方式字段优先不带电或手动，不要泛化为其他",
                         "不要输出解释、单位推理或多余句子",
                     ],
                 },
@@ -3364,6 +3491,7 @@ def _fill_basic_product_attr_missing_by_ai_legacy(robot: Any, page: Any, scan: d
                 context = context_fn(page)
         else:
             context = {}
+        context = _merge_basic_ai_product_context(scan, context if isinstance(context, dict) else {})
         decisions = decide_fn(context if isinstance(context, dict) else {}, fields)
     except Exception as exc:
         skipped.extend({"label": field["label"], "reason": _safe_error_text(exc)} for field in fields)
@@ -3384,11 +3512,13 @@ def _fill_basic_product_attr_missing_by_ai_legacy(robot: Any, page: Any, scan: d
         if not raw_value:
             skipped.append({"label": label, "reason": "ai_returned_null", "decision": decision})
             continue
-        if callable(contains_redline) and contains_redline(raw_value):
+        if callable(contains_redline) and contains_redline(raw_value) and not _is_safe_non_electric_option(raw_value):
             skipped.append({"label": label, "reason": "ai_redline_blocked", "value": raw_value})
             continue
         options = [str(item) for item in field.get("options") or []]
-        chosen = _matching_basic_option(raw_value, options)
+        chosen = _preferred_safe_non_electric_option(options) if _is_power_basic_attr_label(label) else ""
+        if not chosen:
+            chosen = _matching_basic_option(raw_value, options)
         if not chosen:
             fallback = _fallback_basic_option_from_options(label, options, product_info=scan.get("productInfo") if isinstance(scan.get("productInfo"), dict) else {}, ai_value=raw_value)
             if fallback:
@@ -3398,7 +3528,7 @@ def _fill_basic_product_attr_missing_by_ai_legacy(robot: Any, page: Any, scan: d
             else:
                 skipped.append({"label": label, "reason": "ai_value_not_in_options", "value": raw_value, "options": field.get("options")})
                 continue
-        if callable(contains_redline) and contains_redline(chosen):
+        if callable(contains_redline) and contains_redline(chosen) and not _is_safe_non_electric_option(chosen):
             skipped.append({"label": label, "reason": "chosen_redline_blocked", "value": chosen})
             continue
         component = str(field.get("component") or "")
@@ -3502,6 +3632,7 @@ def _fill_basic_product_attr_missing_by_ai(robot: Any, page: Any, scan: dict[str
     except Exception as exc:
         context = {}
         _log("WARN", "AI 产品属性上下文读取失败，改用空上下文", error=_safe_error_text(exc))
+    context = _merge_basic_ai_product_context(scan, context if isinstance(context, dict) else {})
 
     decisions: list[dict[str, Any]] = []
     decide_fn = BASE.get("_decide_basic_attrs_with_ai")
@@ -3540,7 +3671,7 @@ def _fill_basic_product_attr_missing_by_ai(robot: Any, page: Any, scan: dict[str
         if not raw_value:
             skipped.append({"label": label, "reason": "ai_returned_null", "decision": decision})
             continue
-        if callable(contains_redline) and contains_redline(raw_value):
+        if callable(contains_redline) and contains_redline(raw_value) and not _is_safe_non_electric_option(raw_value):
             skipped.append({"label": label, "reason": "ai_redline_blocked", "value": raw_value})
             continue
 
@@ -3561,7 +3692,9 @@ def _fill_basic_product_attr_missing_by_ai(robot: Any, page: Any, scan: dict[str
             continue
 
         options = [str(item) for item in field.get("options") or []]
-        chosen = _matching_basic_option(raw_value, options)
+        chosen = _preferred_safe_non_electric_option(options) if _is_power_basic_attr_label(label) else ""
+        if not chosen:
+            chosen = _matching_basic_option(raw_value, options)
         if not chosen:
             fallback = _fallback_basic_option_from_options(label, options, product_info=product_info, ai_value=raw_value)
             if fallback:
@@ -3571,7 +3704,7 @@ def _fill_basic_product_attr_missing_by_ai(robot: Any, page: Any, scan: dict[str
             else:
                 skipped.append({"label": label, "reason": "ai_value_not_in_options", "value": raw_value, "options": field.get("options")})
                 continue
-        if callable(contains_redline) and contains_redline(chosen):
+        if callable(contains_redline) and contains_redline(chosen) and not _is_safe_non_electric_option(chosen):
             skipped.append({"label": label, "reason": "chosen_redline_blocked", "value": chosen})
             continue
         if component == "checkbox-group":
