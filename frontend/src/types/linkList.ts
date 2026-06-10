@@ -129,6 +129,7 @@ export type LinkListRecord = {
   mainImage?: LinkListImageAsset;
   productMaterialImages?: LinkListImageAsset[];
   imageSlots?: LinkListImageSlot[];
+  productImageGenerationCount?: number;
   styleProfile?: LinkListStyleProfile;
   productImageUrl?: string;
   productSourceUrl?: string;

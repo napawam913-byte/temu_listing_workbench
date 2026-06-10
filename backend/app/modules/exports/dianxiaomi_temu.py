@@ -230,7 +230,7 @@ def export_dianxiaomi_temu_template(records: list[dict[str, Any]], export_mode: 
 
 def build_rows_for_record(record: dict[str, Any], export_mode: str = EXPORT_MODE_CURATED) -> list[list[Any]]:
     export_mode = normalize_export_mode(export_mode)
-    sku_entries = record.get("skuEntries") or []
+    sku_entries = sort_sku_entries(record.get("skuEntries") or [])
     product_title = clean_text(record.get("productTitle")) or "未命名商品"
     product_title_en = normalize_english_title(record.get("productTitleEn"), product_title)
     optimized_titles = optimize_listing_titles(
@@ -534,6 +534,8 @@ def pick_slot_image_urls(record: dict[str, Any], slot_type: str, export_mode: st
         if slot.get("type") != slot_type:
             continue
         asset = asset_map.get(clean_text(slot.get("assetId"))) or {}
+        if slot_type in {"main", "carousel"} and asset.get("role") == "sales-sku":
+            continue
         image_url = (
             pick_asset_original_url(asset)
             if export_mode == EXPORT_MODE_DISTRIBUTION
@@ -541,6 +543,17 @@ def pick_slot_image_urls(record: dict[str, Any], slot_type: str, export_mode: st
         )
         image_urls.append(first_non_empty(image_url, slot.get("imageUrl"), slot.get("url")))
     return unique_strings(image_urls)
+
+
+def sort_sku_entries(sku_entries: list[Any]) -> list[dict[str, Any]]:
+    indexed_entries = [(index, entry) for index, entry in enumerate(sku_entries) if isinstance(entry, dict)]
+    return [
+        entry
+        for _index, entry in sorted(
+            indexed_entries,
+            key=lambda item: (positive_number(item[1].get("order")) or item[0] + 1, item[0]),
+        )
+    ]
 
 
 def build_record_asset_map(record: dict[str, Any]) -> dict[str, dict[str, Any]]:

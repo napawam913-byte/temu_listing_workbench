@@ -14,6 +14,7 @@ from app.modules.creative_generation.plugin_jobs import (
     complete_plugin_job,
     create_plugin_jobs,
     list_plugin_jobs,
+    reset_plugin_job_for_record,
     sync_records_with_plugin_jobs,
 )
 from app.modules.sourcing_1688.smart_recommendations import (
@@ -39,6 +40,12 @@ class PluginCreativeJobResultRequest(BaseModel):
     image_url: str | None = None
     analysis_text: str | None = None
     error_message: str | None = None
+
+
+class PluginCreativeJobRegenerateRequest(BaseModel):
+    record: dict[str, Any] = Field(default_factory=dict)
+    image_kind: str
+    provider: str = Field(default="plugin_chatgpt_web")
 
 
 class Smart1688RecommendationsRequest(BaseModel):
@@ -80,6 +87,15 @@ def create_plugin_creative_jobs(payload: PluginCreativeJobsRequest):
 @router.post("/plugin/jobs/sync")
 def sync_plugin_creative_jobs(payload: PluginCreativeJobsRequest):
     return sync_records_with_plugin_jobs(payload.records, provider=payload.provider)
+
+
+@router.post("/plugin/jobs/regenerate")
+def regenerate_plugin_creative_job(payload: PluginCreativeJobRegenerateRequest):
+    try:
+        job = reset_plugin_job_for_record(payload.record, image_kind=payload.image_kind, provider=payload.provider)
+        return {"item": job}
+    except CreativePluginJobError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/plugin/jobs")

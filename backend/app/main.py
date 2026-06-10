@@ -10,6 +10,7 @@ from app.api.routes_products import router as products_router
 from app.api.routes_sourcing_1688 import router as sourcing_1688_router
 from app.api.routes_sync import router as sync_router
 from app.api.routes_upload import router as upload_router
+from app.api.routes_visual_generation import router as visual_generation_router
 from app.core.config import ensure_runtime_dirs
 from app.core.database import init_db
 
@@ -40,6 +41,7 @@ def create_app() -> FastAPI:
     app.include_router(link_records_router)
     app.include_router(creative_router)
     app.include_router(sync_router)
+    app.include_router(visual_generation_router)
 
     @app.get("/api/health")
     def health():

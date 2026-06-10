@@ -1,5 +1,5 @@
 import { BulbOutlined, EyeOutlined } from '@ant-design/icons';
-import { Button, Card, Checkbox, Empty, Image, Input, Modal, Select, Skeleton, Space, Tabs, Tag, Typography, message } from 'antd';
+import { Button, Card, Checkbox, Empty, Image, Input, InputNumber, Modal, Select, Skeleton, Space, Tabs, Tag, Typography, message } from 'antd';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   API_BASE_URL,
@@ -21,6 +21,8 @@ import type { Product, SourcingCandidate } from '../types/product';
 
 const { Text } = Typography;
 const DEFAULT_IMAGE_PROVIDER = 'chatgpt';
+const MIN_PRODUCT_IMAGE_GENERATION_COUNT = 1;
+const MAX_PRODUCT_IMAGE_GENERATION_COUNT = 8;
 const SMART_RECOMMEND_CACHE_STORAGE_KEY = 'temuListingWorkbenchSmart1688CacheV2';
 const SMART_RECOMMEND_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_STYLE_PROMPT =
@@ -175,12 +177,17 @@ function uniqueStrings(values: Array<string | null | undefined>) {
   }, []);
 }
 
+function normalizeProductImageGenerationCount(value: number | null | undefined) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return MAX_PRODUCT_IMAGE_GENERATION_COUNT;
+  return Math.max(MIN_PRODUCT_IMAGE_GENERATION_COUNT, Math.min(MAX_PRODUCT_IMAGE_GENERATION_COUNT, Math.floor(number)));
+}
+
 function getCandidateImageUrls(candidate: Captured1688Candidate) {
   const rawGallery = toStringArray(candidate.raw_data?.gallery_image_urls);
   const topLevelGallery = toStringArray(candidate.gallery_image_urls);
-  const skuImages = (candidate.sku_list || []).map((sku) => sku.image_url);
 
-  return uniqueStrings([candidate.main_image_url, ...topLevelGallery, ...rawGallery, ...skuImages]);
+  return uniqueStrings([candidate.main_image_url, ...topLevelGallery, ...rawGallery]);
 }
 
 function getCandidateMainImageUrl(candidate: Captured1688Candidate) {
@@ -594,6 +601,7 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
   const [skuOrderModalOpen, setSkuOrderModalOpen] = useState(false);
   const [draggingSkuEntryId, setDraggingSkuEntryId] = useState<string | undefined>();
   const [finalSkuEntryOrderIds, setFinalSkuEntryOrderIds] = useState<string[]>([]);
+  const [productImageGenerationCount, setProductImageGenerationCount] = useState(MAX_PRODUCT_IMAGE_GENERATION_COUNT);
   const [previewActiveEntryId, setPreviewActiveEntryId] = useState<string | undefined>();
   const [previewActiveImageUrl, setPreviewActiveImageUrl] = useState<string | undefined>();
   const [tab, setTab] = useState<PanelTab>('search');
@@ -1184,6 +1192,7 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
 
     const recordId = `link-entry-${product.id}-${Date.now()}`;
     const createdAt = new Date().toISOString();
+    const normalizedProductImageGenerationCount = normalizeProductImageGenerationCount(productImageGenerationCount);
     const sourceMap = new Map<string, LinkListSource>();
     finalSkuEntries.forEach((entry) => {
       entry.items.forEach((item) => {
@@ -1219,7 +1228,7 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
     const carouselAssets = [
       { id: mainImageAssetId },
       ...productMaterialImageAssets.map((asset) => ({ id: asset.id })),
-    ].slice(0, 10);
+    ].slice(0, normalizedProductImageGenerationCount);
     const imageSlots: LinkListImageSlot[] = [
       {
         id: `${recordId}-slot-main`,
@@ -1227,11 +1236,11 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
         order: 0,
         assetId: mainImageAssetId,
       },
-      ...carouselAssets.map((asset, index) => ({
+      ...Array.from({ length: normalizedProductImageGenerationCount }, (_, index) => ({
         id: `${recordId}-slot-carousel-${index + 1}`,
         type: 'carousel' as const,
         order: index + 1,
-        assetId: asset.id,
+        assetId: carouselAssets[index]?.id,
       })),
     ];
 
@@ -1257,6 +1266,7 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
         alt: `${product.title} 素材图 ${index + 1}`,
       })),
       imageSlots,
+      productImageGenerationCount: normalizedProductImageGenerationCount,
       styleProfile: {
         id: styleProfileId,
         name: '统一 SKU 商品图风格',
@@ -1343,7 +1353,6 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
   const selectedCandidateMainImageUrl = selectedCandidate ? getCandidateMainImageUrl(selectedCandidate) : undefined;
   const activePreviewSkuEntry = finalSkuEntries.find((entry) => entry.id === previewActiveEntryId) ?? finalSkuEntries[0];
   const previewMainImageUrl =
-    activePreviewSkuEntry?.imageUrl ||
     product.mainImageUrl ||
     selectedCandidateMainImageUrl ||
     capturedCandidates.map((candidate) => getCandidateMainImageUrl(candidate)).find(Boolean);
@@ -1351,7 +1360,6 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
     previewMainImageUrl,
     product.mainImageUrl,
     selectedCandidateMainImageUrl,
-    ...finalSkuEntries.map((entry) => entry.imageUrl),
     ...capturedCandidates.flatMap((candidate) => getCandidateImageUrls(candidate).slice(0, 2)),
   ]);
   const previewDisplayedImageUrl =
@@ -1714,6 +1722,16 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
                   <div>
                     <Text type="secondary">重量范围</Text>
                     <strong>{formatPositiveNumberRange(selectedWeightValues, (value) => `${value} kg`)}</strong>
+                  </div>
+                  <div>
+                    <Text type="secondary">商品图数量</Text>
+                    <InputNumber
+                      max={MAX_PRODUCT_IMAGE_GENERATION_COUNT}
+                      min={MIN_PRODUCT_IMAGE_GENERATION_COUNT}
+                      size="small"
+                      value={productImageGenerationCount}
+                      onChange={(value) => setProductImageGenerationCount(normalizeProductImageGenerationCount(value))}
+                    />
                   </div>
                 </div>
                 {selectedSkuComboSummaries.length > 0 ? (

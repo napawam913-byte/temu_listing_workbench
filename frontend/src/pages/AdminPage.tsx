@@ -37,11 +37,22 @@ type PasswordResetState = {
   password: string;
 };
 
+const SETTING_CATEGORY_ORDER = ['ai', 'visual', '1688', 'oss'];
+
 function categoryLabel(category: string) {
   if (category === 'ai') return 'AI 配置';
+  if (category === 'visual') return '生图配置';
   if (category === '1688') return '1688 API';
   if (category === 'oss') return '阿里云 OSS';
   return category;
+}
+
+function categoryDescription(category: string) {
+  if (category === 'ai') return '管理 LaoZhang / OpenAI 兼容接口、文本模型和基础生图模型。';
+  if (category === 'visual') return '管理母图任务、九宫格切图、图生图参考和 OSS 上传默认策略。';
+  if (category === '1688') return '管理 1688 搜图 API 服务，用于后续同款或相关货源检索。';
+  if (category === 'oss') return '管理阿里云 OSS 图片存储，用于导出模板中的公网图片链接。';
+  return '系统运行配置。';
 }
 
 function sourceLabel(source: string) {
@@ -155,7 +166,11 @@ export function AdminPage() {
     settings.forEach((setting) => {
       groups.set(setting.category, [...(groups.get(setting.category) || []), setting]);
     });
-    return Array.from(groups.entries());
+    return Array.from(groups.entries()).sort(
+      ([left], [right]) =>
+        (SETTING_CATEGORY_ORDER.indexOf(left) === -1 ? 99 : SETTING_CATEGORY_ORDER.indexOf(left)) -
+        (SETTING_CATEGORY_ORDER.indexOf(right) === -1 ? 99 : SETTING_CATEGORY_ORDER.indexOf(right)),
+    );
   }, [settings]);
 
   const userColumns: ColumnsType<AdminUser> = [
@@ -305,6 +320,10 @@ export function AdminPage() {
                     label: categoryLabel(category),
                     children: (
                       <div className="admin-settings-list">
+                        <div className="admin-setting-group-head">
+                          <Typography.Text strong>{categoryLabel(category)}</Typography.Text>
+                          <Typography.Text type="secondary">{categoryDescription(category)}</Typography.Text>
+                        </div>
                         {groupSettings.map((setting) => (
                           <div className="admin-setting-row" key={setting.key}>
                             <div className="admin-setting-meta">

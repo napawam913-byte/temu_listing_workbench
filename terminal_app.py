@@ -268,21 +268,23 @@ WAREHOUSE_SELECTED_STATE_WITH_CHECKBOX_JS = r"""
   const overflowText=clean(root?.querySelector('.ant-select-selection-overflow-item-rest')?.textContent || '');
   const overflowMatch=(mainText + ' ' + overflowText).match(/\+\s*(\d+)/);
   const overflowCount=overflowMatch ? parseInt(overflowMatch[1], 10) : 0;
-  const selected=[];
+  const selectedFromTags=[];
   const tagNodes=[...root?.querySelectorAll('.ant-select-selection-item')||[]];
   for(const tag of tagNodes){
     const content=tag.querySelector('.ant-select-selection-item-content');
     const txt=clean(tag.getAttribute('title')||content?.getAttribute('title')||content?.textContent||tag.textContent||'');
-    if(txt && !ignoreText(txt)) selected.push(txt);
+    if(txt && !ignoreText(txt)) selectedFromTags.push(txt);
   }
   const options=[...document.querySelectorAll('.ant-select-dropdown .ant-select-item-option,.ant-select-dropdown [role="option"]')].filter(el => visible(el) && nearWarehouse(el));
   const seen=[];
+  const selectedFromOptions=[];
   for(const opt of options){
     const txt=optionText(opt);
     if(txt && !ignoreText(txt)) seen.push(txt);
     if(ignoreText(txt) || !optionSelected(opt)) continue;
-    selected.push(txt);
+    selectedFromOptions.push(txt);
   }
+  const selected = selectedFromTags.length ? selectedFromTags : selectedFromOptions;
   const selectedTexts=[mainText,...selected].filter(Boolean);
   const allText=selectedTexts.join('|');
   const allNorm=norm(allText);
@@ -295,7 +297,7 @@ WAREHOUSE_SELECTED_STATE_WITH_CHECKBOX_JS = r"""
     const itemBase=baseNorm(item);
     return targetList.some(target => itemNorm===norm(target) || itemBase===baseNorm(target));
   }).length;
-  const collapsedMatchesTargets=overflowCount>0 && selectedTargetCount>0 && selectedTargetCount + overflowCount >= targetList.length;
+  const collapsedMatchesTargets=overflowCount>0 && selectedTargetCount>0 && selectedTargetCount + overflowCount === targetList.length;
   for(const target of targets||[]){
     const targetNorm=norm(target);
     const targetBase=baseNorm(target);
@@ -390,7 +392,7 @@ WAREHOUSE_EXACT_SELECTION_STATE_JS = r"""
   const overflowText=clean(root.querySelector('.ant-select-selection-overflow-item-rest')?.textContent || '');
   const overflowMatch=(mainText + ' ' + overflowText).match(/\+\s*(\d+)/);
   const overflowCount=overflowMatch ? parseInt(overflowMatch[1], 10) : 0;
-  const selectedItems=[];
+  const selectedItemsFromTags=[];
   const seen=[];
   const tagNodes=[...root.querySelectorAll('.ant-select-selection-item')];
   for(const tag of tagNodes){
@@ -398,16 +400,18 @@ WAREHOUSE_EXACT_SELECTION_STATE_JS = r"""
     const text=clean(tag.getAttribute('title') || content?.getAttribute('title') || content?.textContent || tag.textContent || '');
     if(ignoreText(text)) continue;
     const remove=tag.querySelector('.ant-select-selection-item-remove,.anticon-close,[aria-label*="close" i],[aria-label*="remove" i]');
-    selectedItems.push({text, source:'tag', point:point(remove || tag)});
+    selectedItemsFromTags.push({text, source:'tag', point:point(remove || tag)});
   }
   const options=[...document.querySelectorAll('.ant-select-dropdown .ant-select-item-option,.ant-select-dropdown [role="option"]')].filter(el => visible(el) && nearWarehouse(el));
+  const selectedItemsFromOptions=[];
   for(const opt of options){
     const text=optionText(opt);
     if(text && !ignoreText(text)) seen.push(text);
     if(ignoreText(text) || !optionSelected(opt)) continue;
     const clickTarget=opt.querySelector('.ant-checkbox-wrapper,.ant-checkbox,input[type="checkbox"],input[type="radio"],.ant-select-item-option-content') || opt;
-    selectedItems.push({text, source:'option', point:point(clickTarget)});
+    selectedItemsFromOptions.push({text, source:'option', point:point(clickTarget)});
   }
+  const selectedItems = selectedItemsFromTags.length ? selectedItemsFromTags : selectedItemsFromOptions;
   const selected=[];
   const selectedKeys=new Set();
   const extraSelected=[];
@@ -432,7 +436,7 @@ WAREHOUSE_EXACT_SELECTION_STATE_JS = r"""
   let inferredFromCollapsedTags=false;
   if(missingTargets.length && overflowCount>0 && extraSelected.length===0){
     const selectedTargetCount=selected.filter(item => matchesTarget(item)).length;
-    if(selectedTargetCount>0 && selectedTargetCount + overflowCount >= targetList.length){
+    if(selectedTargetCount>0 && selectedTargetCount + overflowCount === targetList.length){
       for(const target of targetList){
         if(!selected.some(item => sameWarehouse(item, target))){
           selected.push(target);
@@ -453,7 +457,8 @@ WAREHOUSE_EXACT_SELECTION_STATE_JS = r"""
     seen:[...new Set(seen)],
     mainText,
     overflowCount,
-    inferredFromCollapsedTags
+    inferredFromCollapsedTags,
+    sourceMode:selectedItemsFromTags.length ? 'tags' : 'dropdown'
   };
 }
 """
@@ -1332,25 +1337,6 @@ STRICT_FILL_BASIC_MATERIAL_PERCENT_BY_LABEL_JS = str(BASE.get("FILL_BASIC_MATERI
     "const attrRoot=document.querySelector('#productBasicInfo .product-attrs')||document.querySelector('.product-attrs'); const roots=attrRoot ? [attrRoot] : [];",
 )
 
-if isinstance(BASE.get("LEGACY"), dict):
-    BASE["LEGACY"]["BASIC_ATTR_SCAN_JS"] = PATCHED_BASIC_ATTR_SCAN_JS
-    BASE["LEGACY"]["BASIC_ATTR_FIND_CONTROL_JS"] = STRICT_BASIC_ATTR_FIND_CONTROL_JS
-    BASE["LEGACY"]["BASIC_ATTR_CLICK_CHECKBOX_JS"] = STRICT_CLICK_BASIC_ATTR_CHECKBOX_BY_LABEL_JS
-    BASE["LEGACY"]["GET_BASIC_ATTR_SELECT_BOX_BY_LABEL_JS"] = STRICT_GET_BASIC_ATTR_SELECT_BOX_BY_LABEL_JS
-    BASE["LEGACY"]["GET_BASIC_ATTR_SELECT_OPTION_POINTS_BY_LABEL_JS"] = STRICT_GET_BASIC_ATTR_SELECT_OPTION_POINTS_BY_LABEL_JS
-    BASE["LEGACY"]["GET_BASIC_ATTR_VALUE_BY_LABEL_JS"] = STRICT_GET_BASIC_ATTR_VALUE_BY_LABEL_JS
-    BASE["LEGACY"]["GET_BASIC_ATTR_CHECKBOX_OPTIONS_JS"] = STRICT_GET_BASIC_ATTR_CHECKBOX_OPTIONS_JS
-    BASE["LEGACY"]["CLICK_BASIC_ATTR_CHECKBOX_BY_LABEL_JS"] = STRICT_CLICK_BASIC_ATTR_CHECKBOX_BY_LABEL_JS
-    BASE["LEGACY"]["FILL_BASIC_MATERIAL_PERCENT_BY_LABEL_JS"] = STRICT_FILL_BASIC_MATERIAL_PERCENT_BY_LABEL_JS
-BASE["BASIC_ATTR_FIND_CONTROL_JS"] = STRICT_BASIC_ATTR_FIND_CONTROL_JS
-BASE["BASIC_ATTR_CLICK_CHECKBOX_JS"] = STRICT_CLICK_BASIC_ATTR_CHECKBOX_BY_LABEL_JS
-BASE["GET_BASIC_ATTR_SELECT_BOX_BY_LABEL_JS"] = STRICT_GET_BASIC_ATTR_SELECT_BOX_BY_LABEL_JS
-BASE["GET_BASIC_ATTR_SELECT_OPTION_POINTS_BY_LABEL_JS"] = STRICT_GET_BASIC_ATTR_SELECT_OPTION_POINTS_BY_LABEL_JS
-BASE["GET_BASIC_ATTR_VALUE_BY_LABEL_JS"] = STRICT_GET_BASIC_ATTR_VALUE_BY_LABEL_JS
-BASE["GET_BASIC_ATTR_CHECKBOX_OPTIONS_JS"] = STRICT_GET_BASIC_ATTR_CHECKBOX_OPTIONS_JS
-BASE["CLICK_BASIC_ATTR_CHECKBOX_BY_LABEL_JS"] = STRICT_CLICK_BASIC_ATTR_CHECKBOX_BY_LABEL_JS
-BASE["FILL_BASIC_MATERIAL_PERCENT_BY_LABEL_JS"] = STRICT_FILL_BASIC_MATERIAL_PERCENT_BY_LABEL_JS
-BASE["GET_WAREHOUSE_SELECTED_STATE_JS"] = WAREHOUSE_SELECTED_STATE_WITH_CHECKBOX_JS
 IMAGE_EXTS = set(BASE.get("IMAGE_EXTS") or {".jpg", ".jpeg", ".png", ".webp", ".bmp"})
 PIPELINE_CONFIG_PATH = Path(BASE.get("PIPELINE_CONFIG_PATH", APP_DIR / "work" / "state" / "automation-config.json"))
 LAOZHANG_API_CONFIG_PATH = Path(
@@ -1365,6 +1351,7 @@ APP_EXITING = False
 INSTANCE_LOCK_HANDLE: Any | None = None
 CLEANUP_DONE = False
 CLEANUP_LOCK = threading.RLock()
+RUNTIME_PATCHES_INSTALLED = False
 PRODUCT_ATTR_SESSION_CACHE_PATH = APP_DIR / "work" / "state" / f"product-attr-session-cache-{os.getpid()}.json"
 PRODUCT_ATTR_SESSION_CACHE_LOCK = threading.RLock()
 PRODUCT_ATTR_SESSION_CACHE: dict[str, Any] = {
@@ -1477,8 +1464,6 @@ class StoppableDxmTemuRobot(_ORIGINAL_DXM_TEMU_ROBOT_CLASS):
         finally:
             _unregister_active_robot(self)
 
-
-BASE["LEGACY"]["DxmTemuRobot"] = StoppableDxmTemuRobot
 
 PRODUCT_INFO_FIND_ACTION_POINT_JS = r"""
 async ({ labels, exact }) => {
@@ -2391,10 +2376,6 @@ def _save_pipeline_config(config: dict[str, Any]) -> None:
         _log("WARN", "图片后处理配置保存失败", error=_safe_error_text(exc))
 
 
-BASE["_load_pipeline_config"] = _load_pipeline_config
-BASE["_save_pipeline_config"] = _save_pipeline_config
-
-
 def _feishu_sign(secret: str, timestamp: int) -> str:
     string_to_sign = f"{timestamp}\n{secret}".encode("utf-8")
     digest = hmac.new(string_to_sign, b"", hashlib.sha256).digest()
@@ -2858,6 +2839,107 @@ def _frontend_required_error_is_resolved_by_basic_attr_value(
         error=text,
     )
     return True
+
+
+def _settle_basic_attr_required_state(page: Any, *, attempts: int = 3, context: str = "") -> dict[str, Any]:
+    if page is None:
+        return {"ok": True, "missingRequired": [], "scanMissing": [], "frontendErrors": [], "attempts": 0}
+    last_missing: list[str] = []
+    last_scan_missing: list[str] = []
+    last_frontend_errors: list[dict[str, str]] = []
+    max_attempts = max(1, int(attempts or 1))
+    for attempt in range(1, max_attempts + 1):
+        _close_active_dropdowns_for_basic_attrs(page)
+        time.sleep(0.12)
+        try:
+            scan_missing = _basic_attr_missing_required(page)
+        except Exception as exc:
+            _log("WARN", "产品属性填后扫描复检失败", context=context, attempt=attempt, error=_safe_error_text(exc))
+            scan_missing = []
+        try:
+            frontend_errors = _frontend_required_errors(page, product_attrs_only=True)
+        except Exception as exc:
+            _log("WARN", "产品属性填后前台错误复检失败", context=context, attempt=attempt, error=_safe_error_text(exc))
+            frontend_errors = []
+
+        unresolved_errors: list[dict[str, str]] = []
+        labels_to_sync: list[str] = []
+        for label in scan_missing:
+            label_text = str(label or "").strip()
+            if label_text and not _is_optional_basic_attr_label(label_text):
+                labels_to_sync.append(label_text)
+        for item in frontend_errors:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label") or "").strip()
+            text = str(item.get("text") or "").strip()
+            item_text = str(item.get("itemText") or "").strip()
+            if _is_optional_basic_attr_label(label):
+                continue
+            if label:
+                labels_to_sync.append(label)
+                if _frontend_required_error_is_resolved_by_basic_attr_value(
+                    page,
+                    label=label,
+                    text=text,
+                    item_text=item_text,
+                ):
+                    continue
+            unresolved_errors.append({"label": label, "text": text, "itemText": item_text})
+
+        seen_labels: set[str] = set()
+        for label in labels_to_sync:
+            key = _basic_attr_label_key(label)
+            if not key or key in seen_labels:
+                continue
+            seen_labels.add(key)
+            _resync_basic_attr_control(page, label)
+
+        messages: list[str] = []
+        seen_messages: set[str] = set()
+        for label in scan_missing:
+            value = str(label or "").strip()
+            if not value or _is_optional_basic_attr_label(value):
+                continue
+            if value not in seen_messages:
+                seen_messages.add(value)
+                messages.append(value)
+        for item in unresolved_errors:
+            label = str(item.get("label") or "").strip()
+            text = str(item.get("text") or "").strip()
+            item_text = str(item.get("itemText") or "").strip()
+            if label and text:
+                value = f"{label}: {text}"
+            else:
+                hint = item_text[:60] if item_text else ""
+                value = f"{text}{(' [' + hint + ']') if hint else ''}"
+            value = " ".join(str(value or "").split())
+            if value and value not in seen_messages and not _is_optional_basic_attr_label(_missing_required_label_text(value)):
+                seen_messages.add(value)
+                messages.append(value)
+
+        last_scan_missing = [str(item) for item in scan_missing if str(item or "").strip()]
+        last_frontend_errors = unresolved_errors
+        last_missing = messages
+        if not messages:
+            return {
+                "ok": True,
+                "missingRequired": [],
+                "scanMissing": last_scan_missing,
+                "frontendErrors": [],
+                "attempts": attempt,
+            }
+        if attempt < max_attempts:
+            _log("INFO", "产品属性填后复检仍有缺失，等待控件状态同步", context=context, attempt=attempt, missing="|".join(messages[:8]))
+            time.sleep(0.28)
+
+    return {
+        "ok": False,
+        "missingRequired": last_missing,
+        "scanMissing": last_scan_missing,
+        "frontendErrors": last_frontend_errors,
+        "attempts": max_attempts,
+    }
 
 
 def _extract_product_category_path(value: Any) -> str:
@@ -3392,9 +3474,6 @@ def _decide_basic_choice_attrs_with_ai(context: dict[str, Any], fields: list[dic
     result = call_json(messages)
     decisions = result.get("decisions", []) if isinstance(result, dict) else []
     return decisions if isinstance(decisions, list) else []
-
-
-BASE["_decide_basic_attrs_with_ai"] = _decide_basic_choice_attrs_with_ai
 
 
 def _decide_basic_input_attrs_with_ai(context: dict[str, Any], fields: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -4135,10 +4214,8 @@ def _fill_basic_required_attrs_ai_guarded_with_product_attr_rules(robot: Any, pa
         percent_result = _fill_basic_product_attr_percent_by_rule(page)
         _close_active_dropdowns_for_basic_attrs(page)
         time.sleep(0.25)
-        try:
-            after_missing = _basic_attr_missing_required(page)
-        except Exception:
-            after_missing = []
+        settled = _settle_basic_attr_required_state(page, attempts=2, context=f"产品属性第 {round_index} 轮")
+        after_missing = list(settled.get("missingRequired") or []) if isinstance(settled, dict) else []
         try:
             after_scan = page.evaluate((BASE.get("LEGACY") or {}).get("BASIC_ATTR_SCAN_JS"))
             _record_product_attr_session_cache_from_scan(after_scan if isinstance(after_scan, dict) else None, source="visible_scan")
@@ -4156,6 +4233,7 @@ def _fill_basic_required_attrs_ai_guarded_with_product_attr_rules(robot: Any, pa
                 "select": select_result,
                 "ai": ai_result,
                 "percent": percent_result,
+                "settled": settled,
             }
         )
         last_missing = after_missing
@@ -4175,9 +4253,6 @@ def _fill_basic_required_attrs_ai_guarded_with_product_attr_rules(robot: Any, pa
         "ai": ai_result,
         "percent": percent_result,
     }
-
-
-BASE["_fill_basic_required_attrs_ai_guarded"] = _fill_basic_required_attrs_ai_guarded_with_product_attr_rules
 
 
 def _skip_basic_age_range_rule(page: Any) -> dict[str, Any]:
@@ -4267,29 +4342,8 @@ def _validate_frontend_required_state(robot: Any, step_name: str) -> None:
     page = getattr(robot, "page", None)
     if page is None:
         return
-    missing: list[str] = []
-    missing.extend(_basic_attr_missing_required(page))
-
-    frontend_errors = _frontend_required_errors(page, product_attrs_only=True)
-    for item in frontend_errors:
-        label = item.get("label") or ""
-        text = item.get("text") or ""
-        item_text = item.get("itemText") or ""
-        if _is_optional_basic_attr_label(str(label)):
-            continue
-        if _frontend_required_error_is_resolved_by_basic_attr_value(
-            page,
-            label=str(label),
-            text=str(text),
-            item_text=str(item_text),
-        ):
-            continue
-        if label and text:
-            missing.append(f"{label}: {text}")
-        elif text:
-            hint = item_text[:60] if item_text else ""
-            missing.append(f"{text}{(' [' + hint + ']') if hint else ''}")
-
+    settled = _settle_basic_attr_required_state(page, attempts=3, context=step_name)
+    missing = settled.get("missingRequired") if isinstance(settled, dict) else []
     if not missing:
         return
     unique: list[str] = []
@@ -4300,7 +4354,7 @@ def _validate_frontend_required_state(robot: Any, step_name: str) -> None:
             continue
         seen.add(text)
         unique.append(text)
-    payload = {"step": step_name, "missingRequired": unique, "frontendErrors": frontend_errors}
+    payload = {"step": step_name, "missingRequired": unique, "settled": settled}
     _save_json("frontend-required-errors", payload)
     raise RuntimeError("前台仍有必填错误：" + " | ".join(unique[:8]))
 
@@ -4570,9 +4624,6 @@ def bind_edit_page_prefer_requested(self: Any, url: str = "") -> dict[str, Any]:
     return {"ok": True, "url": final_url, "requestedUrl": requested_url, "reused": False}
 
 
-BASE["LEGACY"]["DxmTemuRobot"].bind_edit_page = bind_edit_page_prefer_requested
-
-
 def _download_result_folder(download_result: Any, folder_text: str = "") -> Path:
     if isinstance(download_result, dict) and download_result.get("folder"):
         path = Path(str(download_result["folder"])).expanduser()
@@ -4588,6 +4639,44 @@ def _uploadable_product_info_image_files(folder: Path) -> list[str]:
     if len(files) < 3:
         _log("WARN", "产品信息图片少于 3 张，仍继续上传", count=len(files), folder=str(folder))
     return files
+
+
+def _set_upload_files_without_native_dialog(page: Any, files: list[str], *, scope: str) -> dict[str, Any]:
+    selectors = [
+        ".ant-modal input[type='file']",
+        ".ant-modal-wrap input[type='file']",
+        ".full-modal__dxm input[type='file']",
+        ".smt-content-center input[type='file']",
+        "input[type='file']",
+    ]
+    errors: list[str] = []
+    for selector in selectors:
+        try:
+            locator = page.locator(selector)
+            count = locator.count()
+        except Exception as exc:
+            errors.append(f"{selector}: count failed: {_safe_error_text(exc)}")
+            continue
+        if count <= 0:
+            continue
+        for index in range(count - 1, -1, -1):
+            try:
+                locator.nth(index).set_input_files(files, timeout=5000)
+                payload = {"ok": True, "selector": selector, "index": index, "count": len(files), "scope": scope}
+                _log("OK", "已通过 file input 直接设置本地图片，未打开系统文件框", **payload)
+                return payload
+            except Exception as exc:
+                errors.append(f"{selector}[{index}]: {_safe_error_text(exc)}")
+    fallback = BASE.get("_set_local_upload_files")
+    if callable(fallback):
+        try:
+            fallback(page, files)
+            payload = {"ok": True, "selector": "BASE._set_local_upload_files", "index": -1, "count": len(files), "scope": scope}
+            _log("OK", "已通过基座 input fallback 设置本地图片，未二次点击系统文件框", **payload)
+            return payload
+        except Exception as exc:
+            errors.append(f"BASE._set_local_upload_files: {_safe_error_text(exc)}")
+    return {"ok": False, "scope": scope, "errors": errors[-8:]}
 
 
 def _click_product_info_action(page: Any, labels: list[str], *, exact: bool = False, timeout: float = 10.0) -> dict[str, Any]:
@@ -4694,25 +4783,16 @@ def _upload_product_info_local_images(page: Any, files: list[str]) -> dict[str, 
     if not isinstance(local_point, dict) or not local_point.get("ok"):
         raise RuntimeError(f"没有找到产品信息本地图片入口：seen={'|'.join((local_point or {}).get('seen', [])[:20])}")
 
-    try:
-        with page.expect_file_chooser(timeout=10000) as chooser_info:
-            page.mouse.click(local_point["x"], local_point["y"])
-        chooser = chooser_info.value
-        if not chooser.is_multiple() and len(files) > 1:
-            raise RuntimeError("产品信息本地图片上传控件不是多选控件，无法一次上传多张图片")
-        chooser.set_files(files)
-    except Exception as exc:
-        fallback = BASE.get("_set_local_upload_files")
-        if not callable(fallback):
-            raise
-        _log("WARN", "产品信息本地图片 file chooser 未捕获，改用 input fallback", error=_safe_error_text(exc))
-        page.mouse.click(local_point["x"], local_point["y"])
-        time.sleep(0.25)
-        fallback(page, files)
+    input_upload = _set_upload_files_without_native_dialog(page, files, scope="产品信息本地图片")
+    if not input_upload.get("ok"):
+        raise RuntimeError(
+            "产品信息本地图片上传未找到可设置的 file input，已阻止打开系统文件选择框；"
+            f"errors={' | '.join(input_upload.get('errors') or [])}"
+        )
 
     expected = min(len(files), 10)
     after = _wait_product_info_image_count(page, minimum=expected, timeout=90)
-    payload = {"ok": True, "count": len(files), "files": files, "after": after}
+    payload = {"ok": True, "count": len(files), "files": files, "upload": input_upload, "after": after}
     _save_json("product-info-upload-local-images", payload)
     _log("OK", "已上传产品信息本地图片", count=len(files), selected=_state_image_count(after))
     return payload
@@ -4901,10 +4981,6 @@ def _open_product_description_editor_resilient(page: Any) -> None:
     )
 
 
-BASE["_open_product_description_editor"] = _open_product_description_editor_resilient
-BASE["_is_description_editor"] = _is_product_description_editor_open_resilient
-
-
 def _product_description_editor_state(page: Any) -> dict[str, Any]:
     reader = BASE.get("_product_description_editor_state")
     if callable(reader):
@@ -5028,21 +5104,12 @@ def _upload_product_description_local_images(page: Any, files: list[str]) -> dic
     if not isinstance(local_point, dict) or not local_point.get("ok"):
         raise RuntimeError(f"没有找到产品描述本地上传入口；seen={'|'.join((local_point or {}).get('seen', [])[:20])}")
 
-    try:
-        with page.expect_file_chooser(timeout=10000) as chooser_info:
-            page.mouse.click(local_point["x"], local_point["y"])
-        chooser = chooser_info.value
-        if not chooser.is_multiple() and len(files) > 1:
-            raise RuntimeError("产品描述批量传图的本地上传控件不是多选控件，无法一次上传多张图片")
-        chooser.set_files(files)
-    except Exception as exc:
-        fallback = BASE.get("_set_local_upload_files")
-        if not callable(fallback):
-            raise
-        _log("WARN", "产品描述本地上传 file chooser 未捕获，改用 input fallback", error=_safe_error_text(exc))
-        page.mouse.click(local_point["x"], local_point["y"])
-        time.sleep(0.25)
-        fallback(page, files)
+    input_upload = _set_upload_files_without_native_dialog(page, files, scope="产品描述本地上传")
+    if not input_upload.get("ok"):
+        raise RuntimeError(
+            "产品描述本地上传未找到可设置的 file input，已阻止打开系统文件选择框；"
+            f"errors={' | '.join(input_upload.get('errors') or [])}"
+        )
 
     wait_batch = BASE.get("_wait_for_product_description_batch_upload")
     if callable(wait_batch):
@@ -5062,7 +5129,7 @@ def _upload_product_description_local_images(page: Any, files: list[str]) -> dic
     click_text_scoped(page, [save_label], ".ant-modal-wrap.full-modal__dxm", exact=True, timeout=20)
     if not _wait_product_description_editor_closed(page, timeout=5):
         _log("WARN", "产品描述保存后编辑器仍未关闭，继续后续流程")
-    payload = {"ok": True, "files": files, "count": len(files), "batch": batch_state, "modules": module_state}
+    payload = {"ok": True, "files": files, "count": len(files), "upload": input_upload, "batch": batch_state, "modules": module_state}
     _save_json("product-description-upload-local-images", payload)
     _log("OK", "已保存产品描述本地图片", count=len(files))
     return payload
@@ -5102,10 +5169,6 @@ def fill_product_description_images_replace(self: Any, folder_text: str = "") ->
     _save_json("product-description-replace-images", payload)
 
 
-BASE["fill_product_description_images_v2"] = fill_product_description_images_replace
-BASE["fill_product_description_images"] = fill_product_description_images_replace
-
-
 _base_download_product_images = BASE["LEGACY"]["DxmTemuRobot"].download_product_images
 
 
@@ -5128,9 +5191,6 @@ def download_product_images_with_postprocess(self: Any, folder_text: str = "") -
     _postprocess_downloaded_product_images(folder, image_config)
     _replace_product_info_images_from_folder(self, folder)
     return result
-
-
-BASE["LEGACY"]["DxmTemuRobot"].download_product_images = download_product_images_with_postprocess
 
 
 _base_find_open_edit_page_for_record = BASE.get("_find_open_edit_page_for_record")
@@ -5628,6 +5688,13 @@ def _frontend_required_error_texts_for_gate(page: Any) -> list[str]:
         item_text = str(item.get("itemText") or "").strip()
         if _is_optional_basic_attr_label(label):
             continue
+        if label and _frontend_required_error_is_resolved_by_basic_attr_value(
+            page,
+            label=label,
+            text=text,
+            item_text=item_text,
+        ):
+            continue
         if label and text:
             value = f"{label}: {text}"
         else:
@@ -5662,20 +5729,61 @@ def _ensure_info_complete_before_image_download(robot: Any) -> None:
     _log("OK", "图片下载前复检通过：允许进入图片下载")
 
 
+def _callable_debug_name(action: Any) -> str:
+    if action is None:
+        return ""
+    names: list[str] = []
+    for attr in ("__qualname__", "__name__"):
+        value = getattr(action, attr, "")
+        if value:
+            names.append(str(value))
+    wrapped = getattr(action, "func", None)
+    if wrapped is not None and wrapped is not action:
+        for attr in ("__qualname__", "__name__"):
+            value = getattr(wrapped, attr, "")
+            if value:
+                names.append(str(value))
+    return " ".join(dict.fromkeys(names))
+
+
+def _pipeline_step_id(index: int, total: int, name: str, action: Any) -> str:
+    text = f"{name or ''} {_callable_debug_name(action)}"
+    action_key = re.sub(r"[^a-z0-9]+", "", _callable_debug_name(action).lower())
+    if (
+        ("下载产品信息模块图片" in text)
+        or ("产品信息" in text and "图片" in text and "下载" in text)
+        or "downloadproductimages" in action_key
+        or "downloadproductinfoimages" in action_key
+    ):
+        return "download_product_info_images"
+    if "扫描基本信息商品属性" in text or "scanbasicattrs" in action_key:
+        return "scan_basic_product_attrs"
+    if "AI补全基本信息红星必填商品属性" in text or "fillbasicrequiredattrs" in action_key:
+        return "fill_basic_required_product_attrs"
+    if "补全产品信息红星必填字段" in text or "fillproductinforequiredfields" in action_key:
+        return "fill_product_info_required_fields"
+    return f"step_{index:02d}"
+
+
+def _pipeline_step_requires_info_gate(step_id: str) -> bool:
+    return step_id == "download_product_info_images"
+
+
 def _run_pipeline_step_with_retry_stoppable(robot: Any, index: int, total: int, name: str, action: Any) -> Any:
     last_error = ""
     max_attempts = int(BASE.get("MAX_MODULE_RETRIES") or 1)
+    step_id = _pipeline_step_id(index, total, name, action)
     for attempt in range(1, max_attempts + 1):
         _check_stop(f"步骤 {index}/{total} {name} 开始前")
         try:
-            _log("INFO", "自动流程步骤开始", index=index, total=total, step=name, attempt=attempt, maxAttempts=max_attempts)
-            if "下载产品信息模块图片" in name:
+            _log("INFO", "自动流程步骤开始", index=index, total=total, step=name, stepId=step_id, attempt=attempt, maxAttempts=max_attempts)
+            if _pipeline_step_requires_info_gate(step_id):
                 _ensure_info_complete_before_image_download(robot)
             value = action()
             _validate_required_info_result(name, value)
             _validate_frontend_required_state(robot, name)
             _check_stop(f"步骤 {index}/{total} {name} 完成后")
-            _log("OK", "自动流程步骤完成", index=index, total=total, step=name, attempt=attempt)
+            _log("OK", "自动流程步骤完成", index=index, total=total, step=name, stepId=step_id, attempt=attempt)
             return value
         except StopRequested:
             raise
@@ -6275,27 +6383,139 @@ def _show_pipeline_control_panel_with_stop_button() -> None:
         tk.Button = original_button
 
 
-def _install_stop_button_runtime_patches() -> None:
+def _runtime_patch_manifest() -> dict[str, Any]:
+    return {
+        "robotClass": "StoppableDxmTemuRobot",
+        "robotMethods": [
+            "bind_edit_page",
+            "download_product_images",
+            "scan_basic_attrs",
+            "fill_basic_required_attrs",
+        ],
+        "baseFunctions": [
+            "_load_pipeline_config",
+            "_save_pipeline_config",
+            "_show_pipeline_control_panel",
+            "_run_pipeline_step_with_retry",
+            "_run_limited_full_pipeline",
+            "_run_full_pipeline",
+            "_run_full_pipeline_with_open_action",
+            "_publish_recorded_edited_pages",
+            "_select_warehouse_names_playwright",
+            "_decide_basic_attrs_with_ai",
+            "_fill_basic_required_attrs_ai_guarded",
+            "_open_product_description_editor",
+            "_is_description_editor",
+            "fill_product_description_images_v2",
+            "fill_product_description_images",
+        ],
+        "basicAttrJs": [
+            "BASIC_ATTR_SCAN_JS",
+            "BASIC_ATTR_FIND_CONTROL_JS",
+            "GET_BASIC_ATTR_SELECT_BOX_BY_LABEL_JS",
+            "GET_BASIC_ATTR_SELECT_OPTION_POINTS_BY_LABEL_JS",
+            "GET_BASIC_ATTR_VALUE_BY_LABEL_JS",
+            "GET_BASIC_ATTR_CHECKBOX_OPTIONS_JS",
+            "CLICK_BASIC_ATTR_CHECKBOX_BY_LABEL_JS",
+            "FILL_BASIC_MATERIAL_PERCENT_BY_LABEL_JS",
+            "GET_WAREHOUSE_SELECTED_STATE_JS",
+        ],
+        "pycBase": [str(path) for path in BASE_CODE_PATHS],
+    }
+
+
+def _install_basic_attr_js_patches() -> None:
+    legacy = BASE.get("LEGACY")
+    if isinstance(legacy, dict):
+        legacy["BASIC_ATTR_SCAN_JS"] = PATCHED_BASIC_ATTR_SCAN_JS
+        legacy["BASIC_ATTR_FIND_CONTROL_JS"] = STRICT_BASIC_ATTR_FIND_CONTROL_JS
+        legacy["BASIC_ATTR_CLICK_CHECKBOX_JS"] = STRICT_CLICK_BASIC_ATTR_CHECKBOX_BY_LABEL_JS
+        legacy["GET_BASIC_ATTR_SELECT_BOX_BY_LABEL_JS"] = STRICT_GET_BASIC_ATTR_SELECT_BOX_BY_LABEL_JS
+        legacy["GET_BASIC_ATTR_SELECT_OPTION_POINTS_BY_LABEL_JS"] = STRICT_GET_BASIC_ATTR_SELECT_OPTION_POINTS_BY_LABEL_JS
+        legacy["GET_BASIC_ATTR_VALUE_BY_LABEL_JS"] = STRICT_GET_BASIC_ATTR_VALUE_BY_LABEL_JS
+        legacy["GET_BASIC_ATTR_CHECKBOX_OPTIONS_JS"] = STRICT_GET_BASIC_ATTR_CHECKBOX_OPTIONS_JS
+        legacy["CLICK_BASIC_ATTR_CHECKBOX_BY_LABEL_JS"] = STRICT_CLICK_BASIC_ATTR_CHECKBOX_BY_LABEL_JS
+        legacy["FILL_BASIC_MATERIAL_PERCENT_BY_LABEL_JS"] = STRICT_FILL_BASIC_MATERIAL_PERCENT_BY_LABEL_JS
+    BASE["BASIC_ATTR_FIND_CONTROL_JS"] = STRICT_BASIC_ATTR_FIND_CONTROL_JS
+    BASE["BASIC_ATTR_CLICK_CHECKBOX_JS"] = STRICT_CLICK_BASIC_ATTR_CHECKBOX_BY_LABEL_JS
+    BASE["GET_BASIC_ATTR_SELECT_BOX_BY_LABEL_JS"] = STRICT_GET_BASIC_ATTR_SELECT_BOX_BY_LABEL_JS
+    BASE["GET_BASIC_ATTR_SELECT_OPTION_POINTS_BY_LABEL_JS"] = STRICT_GET_BASIC_ATTR_SELECT_OPTION_POINTS_BY_LABEL_JS
+    BASE["GET_BASIC_ATTR_VALUE_BY_LABEL_JS"] = STRICT_GET_BASIC_ATTR_VALUE_BY_LABEL_JS
+    BASE["GET_BASIC_ATTR_CHECKBOX_OPTIONS_JS"] = STRICT_GET_BASIC_ATTR_CHECKBOX_OPTIONS_JS
+    BASE["CLICK_BASIC_ATTR_CHECKBOX_BY_LABEL_JS"] = STRICT_CLICK_BASIC_ATTR_CHECKBOX_BY_LABEL_JS
+    BASE["FILL_BASIC_MATERIAL_PERCENT_BY_LABEL_JS"] = STRICT_FILL_BASIC_MATERIAL_PERCENT_BY_LABEL_JS
+    BASE["GET_WAREHOUSE_SELECTED_STATE_JS"] = WAREHOUSE_SELECTED_STATE_WITH_CHECKBOX_JS
+
+
+def _install_config_patches() -> None:
+    BASE["_load_pipeline_config"] = _load_pipeline_config
+    BASE["_save_pipeline_config"] = _save_pipeline_config
+
+
+def _install_robot_method_patches() -> None:
     BASE["LEGACY"]["DxmTemuRobot"] = StoppableDxmTemuRobot
+    BASE["LEGACY"]["DxmTemuRobot"].bind_edit_page = bind_edit_page_prefer_requested
+    BASE["LEGACY"]["DxmTemuRobot"].download_product_images = download_product_images_with_postprocess
+    BASE["LEGACY"]["DxmTemuRobot"].fill_basic_required_attrs = fill_basic_required_attrs_product_attrs_only
+    BASE["LEGACY"]["DxmTemuRobot"].scan_basic_attrs = scan_basic_attrs_product_attrs_only
+
+
+def _install_product_attr_patches() -> None:
     BASE["patched_fill_basic_required_attrs"] = fill_basic_required_attrs_product_attrs_only
     BASE["ORIGINAL_FILL_BASIC_REQUIRED_ATTRS"] = fill_basic_required_attrs_product_attrs_only
     BASE["_ensure_basic_age_range_rule"] = _skip_basic_age_range_rule
-    BASE["LEGACY"]["DxmTemuRobot"].fill_basic_required_attrs = fill_basic_required_attrs_product_attrs_only
-    BASE["LEGACY"]["DxmTemuRobot"].scan_basic_attrs = scan_basic_attrs_product_attrs_only
+    BASE["_decide_basic_attrs_with_ai"] = _decide_basic_choice_attrs_with_ai
+    BASE["_fill_basic_required_attrs_ai_guarded"] = _fill_basic_required_attrs_ai_guarded_with_product_attr_rules
+
+
+def _install_image_and_description_patches() -> None:
+    BASE["_open_product_description_editor"] = _open_product_description_editor_resilient
+    BASE["_is_description_editor"] = _is_product_description_editor_open_resilient
+    BASE["fill_product_description_images_v2"] = fill_product_description_images_replace
+    BASE["fill_product_description_images"] = fill_product_description_images_replace
+
+
+def _install_pipeline_and_publish_patches() -> None:
     BASE["_show_pipeline_control_panel"] = _show_pipeline_control_panel_with_stop_button
     BASE["_run_pipeline_step_with_retry"] = _run_pipeline_step_with_retry_stoppable
     BASE["_run_limited_full_pipeline"] = _run_limited_full_pipeline_stoppable
     BASE["_run_full_pipeline"] = _run_full_pipeline_stoppable
     BASE["_run_full_pipeline_with_open_action"] = _run_full_pipeline_with_open_action_stoppable
     BASE["_publish_recorded_edited_pages"] = _publish_recorded_edited_pages_stoppable
+
+
+def _install_warehouse_patches() -> None:
     BASE["_select_warehouse_names_playwright"] = _select_warehouse_names_with_self_check
-    BASE["_fill_basic_required_attrs_ai_guarded"] = _fill_basic_required_attrs_ai_guarded_with_product_attr_rules
+
+
+def _install_manual_menu_patches() -> None:
     if callable(_base_manual_menu_for_stop):
         BASE["_manual_menu"] = _manual_menu_stoppable
 
 
-BASE["_publish_recorded_edited_pages"] = _publish_recorded_edited_pages_stoppable
-_install_stop_button_runtime_patches()
+def _install_runtime_patches(*, force_log: bool = False) -> None:
+    global RUNTIME_PATCHES_INSTALLED
+    _install_basic_attr_js_patches()
+    _install_config_patches()
+    _install_robot_method_patches()
+    _install_product_attr_patches()
+    _install_image_and_description_patches()
+    _install_pipeline_and_publish_patches()
+    _install_warehouse_patches()
+    _install_manual_menu_patches()
+    if force_log or not RUNTIME_PATCHES_INSTALLED:
+        manifest = _runtime_patch_manifest()
+        _save_json("runtime-patches", manifest)
+        _log(
+            "INFO",
+            "机器人运行时补丁已安装",
+            baseFunctions="|".join(manifest["baseFunctions"]),
+            robotMethods="|".join(manifest["robotMethods"]),
+        )
+    RUNTIME_PATCHES_INSTALLED = True
+
+
+_install_runtime_patches()
 
 
 def main() -> None:
@@ -6305,16 +6525,7 @@ def main() -> None:
     if "--test-feishu" in sys.argv[1:]:
         ok = _send_feishu_text("测试通知", "DxmTemuTerminalRobot 飞书机器人配置可用。", level="INFO")
         raise SystemExit(0 if ok else 1)
-    _install_stop_button_runtime_patches()
-    BASE["LEGACY"]["DxmTemuRobot"].bind_edit_page = bind_edit_page_prefer_requested
-    BASE["LEGACY"]["DxmTemuRobot"].download_product_images = download_product_images_with_postprocess
-    BASE["fill_product_description_images_v2"] = fill_product_description_images_replace
-    BASE["fill_product_description_images"] = fill_product_description_images_replace
-    BASE["_publish_recorded_edited_pages"] = _publish_recorded_edited_pages_stoppable
-    BASE["_run_pipeline_step_with_retry"] = _run_pipeline_step_with_retry_stoppable
-    BASE["_run_limited_full_pipeline"] = _run_limited_full_pipeline_stoppable
-    BASE["_show_pipeline_control_panel"] = _show_pipeline_control_panel_with_stop_button
-    BASE["_select_warehouse_names_playwright"] = _select_warehouse_names_with_self_check
+    _install_runtime_patches()
     BASE["main"]()
 
 

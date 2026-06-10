@@ -74,172 +74,278 @@ def ensure_creative_job_column(conn: sqlite3.Connection, column_name: str, ddl: 
         conn.execute(f"ALTER TABLE creative_image_jobs ADD COLUMN {ddl}")
 
 
+def upsert_creative_job(conn: sqlite3.Connection, job: dict[str, Any]) -> None:
+    conn.execute(
+        """
+        INSERT INTO creative_image_jobs (
+            id, provider, status, record_id, product_id, record_title, safe_title_en,
+            record_json, image_index, image_kind, image_label, target_sku_entry_id, prompt, input_image_url,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(provider, record_id, image_kind) DO UPDATE SET
+            status = CASE
+                WHEN creative_image_jobs.status = 'completed' THEN creative_image_jobs.status
+                ELSE excluded.status
+            END,
+            product_id = excluded.product_id,
+            record_title = excluded.record_title,
+            safe_title_en = excluded.safe_title_en,
+            record_json = excluded.record_json,
+            image_index = excluded.image_index,
+            image_label = excluded.image_label,
+            target_sku_entry_id = excluded.target_sku_entry_id,
+            prompt = excluded.prompt,
+            input_image_url = excluded.input_image_url,
+            result_image_url = CASE
+                WHEN creative_image_jobs.status = 'completed' THEN creative_image_jobs.result_image_url
+                ELSE NULL
+            END,
+            result_storage_key = CASE
+                WHEN creative_image_jobs.status = 'completed' THEN creative_image_jobs.result_storage_key
+                ELSE NULL
+            END,
+            analysis_text = CASE
+                WHEN creative_image_jobs.status = 'completed' THEN creative_image_jobs.analysis_text
+                ELSE NULL
+            END,
+            error_message = CASE
+                WHEN creative_image_jobs.status = 'completed' THEN creative_image_jobs.error_message
+                ELSE NULL
+            END,
+            claimed_at = CASE
+                WHEN creative_image_jobs.status = 'completed' THEN creative_image_jobs.claimed_at
+                ELSE NULL
+            END,
+            completed_at = CASE
+                WHEN creative_image_jobs.status = 'completed' THEN creative_image_jobs.completed_at
+                ELSE NULL
+            END,
+            updated_at = excluded.updated_at
+        """,
+        (
+            job["id"],
+            job["provider"],
+            job["status"],
+            job["record_id"],
+            job["product_id"],
+            job["record_title"],
+            job["safe_title_en"],
+            job["record_json"],
+            job["image_index"],
+            job["image_kind"],
+            job["image_label"],
+            job["target_sku_entry_id"],
+            job["prompt"],
+            job["input_image_url"],
+            job["created_at"],
+            job["updated_at"],
+        ),
+    )
+
+
 def create_plugin_jobs(records: list[dict[str, Any]], provider: str = PLUGIN_PROVIDER) -> list[dict[str, Any]]:
     provider = clean_text(provider) or PLUGIN_PROVIDER
     now = utc_now_text()
-    created_or_existing: list[dict[str, Any]] = []
+    prepared_records: list[dict[str, Any]] = []
+    record_ids: list[str] = []
+
+    for record in records:
+        record_id = clean_text(record.get("id"))
+        if not record_id:
+            continue
+        record_ids.append(record_id)
+        product_id = clean_text(record.get("productId")) or record_id
+        safe_title_cn, _ = sanitize_marketplace_text(record.get("productTitle"))
+        safe_title_en = normalize_english_title(record.get("productTitleEn"), safe_title_cn or record.get("productTitle", ""))
+        safe_title_en, _ = sanitize_marketplace_text(safe_title_en)
+        input_image_url = pick_record_input_image(record)
+        product_image_count = get_product_image_generation_count(record)
+        plan = build_image_plan(record, safe_title_en)[:product_image_count]
+        job_entries: list[dict[str, Any]] = []
+
+        for image_index, image_plan in enumerate(plan, start=1):
+            job_entries.append(
+                {
+                    "id": stable_job_id(provider, record_id, image_plan["kind"]),
+                    "provider": provider,
+                    "status": JOB_STATUS_QUEUED,
+                    "record_id": record_id,
+                    "product_id": product_id,
+                    "record_title": clean_text(record.get("productTitle")),
+                    "safe_title_en": safe_title_en,
+                    "record_json": json.dumps(record, ensure_ascii=False),
+                    "image_index": image_index,
+                    "image_kind": image_plan["kind"],
+                    "image_label": image_plan["label"],
+                    "target_sku_entry_id": None,
+                    "prompt": build_image_prompt(record, safe_title_en, image_plan),
+                    "input_image_url": input_image_url,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+
+        for sku_index, sku_entry in enumerate(iter_sku_entries(record), start=1):
+            sku_entry_id = clean_text(sku_entry.get("id")) or f"sku-{sku_index}"
+            image_kind = f"sku-{sku_index:02d}-{clean_key_part(sku_entry_id)}"
+            sku_name = clean_text(sku_entry.get("name")) or f"SKU {sku_index}"
+            job_entries.append(
+                {
+                    "id": stable_job_id(provider, record_id, image_kind),
+                    "provider": provider,
+                    "status": JOB_STATUS_QUEUED,
+                    "record_id": record_id,
+                    "product_id": product_id,
+                    "record_title": clean_text(record.get("productTitle")),
+                    "safe_title_en": safe_title_en,
+                    "record_json": json.dumps(record, ensure_ascii=False),
+                    "image_index": IMAGE_COUNT + sku_index,
+                    "image_kind": image_kind,
+                    "image_label": f"SKU {sku_index}: {sku_name}",
+                    "target_sku_entry_id": sku_entry_id,
+                    "prompt": build_sku_image_prompt(record, safe_title_en, sku_entry, sku_index),
+                    "input_image_url": pick_sku_input_image(record, sku_entry) or input_image_url,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+
+        prepared_records.append(
+            {
+                "record_id": record_id,
+                "valid_product_image_kinds": {image_plan["kind"] for image_plan in plan},
+                "job_entries": job_entries,
+            }
+        )
 
     with get_connection() as conn:
         ensure_creative_jobs_schema(conn)
-        for record in records:
-            record_id = clean_text(record.get("id"))
-            if not record_id:
-                continue
-            product_id = clean_text(record.get("productId")) or record_id
-            safe_title_cn, _ = sanitize_marketplace_text(record.get("productTitle"))
-            safe_title_en = normalize_english_title(record.get("productTitleEn"), safe_title_cn or record.get("productTitle", ""))
-            safe_title_en, _ = sanitize_marketplace_text(safe_title_en)
-            input_image_url = pick_record_input_image(record)
-            plan = build_image_plan(record, safe_title_en)
+        for prepared_record in prepared_records:
+            delete_stale_product_jobs(
+                conn,
+                provider,
+                prepared_record["record_id"],
+                prepared_record["valid_product_image_kinds"],
+            )
+            for job in prepared_record["job_entries"]:
+                upsert_creative_job(conn, job)
 
-            for image_index, image_plan in enumerate(plan, start=1):
-                job_id = stable_job_id(provider, record_id, image_plan["kind"])
-                prompt = build_image_prompt(record, safe_title_en, image_plan)
-                conn.execute(
-                    """
-                    INSERT INTO creative_image_jobs (
-                        id, provider, status, record_id, product_id, record_title, safe_title_en,
-                        record_json, image_index, image_kind, image_label, target_sku_entry_id, prompt, input_image_url,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(provider, record_id, image_kind) DO UPDATE SET
-                        status = CASE
-                            WHEN creative_image_jobs.status = 'completed' THEN creative_image_jobs.status
-                            ELSE excluded.status
-                        END,
-                        product_id = excluded.product_id,
-                        record_title = excluded.record_title,
-                        safe_title_en = excluded.safe_title_en,
-                        record_json = excluded.record_json,
-                        image_index = excluded.image_index,
-                        image_label = excluded.image_label,
-                        target_sku_entry_id = excluded.target_sku_entry_id,
-                        prompt = excluded.prompt,
-                        input_image_url = excluded.input_image_url,
-                        result_image_url = CASE
-                            WHEN creative_image_jobs.status = 'completed' THEN creative_image_jobs.result_image_url
-                            ELSE NULL
-                        END,
-                        result_storage_key = CASE
-                            WHEN creative_image_jobs.status = 'completed' THEN creative_image_jobs.result_storage_key
-                            ELSE NULL
-                        END,
-                        analysis_text = CASE
-                            WHEN creative_image_jobs.status = 'completed' THEN creative_image_jobs.analysis_text
-                            ELSE NULL
-                        END,
-                        error_message = CASE
-                            WHEN creative_image_jobs.status = 'completed' THEN creative_image_jobs.error_message
-                            ELSE NULL
-                        END,
-                        claimed_at = CASE
-                            WHEN creative_image_jobs.status = 'completed' THEN creative_image_jobs.claimed_at
-                            ELSE NULL
-                        END,
-                        completed_at = CASE
-                            WHEN creative_image_jobs.status = 'completed' THEN creative_image_jobs.completed_at
-                            ELSE NULL
-                        END,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        job_id,
-                        provider,
-                        JOB_STATUS_QUEUED,
-                        record_id,
-                        product_id,
-                        clean_text(record.get("productTitle")),
-                        safe_title_en,
-                        json.dumps(record, ensure_ascii=False),
-                        image_index,
-                        image_plan["kind"],
-                        image_plan["label"],
-                        None,
-                        prompt,
-                        input_image_url,
-                        now,
-                        now,
-                    ),
-                )
-
-            for sku_index, sku_entry in enumerate(iter_sku_entries(record), start=1):
-                sku_entry_id = clean_text(sku_entry.get("id")) or f"sku-{sku_index}"
-                image_kind = f"sku-{sku_index:02d}-{clean_key_part(sku_entry_id)}"
-                job_id = stable_job_id(provider, record_id, image_kind)
-                sku_name = clean_text(sku_entry.get("name")) or f"SKU {sku_index}"
-                prompt = build_sku_image_prompt(record, safe_title_en, sku_entry, sku_index)
-                sku_input_image_url = pick_sku_input_image(record, sku_entry) or input_image_url
-                conn.execute(
-                    """
-                    INSERT INTO creative_image_jobs (
-                        id, provider, status, record_id, product_id, record_title, safe_title_en,
-                        record_json, image_index, image_kind, image_label, target_sku_entry_id, prompt, input_image_url,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(provider, record_id, image_kind) DO UPDATE SET
-                        status = CASE
-                            WHEN creative_image_jobs.status = 'completed' THEN creative_image_jobs.status
-                            ELSE excluded.status
-                        END,
-                        product_id = excluded.product_id,
-                        record_title = excluded.record_title,
-                        safe_title_en = excluded.safe_title_en,
-                        record_json = excluded.record_json,
-                        image_index = excluded.image_index,
-                        image_label = excluded.image_label,
-                        target_sku_entry_id = excluded.target_sku_entry_id,
-                        prompt = excluded.prompt,
-                        input_image_url = excluded.input_image_url,
-                        result_image_url = CASE
-                            WHEN creative_image_jobs.status = 'completed' THEN creative_image_jobs.result_image_url
-                            ELSE NULL
-                        END,
-                        result_storage_key = CASE
-                            WHEN creative_image_jobs.status = 'completed' THEN creative_image_jobs.result_storage_key
-                            ELSE NULL
-                        END,
-                        analysis_text = CASE
-                            WHEN creative_image_jobs.status = 'completed' THEN creative_image_jobs.analysis_text
-                            ELSE NULL
-                        END,
-                        error_message = CASE
-                            WHEN creative_image_jobs.status = 'completed' THEN creative_image_jobs.error_message
-                            ELSE NULL
-                        END,
-                        claimed_at = CASE
-                            WHEN creative_image_jobs.status = 'completed' THEN creative_image_jobs.claimed_at
-                            ELSE NULL
-                        END,
-                        completed_at = CASE
-                            WHEN creative_image_jobs.status = 'completed' THEN creative_image_jobs.completed_at
-                            ELSE NULL
-                        END,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        job_id,
-                        provider,
-                        JOB_STATUS_QUEUED,
-                        record_id,
-                        product_id,
-                        clean_text(record.get("productTitle")),
-                        safe_title_en,
-                        json.dumps(record, ensure_ascii=False),
-                        IMAGE_COUNT + sku_index,
-                        image_kind,
-                        f"SKU {sku_index}: {sku_name}",
-                        sku_entry_id,
-                        prompt,
-                        sku_input_image_url,
-                        now,
-                        now,
-                    ),
-                )
-
-        record_ids = [clean_text(record.get("id")) for record in records if clean_text(record.get("id"))]
         created_or_existing = list_creative_jobs(conn, provider=provider, record_ids=record_ids)
 
     return created_or_existing
+
+
+def reset_plugin_job_for_record(
+    record: dict[str, Any],
+    *,
+    image_kind: str,
+    provider: str = PLUGIN_PROVIDER,
+) -> dict[str, Any]:
+    provider = clean_text(provider) or PLUGIN_PROVIDER
+    record_id = clean_text(record.get("id"))
+    clean_image_kind = clean_text(image_kind)
+    if not record_id or not clean_image_kind:
+        raise CreativePluginJobError("缺少链接记录或图片槽位")
+
+    now = utc_now_text()
+    job = prepare_single_creative_job(record, provider=provider, image_kind=clean_image_kind, now=now)
+    if job is None:
+        raise CreativePluginJobError("鏈壘鍒板搴旂殑鐢熷浘妲戒綅浠诲姟")
+
+    with get_connection() as conn:
+        ensure_creative_jobs_schema(conn)
+        upsert_creative_job(conn, job)
+        row = conn.execute(
+            """
+            SELECT *
+            FROM creative_image_jobs
+            WHERE provider = ? AND record_id = ? AND image_kind = ?
+            """,
+            (provider, record_id, clean_image_kind),
+        ).fetchone()
+        if row is None:
+            raise CreativePluginJobError("未找到对应的生图槽位任务")
+
+        conn.execute(
+            """
+            UPDATE creative_image_jobs
+            SET status = ?, result_image_url = NULL, result_storage_key = NULL, analysis_text = NULL,
+                error_message = NULL, claimed_at = NULL, completed_at = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (JOB_STATUS_QUEUED, now, row["id"]),
+        )
+        updated = conn.execute("SELECT * FROM creative_image_jobs WHERE id = ?", (row["id"],)).fetchone()
+
+    return creative_job_row_to_api(updated)
+
+
+def prepare_single_creative_job(
+    record: dict[str, Any],
+    *,
+    provider: str,
+    image_kind: str,
+    now: str,
+) -> dict[str, Any] | None:
+    record_id = clean_text(record.get("id"))
+    if not record_id:
+        return None
+
+    product_id = clean_text(record.get("productId")) or record_id
+    safe_title_cn, _ = sanitize_marketplace_text(record.get("productTitle"))
+    safe_title_en = normalize_english_title(record.get("productTitleEn"), safe_title_cn or record.get("productTitle", ""))
+    safe_title_en, _ = sanitize_marketplace_text(safe_title_en)
+    input_image_url = pick_record_input_image(record)
+    product_image_count = get_product_image_generation_count(record)
+
+    for image_plan in build_image_plan(record, safe_title_en)[:product_image_count]:
+        if image_plan["kind"] != image_kind:
+            continue
+        return {
+            "id": stable_job_id(provider, record_id, image_plan["kind"]),
+            "provider": provider,
+            "status": JOB_STATUS_QUEUED,
+            "record_id": record_id,
+            "product_id": product_id,
+            "record_title": clean_text(record.get("productTitle")),
+            "safe_title_en": safe_title_en,
+            "record_json": json.dumps(record, ensure_ascii=False),
+            "image_index": int(image_plan["index"]),
+            "image_kind": image_plan["kind"],
+            "image_label": image_plan["label"],
+            "target_sku_entry_id": None,
+            "prompt": build_image_prompt(record, safe_title_en, image_plan),
+            "input_image_url": input_image_url,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    for sku_index, sku_entry in enumerate(iter_sku_entries(record), start=1):
+        sku_entry_id = clean_text(sku_entry.get("id")) or f"sku-{sku_index}"
+        sku_image_kind = f"sku-{sku_index:02d}-{clean_key_part(sku_entry_id)}"
+        if sku_image_kind != image_kind:
+            continue
+        sku_name = clean_text(sku_entry.get("name")) or f"SKU {sku_index}"
+        return {
+            "id": stable_job_id(provider, record_id, sku_image_kind),
+            "provider": provider,
+            "status": JOB_STATUS_QUEUED,
+            "record_id": record_id,
+            "product_id": product_id,
+            "record_title": clean_text(record.get("productTitle")),
+            "safe_title_en": safe_title_en,
+            "record_json": json.dumps(record, ensure_ascii=False),
+            "image_index": IMAGE_COUNT + sku_index,
+            "image_kind": sku_image_kind,
+            "image_label": f"SKU {sku_index}: {sku_name}",
+            "target_sku_entry_id": sku_entry_id,
+            "prompt": build_sku_image_prompt(record, safe_title_en, sku_entry, sku_index),
+            "input_image_url": pick_sku_input_image(record, sku_entry) or input_image_url,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    return None
 
 
 def claim_next_plugin_job(provider: str = PLUGIN_PROVIDER) -> dict[str, Any] | None:
@@ -376,8 +482,9 @@ def sync_records_with_plugin_jobs(records: list[dict[str, Any]], provider: str =
         completed_jobs = [job for job in record_jobs if job["status"] == JOB_STATUS_COMPLETED and job.get("resultImageUrl")]
         completed_product_jobs = [job for job in completed_jobs if not clean_text(job.get("targetSkuEntryId"))]
         completed_sku_jobs = [job for job in completed_jobs if clean_text(job.get("targetSkuEntryId"))]
-        if len(completed_product_jobs) >= IMAGE_COUNT:
-            updated = apply_completed_jobs_to_record(updated, completed_product_jobs[:IMAGE_COUNT])
+        product_image_count = get_product_image_generation_count(record)
+        if len(completed_product_jobs) >= product_image_count:
+            updated = apply_completed_jobs_to_record(updated, completed_product_jobs[:product_image_count])
             completed_record_ids.append(record_id)
         if completed_sku_jobs:
             updated = apply_completed_sku_jobs_to_record(updated, completed_sku_jobs)
@@ -445,18 +552,95 @@ def list_creative_jobs(
     return [creative_job_row_to_api(row) for row in rows]
 
 
+def delete_stale_product_jobs(
+    conn: sqlite3.Connection,
+    provider: str,
+    record_id: str,
+    valid_image_kinds: set[str],
+) -> None:
+    if not valid_image_kinds:
+        return
+    placeholders = ",".join("?" for _ in valid_image_kinds)
+    conn.execute(
+        f"""
+        DELETE FROM creative_image_jobs
+        WHERE provider = ?
+          AND record_id = ?
+          AND target_sku_entry_id IS NULL
+          AND image_kind NOT IN ({placeholders})
+        """,
+        [provider, record_id, *sorted(valid_image_kinds)],
+    )
+
+
+def get_product_image_generation_count(record: dict[str, Any]) -> int:
+    try:
+        count = int(record.get("productImageGenerationCount") or 0)
+    except (TypeError, ValueError):
+        count = 0
+    if count <= 0:
+        slot_count = len(
+            [
+                slot
+                for slot in record.get("imageSlots") or []
+                if isinstance(slot, dict) and clean_text(slot.get("type")) == "carousel"
+            ]
+        )
+        count = slot_count or IMAGE_COUNT
+    return max(1, min(count, IMAGE_COUNT))
+
+
+def build_generated_product_image_slots(record: dict[str, Any], generated_assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    record_id = clean_text(record.get("id") or record.get("productId") or "record")
+    existing_slots = [slot for slot in record.get("imageSlots") or [] if isinstance(slot, dict)]
+    main_asset_id = clean_text((record.get("mainImage") or {}).get("id")) or f"{record_id}-main-image"
+    main_slot = next((slot for slot in existing_slots if clean_text(slot.get("type")) == "main"), None) or {}
+    next_slots: list[dict[str, Any]] = [
+        {
+            **main_slot,
+            "id": clean_text(main_slot.get("id")) or f"{record_id}-slot-main",
+            "type": "main",
+            "order": 0,
+            "assetId": main_asset_id,
+        }
+    ]
+
+    existing_carousel_by_order = {
+        int(float(slot.get("order") or index + 1)): slot
+        for index, slot in enumerate(existing_slots)
+        if clean_text(slot.get("type")) == "carousel"
+    }
+    for index, asset in enumerate(generated_assets, start=1):
+        slot = existing_carousel_by_order.get(index, {})
+        next_slots.append(
+            {
+                **slot,
+                "id": clean_text(slot.get("id")) or f"{record_id}-slot-carousel-{index}",
+                "type": "carousel",
+                "order": index,
+                "assetId": asset.get("id"),
+            }
+        )
+
+    return next_slots
+
+
 def apply_completed_jobs_to_record(record: dict[str, Any], completed_jobs: list[dict[str, Any]]) -> dict[str, Any]:
     safe_title_en = clean_text(completed_jobs[0].get("safeTitleEn")) if completed_jobs else ""
     if safe_title_en:
         record["productTitleEn"] = safe_title_en
 
     generated_assets = []
+    record_id = clean_text(record.get("id") or record.get("productId") or "record")
+    current_main = record.get("mainImage") or {}
+    main_asset_id = clean_text(current_main.get("id")) or f"{record_id}-main-image"
     for job in completed_jobs:
         image_url = job["resultImageUrl"]
+        image_index = int(job.get("imageIndex") or len(generated_assets) + 1)
         generated_assets.append(
             {
-                "id": f"{record.get('id', record.get('productId', 'record'))}-plugin-{job['imageKind']}",
-                "role": "product-main" if job["imageIndex"] == 1 else "product-material",
+                "id": main_asset_id if image_index == 1 else f"{record_id}-plugin-{job['imageKind']}",
+                "role": "product-main" if image_index == 1 else "product-material",
                 "editedCloudUrl": image_url,
                 "displayCloudUrl": image_url,
                 "storageKey": job.get("resultStorageKey") or "",
@@ -465,11 +649,10 @@ def apply_completed_jobs_to_record(record: dict[str, Any], completed_jobs: list[
         )
 
     if generated_assets:
-        current_main = record.get("mainImage") or {}
         first = generated_assets[0]
         record["mainImage"] = {
             **current_main,
-            "id": current_main.get("id") or f"{record.get('id', record.get('productId', 'record'))}-main-image",
+            "id": main_asset_id,
             "role": "product-main",
             "editedCloudUrl": first["editedCloudUrl"],
             "displayCloudUrl": first["displayCloudUrl"],
@@ -477,6 +660,8 @@ def apply_completed_jobs_to_record(record: dict[str, Any], completed_jobs: list[
             "alt": first["alt"],
         }
         record["productMaterialImages"] = generated_assets
+        record["productImageGenerationCount"] = len(generated_assets)
+        record["imageSlots"] = build_generated_product_image_slots(record, generated_assets)
 
     return record
 

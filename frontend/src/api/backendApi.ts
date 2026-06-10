@@ -38,7 +38,7 @@ export type AdminUser = {
 
 export type AdminSetting = {
   key: string;
-  category: 'ai' | 'oss' | '1688' | string;
+  category: 'ai' | 'visual' | 'oss' | '1688' | string;
   label: string;
   description: string;
   value: string;
@@ -256,6 +256,86 @@ export type PluginCreativeSyncResponse = {
   completedRecordIds: string[];
   pendingCount: number;
   failedCount: number;
+};
+
+export type VisualGenerationModule = {
+  id: string;
+  taskId: string;
+  panelIndex: number;
+  position?: string | null;
+  slotType?: string | null;
+  title?: string | null;
+  purpose?: string | null;
+  prompt: string;
+  outputPath?: string | null;
+  outputUrl?: string | null;
+  targetSlotId?: string | null;
+  targetSkuEntryId?: string | null;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type VisualGenerationTask = {
+  id: string;
+  userId: string;
+  linkRecordId?: string | null;
+  productId?: string | null;
+  mode: string;
+  layout: '1x1' | '2x2' | '3x3' | string;
+  requestedCount: number;
+  status: string;
+  sourceImageRef?: string | null;
+  record?: Record<string, unknown>;
+  analysis?: Record<string, unknown>;
+  promptText?: string;
+  motherImagePath?: string | null;
+  motherImageUrl?: string | null;
+  manifest?: Record<string, unknown>;
+  modules: VisualGenerationModule[];
+  errorMessage?: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type VisualTaskCreatePayload = {
+  record?: LinkListRecord;
+  linkRecordId?: string;
+  productId?: string;
+  mode?: string;
+  layout?: '1x1' | '2x2' | '3x3' | string;
+  requestedCount?: number;
+  sourceImageRef?: string;
+};
+
+export type VisualTaskPlanPayload = {
+  sourceImageRef?: string;
+  allowShortLabels?: boolean;
+  analysisModel?: string;
+  promptModel?: string;
+};
+
+export type VisualTaskGeneratePayload = {
+  splitAfter?: boolean;
+  uploadToOss?: boolean;
+  imageModel?: string;
+  imageSize?: string;
+  useReferenceImage?: boolean;
+};
+
+export type VisualTaskSplitPayload = {
+  motherImageRef?: string;
+  uploadToOss?: boolean;
+  targetSize?: number;
+  safeMarginRatio?: number;
+  outputFormat?: 'webp' | 'jpg' | 'jpeg' | 'png' | string;
+  quality?: number;
+  sharpen?: number;
+};
+
+export type VisualSplitPayload = VisualTaskSplitPayload & {
+  motherImageRef: string;
+  layout?: '1x1' | '2x2' | '3x3' | string;
 };
 
 export type Smart1688Recommendation = {
@@ -723,6 +803,128 @@ export async function syncPluginCreativeJobs(records: LinkListRecord[]): Promise
   }
 
   return response.json();
+}
+
+export async function regeneratePluginCreativeJob(
+  record: LinkListRecord,
+  imageKind: string,
+): Promise<{ item: PluginCreativeJob }> {
+  const response = await fetch(`${API_BASE_URL}/api/creative/plugin/jobs/regenerate`, withSession({
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ record, image_kind: imageKind, provider: 'plugin_chatgpt_web' }),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json();
+}
+
+export async function fetchVisualGenerationTasks(status?: string): Promise<VisualGenerationTask[]> {
+  const search = new URLSearchParams();
+  if (status) search.set('status', status);
+  const suffix = search.toString() ? `?${search}` : '';
+  const response = await fetch(`${API_BASE_URL}/api/visual/tasks${suffix}`, withSession({
+    headers: authHeaders(),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.items || [];
+}
+
+export async function createVisualGenerationTask(payload: VisualTaskCreatePayload): Promise<VisualGenerationTask> {
+  const response = await fetch(`${API_BASE_URL}/api/visual/tasks`, withSession({
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.item;
+}
+
+export async function fetchVisualGenerationTask(taskId: string): Promise<VisualGenerationTask> {
+  const response = await fetch(`${API_BASE_URL}/api/visual/tasks/${encodeURIComponent(taskId)}`, withSession({
+    headers: authHeaders(),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.item;
+}
+
+export async function planVisualGenerationTask(
+  taskId: string,
+  payload: VisualTaskPlanPayload = {},
+): Promise<VisualGenerationTask> {
+  const response = await fetch(`${API_BASE_URL}/api/visual/tasks/${encodeURIComponent(taskId)}/plan`, withSession({
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.item;
+}
+
+export async function generateVisualGenerationTask(
+  taskId: string,
+  payload: VisualTaskGeneratePayload = {},
+): Promise<VisualGenerationTask> {
+  const response = await fetch(`${API_BASE_URL}/api/visual/tasks/${encodeURIComponent(taskId)}/generate`, withSession({
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.item;
+}
+
+export async function splitVisualGenerationTask(
+  taskId: string,
+  payload: VisualTaskSplitPayload = {},
+): Promise<VisualGenerationTask> {
+  const response = await fetch(`${API_BASE_URL}/api/visual/tasks/${encodeURIComponent(taskId)}/split`, withSession({
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.item;
+}
+
+export async function splitVisualMotherImage(payload: VisualSplitPayload): Promise<VisualGenerationTask> {
+  const response = await fetch(`${API_BASE_URL}/api/visual/split`, withSession({
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.item;
 }
 
 export async function fetchAdminUsers(): Promise<AdminUser[]> {
