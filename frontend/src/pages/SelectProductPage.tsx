@@ -9,20 +9,17 @@ import {
   Layout,
   Modal,
   Popover,
+  Progress,
   Select,
   Space,
   Statistic,
-  Tabs,
   Tag,
   Typography,
   message,
 } from 'antd';
 import {
-  AppstoreOutlined,
   CheckCircleOutlined,
   ClockCircleOutlined,
-  EyeOutlined,
-  HistoryOutlined,
   PictureOutlined,
   ReloadOutlined,
   SwapOutlined,
@@ -34,6 +31,7 @@ import type { Key } from 'react';
 import type { SortOrder } from 'antd/es/table/interface';
 import {
   addProductsToPool,
+  createVisualGenerationTask,
   deleteProduct as deleteBackendProduct,
   deleteLinkListRecord,
   exportDianxiaomiTemuTemplate,
@@ -42,6 +40,8 @@ import {
   fetchProductStats,
   fetchProducts,
   mapBackendProduct,
+  generateVisualGenerationTask,
+  planVisualGenerationTask,
   saveLinkListRecord,
   saveLinkListRecords,
   regeneratePluginCreativeJob,
@@ -49,7 +49,7 @@ import {
   upload1688Links,
   uploadYunqiFile,
 } from '../api/backendApi';
-import type { CurrentUser, ProductCategoryOption, ProductStats } from '../api/backendApi';
+import type { CurrentUser, ProductCategoryOption, ProductStats, VisualGenerationTask } from '../api/backendApi';
 import { DataImportModal } from '../components/DataImportModal';
 import { ProductDetailDrawer } from '../components/ProductDetailDrawer';
 import { ProductTable } from '../components/ProductTable';
@@ -102,21 +102,34 @@ type VisualQueueItem = {
   completedCount: number;
   statusLabel: string;
   statusColor: string;
+  backendTaskId?: string;
+  backendStatus?: string;
+  errorMessage?: string;
+  analysis?: Record<string, unknown>;
+  promptText?: string;
+  motherImageUrl?: string;
+  motherImagePath?: string;
+  manifest?: Record<string, unknown>;
   styleProfileId: string;
   styleLockLabel: string;
   styleLockStatus: string;
   referenceImageUrl?: string;
+  referenceImageUrls?: string[];
+  referenceImageLabels?: string[];
   selectedSkuIds?: string[];
   selectedSlotIds?: string[];
   createdAt: string;
   modules: Array<{
     id: string;
     order: number;
+    slotId?: string;
     skuEntryId?: string;
     title: string;
     targetLabel: string;
     imageKind?: string;
     imageUrl?: string;
+    outputUrl?: string;
+    outputPath?: string;
     sourceLabel: string;
     statusLabel: string;
     statusColor: string;
@@ -473,6 +486,34 @@ function getSkuDisplayImageUrl(entry: LinkListRecord['skuEntries'][number]) {
   return getAssetDisplayUrl(entry.imageAsset) || entry.imageUrl;
 }
 
+function getSelectedSkuImageRefDescriptors(record: LinkListRecord, selectedSkuIds?: string[]) {
+  const selectedSet = new Set(selectedSkuIds || []);
+  const entries =
+    selectedSet.size > 0 ? record.skuEntries.filter((entry) => selectedSet.has(entry.id)) : record.skuEntries;
+  const refs: Array<{ url: string; label: string }> = [];
+  const addRef = (value: string | undefined, label: string) => {
+    const clean = String(value || '').trim();
+    if (clean && !refs.some((item) => item.url === clean)) refs.push({ url: clean, label });
+  };
+
+  entries.forEach((entry) => {
+    const skuLabel = `SKU ${entry.order || ''}：${entry.name}`.trim();
+    addRef(getSkuDisplayImageUrl(entry), skuLabel);
+    (entry.sourceSkuLinks || []).forEach((link) => {
+      addRef(link.imageUrl, `货源 SKU：${link.specText || link.optionText || entry.name}`);
+    });
+    (entry.componentSkus || []).forEach((component) => {
+      addRef(component.sourceImageUrl || component.imageUrl, `组件：${component.name || component.specText || component.sourceTitle}`);
+    });
+  });
+
+  return refs;
+}
+
+function getSelectedSkuImageRefs(record: LinkListRecord, selectedSkuIds?: string[]) {
+  return getSelectedSkuImageRefDescriptors(record, selectedSkuIds).map((item) => item.url);
+}
+
 function collectRecordImageAssets(record?: LinkListRecord): LinkListImageAsset[] {
   if (!record) return [];
   const assets: LinkListImageAsset[] = [];
@@ -693,6 +734,179 @@ function updateRecordImageSlot(record: LinkListRecord, slotId: string, assetId: 
   };
 }
 
+function createProductCarouselSlot(record: LinkListRecord, assetId: string, order: number): LinkListImageSlot {
+  const assetKey = assetId.replace(/[^a-zA-Z0-9_-]/g, '').slice(-24) || `${order}`;
+  return {
+    id: `${record.id}-slot-carousel-${Date.now()}-${order}-${assetKey}`,
+    type: 'carousel',
+    order,
+    assetId,
+  };
+}
+
+function syncRecordProductSlots(record: LinkListRecord, carouselSlots: LinkListImageSlot[]): LinkListRecord {
+  const normalizedCarouselSlots = carouselSlots
+    .filter((slot) => slot.assetId)
+    .slice(0, MAX_EXPORT_CAROUSEL_IMAGE_COUNT)
+    .map((slot, index) => ({
+      ...slot,
+      type: 'carousel' as const,
+      order: index + 1,
+    }));
+  const firstAssetId = normalizedCarouselSlots[0]?.assetId;
+  const otherSlots = getRecordImageSlots(record).filter((slot) => slot.type !== 'main' && slot.type !== 'carousel');
+  const mainSlot: LinkListImageSlot = {
+    id: `${record.id}-slot-main`,
+    type: 'main',
+    order: 0,
+    assetId: firstAssetId,
+  };
+
+  return {
+    ...record,
+    schemaVersion: 3,
+    productImageGenerationCount: normalizedCarouselSlots.length,
+    imageSlots: [mainSlot, ...normalizedCarouselSlots, ...otherSlots].sort((left, right) => left.order - right.order),
+  };
+}
+
+function getEditableProductImageSlotItems(record?: LinkListRecord) {
+  if (!record) return [];
+  const assetMap = getRecordAssetMap(record);
+  return getRecordImageSlots(record)
+    .filter((slot) => slot.type === 'carousel' && slot.assetId)
+    .map((slot, index) => {
+      const asset = slot.assetId ? assetMap.get(slot.assetId) : undefined;
+      const imageUrl = getAssetDisplayUrl(asset);
+      const order = index + 1;
+      return {
+        slot: {
+          ...slot,
+          order,
+        },
+        asset,
+        imageUrl,
+        order,
+        imageKind: getProductImageKindByOrder(order),
+        imageLabel: `图片 ${order}`,
+        job: getProductSlotJob(record, getProductImageKindByOrder(order)),
+      };
+    })
+    .filter((item) => item.imageUrl);
+}
+
+function addProductImageAssets(record: LinkListRecord, assetIds: string[]): LinkListRecord {
+  const assetMap = getRecordAssetMap(record);
+  const currentSlots = getRecordImageSlots(record).filter((slot) => slot.type === 'carousel' && slot.assetId);
+  const existingAssetIds = new Set(currentSlots.map((slot) => slot.assetId).filter(Boolean));
+  const nextSlots = [...currentSlots];
+
+  assetIds.forEach((assetId) => {
+    const asset = assetMap.get(assetId);
+    if (!asset || asset.role === 'sales-sku' || existingAssetIds.has(assetId)) return;
+    if (nextSlots.length >= MAX_EXPORT_CAROUSEL_IMAGE_COUNT) return;
+    existingAssetIds.add(assetId);
+    nextSlots.push(createProductCarouselSlot(record, assetId, nextSlots.length + 1));
+  });
+
+  return syncRecordProductSlots(record, nextSlots);
+}
+
+function removeProductImageSlot(record: LinkListRecord, slotId: string): LinkListRecord {
+  const nextSlots = getRecordImageSlots(record).filter((slot) => slot.type === 'carousel' && slot.id !== slotId);
+  return syncRecordProductSlots(record, nextSlots);
+}
+
+function reorderProductImageSlot(record: LinkListRecord, sourceSlotId: string, targetSlotId: string): LinkListRecord {
+  if (sourceSlotId === targetSlotId) return record;
+  const slots = getRecordImageSlots(record).filter((slot) => slot.type === 'carousel' && slot.assetId);
+  const sourceIndex = slots.findIndex((slot) => slot.id === sourceSlotId);
+  const targetIndex = slots.findIndex((slot) => slot.id === targetSlotId);
+  if (sourceIndex < 0 || targetIndex < 0) return record;
+  const nextSlots = [...slots];
+  const [moved] = nextSlots.splice(sourceIndex, 1);
+  nextSlots.splice(targetIndex, 0, moved);
+  return syncRecordProductSlots(record, nextSlots);
+}
+
+function buildSkuImageAsset(record: LinkListRecord, entryId: string, asset: LinkListImageAsset, entryName: string): LinkListImageAsset {
+  const displayUrl = getAssetDisplayUrl(asset);
+  return {
+    ...asset,
+    id: `${record.id}-sku-image-${entryId}-${asset.id.replace(/[^a-zA-Z0-9_-]/g, '').slice(-24)}`,
+    role: 'sales-sku',
+    sourceUrl: asset.sourceUrl || displayUrl,
+    displayUrl,
+    displayCloudUrl: asset.displayCloudUrl || asset.editedCloudUrl || asset.sourceCloudUrl,
+    editedUrl: asset.editedUrl,
+    editedCloudUrl: asset.editedCloudUrl,
+    alt: entryName,
+  };
+}
+
+function addSkuImageAssets(record: LinkListRecord, assetIds: string[], selectedSkuIds: string[]): LinkListRecord {
+  const assetMap = getRecordAssetMap(record);
+  const assets = assetIds.map((assetId) => assetMap.get(assetId)).filter((asset): asset is LinkListImageAsset => Boolean(asset));
+  if (assets.length === 0) return record;
+  const selectedSet = new Set(selectedSkuIds);
+  const targetEntries = record.skuEntries
+    .filter((entry) => (selectedSet.size > 0 ? selectedSet.has(entry.id) : true))
+    .slice(0, selectedSet.size > 0 ? selectedSet.size : assets.length);
+  const targetIds = new Set(targetEntries.map((entry) => entry.id));
+
+  return {
+    ...record,
+    schemaVersion: 3,
+    skuEntries: record.skuEntries.map((entry) => {
+      if (!targetIds.has(entry.id)) return entry;
+      const asset = assets[targetEntries.findIndex((target) => target.id === entry.id) % assets.length];
+      const displayUrl = getAssetDisplayUrl(asset);
+      return {
+        ...entry,
+        imageAsset: buildSkuImageAsset(record, entry.id, asset, entry.name),
+        imageUrl: displayUrl || entry.imageUrl,
+      };
+    }),
+  };
+}
+
+function removeSkuImage(record: LinkListRecord, skuEntryId: string): LinkListRecord {
+  return {
+    ...record,
+    schemaVersion: 3,
+    skuEntries: record.skuEntries.map((entry) =>
+      entry.id === skuEntryId
+        ? {
+            ...entry,
+            imageAsset: undefined,
+            imageUrl: undefined,
+          }
+        : entry,
+    ),
+  };
+}
+
+function reorderSkuEntry(record: LinkListRecord, sourceSkuId: string, targetSkuId: string): LinkListRecord {
+  if (sourceSkuId === targetSkuId) return record;
+  const entries = [...record.skuEntries].sort((left, right) => left.order - right.order);
+  const sourceIndex = entries.findIndex((entry) => entry.id === sourceSkuId);
+  const targetIndex = entries.findIndex((entry) => entry.id === targetSkuId);
+  if (sourceIndex < 0 || targetIndex < 0) return record;
+  const [moved] = entries.splice(sourceIndex, 1);
+  entries.splice(targetIndex, 0, moved);
+  const orderMap = new Map(entries.map((entry, index) => [entry.id, index + 1]));
+  return {
+    ...record,
+    schemaVersion: 3,
+    skuEntries: record.skuEntries
+      .map((entry) => ({
+        ...entry,
+        order: orderMap.get(entry.id) || entry.order,
+      }))
+      .sort((left, right) => left.order - right.order),
+  };
+}
+
 function getImageSlotLabel(slot?: LinkListImageSlot) {
   if (!slot) return '图片';
   if (slot.type === 'main') return '主图';
@@ -725,27 +939,6 @@ function getCreativeJobSummary(record: LinkListRecord) {
   const queued = jobs.filter((job) => job.status === 'queued').length;
   const failed = jobs.filter((job) => job.status === 'failed').length;
   return { total: jobs.length, completed, running, queued, failed };
-}
-
-function getImageTaskStatusText(status?: string) {
-  if (status === 'queued') return '排队中';
-  if (status === 'running') return '生成中';
-  if (status === 'completed') return '已完成';
-  if (status === 'done') return '已统一';
-  if (status === 'failed') return '生成失败';
-  return '待修图';
-}
-
-function getImageTaskStatusMeta(status?: string, hasImage = false) {
-  if (status === 'queued') return { label: '队列中', color: 'blue', icon: <ClockCircleOutlined /> };
-  if (status === 'running') return { label: '生成中', color: 'gold', icon: <SyncOutlined spin /> };
-  if (status === 'completed') {
-    return { label: hasImage ? '已完成' : '待同步', color: hasImage ? 'green' : 'gold', icon: <CheckCircleOutlined /> };
-  }
-  if (status === 'done') return { label: '已统一', color: 'green', icon: <CheckCircleOutlined /> };
-  if (status === 'failed') return { label: '失败', color: 'red', icon: <WarningOutlined /> };
-  if (hasImage) return { label: '可导出', color: 'green', icon: <CheckCircleOutlined /> };
-  return { label: '未生成', color: 'default', icon: <ClockCircleOutlined /> };
 }
 
 function getImageAssetSourceMeta(asset?: LinkListImageAsset, job?: LinkListCreativeJobSummary) {
@@ -823,12 +1016,6 @@ function getVisualPublishModeLabel(mode: VisualPublishMode) {
   return '单图精修';
 }
 
-function getVisualPublishModeHint(mode: VisualPublishMode) {
-  if (mode === 'main_multi') return '选择一张参考图，生成任意数量的商品主图模块，适合 1 生 5、1 生 8 或九宫格批量任务。';
-  if (mode === 'sku_adapt') return '围绕销售 SKU 或组合 SKU 重新生图，组合出售时会把组件商品放进同一个模块任务。';
-  return '只重做当前任务包里的单张图片，适合质量不满意、局部重画或人工精修。';
-}
-
 function getVisualStyleProfileId(record: LinkListRecord) {
   return record.styleProfile?.id || `pending-style-${record.id}`;
 }
@@ -851,34 +1038,6 @@ function getQueueMixPolicyLabel(mode: VisualPublishMode, count: number) {
   if (count >= 9) return '同链接九宫格优先，按模块边界切图';
   if (count >= 4) return '同链接四宫格优先，数量不足可凑批';
   return '同链接主图批量生成';
-}
-
-function getRecordStyleLockView(record: LinkListRecord) {
-  const referenceImageUrl = getRecordMainImageUrl(record);
-  if (record.styleProfile) {
-    return {
-      status: 'locked',
-      label: '已锁定',
-      color: 'green',
-      title: record.styleProfile.name || '链接级统一画风',
-      description: '后续商品图、SKU 图和单张重生都会优先沿用这套画风要求。',
-      providerLabel: record.styleProfile.provider === 'comfyui' ? 'ComfyUI' : record.styleProfile.provider === 'chatgpt' ? 'ChatGPT API' : 'GPT 插件',
-      referenceLabel: record.styleProfile.referenceImageAssetId ? '指定参考图' : referenceImageUrl ? '当前主图' : '待补参考图',
-      prompt: record.styleProfile.prompt,
-    };
-  }
-
-  const hasCreativeJobs = (record.creativeJobs || []).length > 0;
-  return {
-    status: hasCreativeJobs ? 'draft' : 'missing',
-    label: hasCreativeJobs ? '待补风格锁' : '未生成',
-    color: hasCreativeJobs ? 'gold' : 'default',
-    title: hasCreativeJobs ? '已有生图记录，建议补充风格锁' : '尚未建立链接级画风',
-    description: '当前仅根据商品图槽位和生成记录推导展示。后端接入后会先分析参考图，再写入 StyleProfile。',
-    providerLabel: '待配置',
-    referenceLabel: referenceImageUrl ? '当前主图可作为参考' : '缺少参考图',
-    prompt: '',
-  };
 }
 
 function getRecordVisualTaskPackages(record: LinkListRecord) {
@@ -960,6 +1119,8 @@ function createVisualQueueItem(
     mode: VisualPublishMode;
     count: number;
     referenceImageUrl?: string;
+    referenceImageUrls?: string[];
+    referenceImageLabels?: string[];
     selectedSkuIds?: string[];
     selectedSlotIds?: string[];
   },
@@ -1029,12 +1190,15 @@ function createVisualQueueItem(
     styleLockLabel: getVisualStyleLockLabel(record),
     styleLockStatus: record.styleProfile ? 'ready' : 'pending',
     referenceImageUrl: options.referenceImageUrl,
+    referenceImageUrls: options.referenceImageUrls,
+    referenceImageLabels: options.referenceImageLabels,
     selectedSkuIds: options.selectedSkuIds,
     selectedSlotIds: options.selectedSlotIds,
     createdAt: new Date().toISOString(),
     modules: selectedModules.map((module) => ({
       id: module.id,
       order: module.order,
+      slotId: module.slotId,
       skuEntryId: module.skuEntryId,
       title: module.title,
       targetLabel: module.targetLabel,
@@ -1047,14 +1211,243 @@ function createVisualQueueItem(
   };
 }
 
-function getDefaultVisualPublishCount(
-  mode: VisualPublishMode,
+function getVisualTaskLayout(count: number): '1x1' | '2x2' | '3x3' {
+  if (count <= 1) return '1x1';
+  if (count <= 4) return '2x2';
+  return '3x3';
+}
+
+function getVisualTaskApiMode(mode: VisualPublishMode) {
+  if (mode === 'sku_adapt') return 'sku-gallery';
+  if (mode === 'single_refine') return 'single-refine';
+  return 'main-gallery';
+}
+
+function getVisualTaskResultUrl(module: VisualGenerationTask['modules'][number]) {
+  return module.outputUrl || module.outputPath || undefined;
+}
+
+function isRemoteImageUrl(url?: string) {
+  return Boolean(url && /^https?:\/\//i.test(url));
+}
+
+function getVisualQueueProgress(item: VisualQueueItem) {
+  if (item.statusColor === 'red') return 100;
+  if (item.completedCount > 0) return 100;
+  if (item.motherImageUrl || item.motherImagePath) return 78;
+  if (item.promptText) return 58;
+  if (item.analysis) return 42;
+  if (item.backendTaskId) return 24;
+  return 8;
+}
+
+function getVisualQueueLayoutLabel(count: number) {
+  return getVisualTaskLayout(count);
+}
+
+function getVisualMotherImageUrl(item?: VisualQueueItem) {
+  if (!item) return undefined;
+  return item.motherImageUrl || (isRemoteImageUrl(item.motherImagePath) ? item.motherImagePath : undefined);
+}
+
+function getVisualInputPromptText(item: VisualQueueItem) {
+  const fallbackReferenceCount =
+    item.referenceImageUrls?.length || (item.referenceImageUrl ? 1 : 0);
+  const referenceLines = item.referenceImageLabels?.length
+    ? item.referenceImageLabels
+        .filter(Boolean)
+        .map((label, index) => `Image ${index + 1}: ${label}`)
+        .join('\n')
+    : Array.from({ length: fallbackReferenceCount }, (_, index) => `Image ${index + 1}: selected reference image`).join(
+        '\n',
+      );
+  return [
+    `Mode: ${item.modeLabel}`,
+    `Product title: ${item.productTitle}`,
+    'Reference image parameters:',
+    referenceLines || 'No reference image selected.',
+    `Requested count: ${item.requestedCount}`,
+    `Layout: ${getVisualQueueLayoutLabel(item.requestedCount)}`,
+    `Style profile: ${item.styleProfileId}`,
+    `Batch strategy: ${item.mixPolicy}`,
+    '',
+    'Goal: analyze the selected image parameters and product record first, then create a unified visual plan before generating the mother grid image.',
+  ].join('\n');
+}
+
+function formatVisualDetail(value?: Record<string, unknown> | string) {
+  if (!value) return '等待规划完成后展示。';
+  if (typeof value === 'string') return value;
+  return JSON.stringify(value, null, 2);
+}
+
+function getVisualWorkflowStates(item: VisualQueueItem) {
+  const completed = [
+    true,
+    true,
+    Boolean(item.analysis),
+    Boolean(item.promptText),
+    Boolean(item.motherImageUrl || item.motherImagePath),
+    item.completedCount > 0,
+  ];
+  const firstPendingIndex = completed.findIndex((done) => !done);
+  return completed.map((done, index) => {
+    if (item.statusColor === 'red' && index === Math.max(0, firstPendingIndex)) return 'error';
+    if (done) return 'done';
+    if (index === firstPendingIndex) return 'active';
+    return 'waiting';
+  });
+}
+
+function replaceAssetById(assets: LinkListImageAsset[], nextAsset: LinkListImageAsset) {
+  const index = assets.findIndex((asset) => asset.id === nextAsset.id);
+  if (index < 0) return [...assets, nextAsset];
+  const nextAssets = [...assets];
+  nextAssets[index] = nextAsset;
+  return nextAssets;
+}
+
+function createVisualResultAsset(
   record: LinkListRecord,
-  task: ReturnType<typeof getRecordVisualTaskPackages>[number],
-) {
-  if (mode === 'single_refine') return 1;
-  if (mode === 'sku_adapt') return Math.max(1, Math.min(8, record.skuEntries.length || task.modules.length || 1));
-  return Math.max(1, Math.min(8, record.productImageGenerationCount || task.modules.length || 8));
+  item: VisualQueueItem,
+  module: VisualGenerationTask['modules'][number],
+  order: number,
+  role: LinkListImageAsset['role'],
+): LinkListImageAsset {
+  const resultUrl = getVisualTaskResultUrl(module);
+  const isRemote = isRemoteImageUrl(resultUrl);
+  const baseId =
+    role === 'sales-sku'
+      ? `${record.id}-visual-sku-${item.backendTaskId || item.id}-${module.targetSkuEntryId || order}`
+      : role === 'product-main'
+        ? `${record.id}-visual-main-${item.backendTaskId || item.id}`
+        : `${record.id}-visual-product-${item.backendTaskId || item.id}-${order}`;
+
+  return {
+    id: baseId,
+    role,
+    sourceUrl: module.outputPath || undefined,
+    displayUrl: resultUrl,
+    displayCloudUrl: isRemote ? resultUrl : undefined,
+    editedUrl: resultUrl,
+    editedCloudUrl: isRemote ? resultUrl : undefined,
+    alt: module.title || module.purpose || `${record.productTitle} ${order}`,
+  };
+}
+
+function applyVisualGenerationResult(record: LinkListRecord, item: VisualQueueItem, task: VisualGenerationTask) {
+  const generatedModules = [...(task.modules || [])]
+    .filter((module) => getVisualTaskResultUrl(module))
+    .sort((left, right) => (left.panelIndex || 0) - (right.panelIndex || 0));
+
+  if (generatedModules.length === 0) return record;
+
+  if (item.mode === 'sku_adapt') {
+    const moduleBySkuId = new Map<string, VisualGenerationTask['modules'][number]>();
+    generatedModules.forEach((module, index) => {
+      const queueModule = item.modules[index];
+      const skuId = module.targetSkuEntryId || queueModule?.skuEntryId;
+      if (skuId) moduleBySkuId.set(skuId, module);
+    });
+
+    const nextSkuEntries = record.skuEntries.map((entry) => {
+      const module = moduleBySkuId.get(entry.id);
+      if (!module) return entry;
+      const resultUrl = getVisualTaskResultUrl(module);
+      const asset = createVisualResultAsset(record, item, module, entry.order, 'sales-sku');
+      return {
+        ...entry,
+        imageAsset: {
+          ...(entry.imageAsset || {}),
+          ...asset,
+          sourceUrl: entry.imageAsset?.sourceUrl || entry.imageUrl,
+        },
+        imageUrl: resultUrl || entry.imageUrl,
+      };
+    });
+
+    return {
+      ...record,
+      schemaVersion: 3 as const,
+      skuEntries: nextSkuEntries,
+    };
+  }
+
+  let nextMainImage = record.mainImage;
+  let nextProductImages = [...(record.productMaterialImages || [])];
+  const slotMap = new Map<string, LinkListImageSlot>();
+  getRecordImageSlots(record).forEach((slot) => {
+    slotMap.set(slot.id, { ...slot });
+  });
+
+  generatedModules.forEach((module, index) => {
+    const queueModule =
+      item.modules[index] || item.modules.find((candidate) => candidate.order === module.panelIndex) || item.modules[0];
+    const order = queueModule?.order || module.panelIndex || index + 1;
+    const targetSlotId = module.targetSlotId || queueModule?.slotId || `${record.id}-slot-carousel-${order}`;
+    const existingSlot = slotMap.get(targetSlotId);
+    const shouldReplaceMain =
+      order === 1 || existingSlot?.type === 'main' || targetSlotId === `${record.id}-slot-main`;
+    const asset = createVisualResultAsset(
+      record,
+      item,
+      module,
+      order,
+      shouldReplaceMain ? 'product-main' : 'product-material',
+    );
+
+    if (shouldReplaceMain) {
+      nextMainImage = {
+        ...(record.mainImage || {}),
+        ...asset,
+        id: record.mainImage?.id || asset.id,
+        role: 'product-main',
+      };
+    } else {
+      nextProductImages = replaceAssetById(nextProductImages, asset);
+    }
+
+    const slotAssetId = shouldReplaceMain ? nextMainImage?.id || asset.id : asset.id;
+    const nextSlot: LinkListImageSlot = {
+      ...(existingSlot || {}),
+      id: targetSlotId,
+      type: existingSlot?.type || 'carousel',
+      order: Number.isFinite(existingSlot?.order) ? Number(existingSlot?.order) : order,
+      assetId: slotAssetId,
+    };
+    slotMap.set(targetSlotId, nextSlot);
+
+    if (shouldReplaceMain) {
+      const mainSlotId = `${record.id}-slot-main`;
+      const mainSlot = slotMap.get(mainSlotId);
+      slotMap.set(mainSlotId, {
+        ...(mainSlot || {}),
+        id: mainSlotId,
+        type: 'main',
+        order: 0,
+        assetId: slotAssetId,
+      });
+
+      const carouselOneId = `${record.id}-slot-carousel-1`;
+      const carouselOne = slotMap.get(carouselOneId);
+      slotMap.set(carouselOneId, {
+        ...(carouselOne || {}),
+        id: carouselOneId,
+        type: 'carousel',
+        order: 1,
+        assetId: slotAssetId,
+      });
+    }
+  });
+
+  return {
+    ...record,
+    schemaVersion: 3 as const,
+    mainImage: nextMainImage,
+    productMaterialImages: nextProductImages,
+    productImageGenerationCount: Math.max(record.productImageGenerationCount || 0, generatedModules.length),
+    imageSlots: [...slotMap.values()].sort((left, right) => left.order - right.order),
+  };
 }
 
 function downloadBlob(blob: Blob, filename: string) {
@@ -1081,34 +1474,32 @@ function LinkListPanel({
   const [previewActiveImageSlotId, setPreviewActiveImageSlotId] = useState<string>();
   const [previewActiveSkuEntryId, setPreviewActiveSkuEntryId] = useState<string>();
   const [imageManagerRecord, setImageManagerRecord] = useState<LinkListRecord>();
+  const [imageEditorOpen, setImageEditorOpen] = useState(false);
   const [managerActiveSlotId, setManagerActiveSlotId] = useState<string>();
   const [imageManagerActiveSkuEntryId, setImageManagerActiveSkuEntryId] = useState<string>();
-  const [imageManagerActiveTab, setImageManagerActiveTab] = useState('product');
+  const [imageManagerSelectedAssetIds, setImageManagerSelectedAssetIds] = useState<string[]>([]);
   const [imageManagerSelectedSlotIds, setImageManagerSelectedSlotIds] = useState<string[]>([]);
   const [imageManagerSelectedSkuIds, setImageManagerSelectedSkuIds] = useState<string[]>([]);
+  const [draggingProductSlotId, setDraggingProductSlotId] = useState<string>();
+  const [draggingSkuEntryId, setDraggingSkuEntryId] = useState<string>();
   const [imageSlotPickerOpen, setImageSlotPickerOpen] = useState(false);
-  const [imageSlotPickerContext, setImageSlotPickerContext] = useState<'preview' | 'manager'>('preview');
   const [syncingRecordId, setSyncingRecordId] = useState<string>();
   const [syncingAll, setSyncingAll] = useState(false);
   const [regeneratingSlotKey, setRegeneratingSlotKey] = useState<string>();
   const [visualQueueOpen, setVisualQueueOpen] = useState(false);
   const [visualQueueItems, setVisualQueueItems] = useState<VisualQueueItem[]>([]);
-  const [visualPublishModalOpen, setVisualPublishModalOpen] = useState(false);
-  const [visualPublishRecord, setVisualPublishRecord] = useState<LinkListRecord>();
-  const [visualPublishTask, setVisualPublishTask] = useState<ReturnType<typeof getRecordVisualTaskPackages>[number]>();
-  const [visualPublishMode, setVisualPublishMode] = useState<VisualPublishMode>('main_multi');
-  const [visualPublishCount, setVisualPublishCount] = useState(8);
-  const [visualPublishReferenceUrl, setVisualPublishReferenceUrl] = useState<string>();
-  const [visualPublishSelectedSkuIds, setVisualPublishSelectedSkuIds] = useState<string[]>([]);
+  const [visualQueueExecuting, setVisualQueueExecuting] = useState(false);
+  const [activeVisualQueueItemId, setActiveVisualQueueItemId] = useState<string>();
+  const [expandedVisualQueueItemIds, setExpandedVisualQueueItemIds] = useState<string[]>([]);
+  const [visualWorkflowStageByItemId, setVisualWorkflowStageByItemId] = useState<Record<string, number>>({});
   const previewGalleryItems = useMemo(() => getRecordPreviewGalleryItems(previewRecord), [previewRecord]);
   const previewImageAssetOptions = useMemo(() => getImageAssetOptions(previewRecord), [previewRecord]);
   const imageManagerSlotItems = useMemo(
     () => (imageManagerRecord ? getRecordProductImageSlotItems(imageManagerRecord) : []),
     [imageManagerRecord],
   );
-  const imageManagerAssetOptions = useMemo(() => getImageAssetOptions(imageManagerRecord), [imageManagerRecord]);
-  const imageManagerStyleLock = useMemo(
-    () => (imageManagerRecord ? getRecordStyleLockView(imageManagerRecord) : undefined),
+  const imageEditorProductSlotItems = useMemo(
+    () => (imageManagerRecord ? getEditableProductImageSlotItems(imageManagerRecord) : []),
     [imageManagerRecord],
   );
   const imageManagerVisualTasks = useMemo(
@@ -1124,7 +1515,14 @@ function LinkListPanel({
     [imageManagerVisualTasks],
   );
   const imageManagerGalleryOptions = useMemo(() => getVisualReferenceImageOptions(imageManagerRecord), [imageManagerRecord]);
-  const visualPublishAssetOptions = useMemo(() => getVisualReferenceImageOptions(visualPublishRecord), [visualPublishRecord]);
+  const imageManagerSelectedAssets = useMemo(() => {
+    const selectedSet = new Set(imageManagerSelectedAssetIds);
+    return imageManagerGalleryOptions.filter((option) => selectedSet.has(option.asset.id));
+  }, [imageManagerGalleryOptions, imageManagerSelectedAssetIds]);
+  const activeVisualQueueItem = useMemo(
+    () => visualQueueItems.find((item) => item.id === activeVisualQueueItemId) || visualQueueItems[0],
+    [activeVisualQueueItemId, visualQueueItems],
+  );
   const imageManagerPreviewGalleryItems = useMemo(
     () => getRecordPreviewGalleryItems(imageManagerRecord),
     [imageManagerRecord],
@@ -1141,12 +1539,9 @@ function LinkListPanel({
   const managerActiveSlotItem =
     imageManagerSlotItems.find((item) => item.slot.id === managerActiveSlotId) || imageManagerSlotItems[0];
   const managerActiveSlot = managerActiveSlotItem?.slot;
-  const imageManagerSelectedSlotItems = imageManagerSlotItems.filter((item) =>
-    imageManagerSelectedSlotIds.includes(item.slot.id),
-  );
-  const activeSlotPickerRecord = imageSlotPickerContext === 'manager' ? imageManagerRecord : previewRecord;
-  const activeSlotPickerSlot = imageSlotPickerContext === 'manager' ? managerActiveSlot : previewActiveSlot;
-  const activeSlotPickerOptions = imageSlotPickerContext === 'manager' ? imageManagerAssetOptions : previewImageAssetOptions;
+  const activeSlotPickerRecord = previewRecord;
+  const activeSlotPickerSlot = previewActiveSlot;
+  const activeSlotPickerOptions = previewImageAssetOptions;
   const activePreviewSkuEntry =
     previewRecord?.skuEntries.find((entry) => entry.id === previewActiveSkuEntryId) || previewRecord?.skuEntries[0];
   const previewPriceText = formatPreviewPrice(previewRecord);
@@ -1234,10 +1629,14 @@ function LinkListPanel({
 
   useEffect(() => {
     if (!imageManagerRecord) {
+      setImageEditorOpen(false);
       setManagerActiveSlotId(undefined);
       setImageManagerActiveSkuEntryId(undefined);
+      setImageManagerSelectedAssetIds([]);
       setImageManagerSelectedSlotIds([]);
       setImageManagerSelectedSkuIds([]);
+      setDraggingProductSlotId(undefined);
+      setDraggingSkuEntryId(undefined);
       return;
     }
 
@@ -1251,16 +1650,30 @@ function LinkListPanel({
   }, [imageManagerRecord, managerActiveSlotId, imageManagerActiveSkuEntryId]);
 
   useEffect(() => {
+    setImageManagerSelectedAssetIds([]);
     setImageManagerSelectedSlotIds([]);
     setImageManagerSelectedSkuIds([]);
+    setDraggingProductSlotId(undefined);
+    setDraggingSkuEntryId(undefined);
   }, [imageManagerRecord?.id]);
+
+  useEffect(() => {
+    if (visualQueueItems.length === 0) {
+      setActiveVisualQueueItemId(undefined);
+      setExpandedVisualQueueItemIds([]);
+      return;
+    }
+    if (!activeVisualQueueItemId || !visualQueueItems.some((item) => item.id === activeVisualQueueItemId)) {
+      setActiveVisualQueueItemId(visualQueueItems[0].id);
+    }
+  }, [activeVisualQueueItemId, visualQueueItems]);
 
   const openImageManager = (record: LinkListRecord, slotId?: string) => {
     const firstSlotId = getRecordProductImageSlotItems(record)[0]?.slot.id;
     setImageManagerRecord(record);
+    setImageEditorOpen(false);
     setManagerActiveSlotId(slotId || firstSlotId);
     setImageManagerActiveSkuEntryId(record.skuEntries[0]?.id);
-    setImageManagerActiveTab('product');
   };
 
   const replaceImageSlot = (record: LinkListRecord, slot: LinkListImageSlot, assetId: string) => {
@@ -1283,14 +1696,79 @@ function LinkListPanel({
     replaceImageSlot(activeSlotPickerRecord, activeSlotPickerSlot, assetId);
   };
 
-  const replacePreviewImageSlot = (assetId: string) => {
-    if (!previewRecord || !previewActiveSlot) return;
-    const nextRecord = updateRecordImageSlot(previewRecord, previewActiveSlot.id, assetId);
+  const commitImageManagerRecord = (nextRecord: LinkListRecord, successText?: string) => {
     onUpdate(nextRecord);
-    setPreviewRecord(nextRecord);
-    setPreviewActiveImageSlotId(previewActiveSlot.id);
-    setImageSlotPickerOpen(false);
-    message.success('已替换当前图片');
+    setPreviewRecord((current) => (current?.id === nextRecord.id ? nextRecord : current));
+    setImageManagerRecord((current) => (current?.id === nextRecord.id ? nextRecord : current));
+    if (successText) message.success(successText);
+  };
+
+  const toggleImageManagerAsset = (assetId: string) => {
+    setImageManagerSelectedAssetIds((current) =>
+      current.includes(assetId) ? current.filter((id) => id !== assetId) : [...current, assetId],
+    );
+  };
+
+  const addSelectedAssetsToProductImages = () => {
+    if (!imageManagerRecord) return;
+    const productAssetIds = imageManagerSelectedAssets
+      .filter((option) => option.asset.role === 'product-main' || option.asset.role === 'product-material')
+      .map((option) => option.asset.id);
+    if (productAssetIds.length === 0) {
+      message.warning('请先在左侧图库选择商品图素材');
+      return;
+    }
+    const beforeCount = getEditableProductImageSlotItems(imageManagerRecord).length;
+    const nextRecord = addProductImageAssets(imageManagerRecord, productAssetIds);
+    const afterItems = getEditableProductImageSlotItems(nextRecord);
+    const addedCount = Math.max(0, afterItems.length - beforeCount);
+    commitImageManagerRecord(nextRecord, addedCount > 0 ? `已加入 ${addedCount} 张主图` : '所选图片已在主图中');
+    setImageManagerSelectedSlotIds(afterItems.slice(-Math.max(addedCount, 0)).map((item) => item.slot.id));
+    if (afterItems.length > 0) setManagerActiveSlotId(afterItems[Math.max(0, afterItems.length - 1)]?.slot.id);
+  };
+
+  const addSelectedAssetsToSkuImages = () => {
+    if (!imageManagerRecord) return;
+    const assetIds = imageManagerSelectedAssets.map((option) => option.asset.id);
+    if (assetIds.length === 0) {
+      message.warning('请先在左侧图库选择要加入 SKU 的图片');
+      return;
+    }
+    const nextRecord = addSkuImageAssets(imageManagerRecord, assetIds, imageManagerSelectedSkuIds);
+    commitImageManagerRecord(nextRecord, `已加入 ${Math.min(assetIds.length, imageManagerRecord.skuEntries.length)} 张 SKU 图`);
+  };
+
+  const removeProductImageFromEditor = (slotId: string) => {
+    if (!imageManagerRecord) return;
+    const nextRecord = removeProductImageSlot(imageManagerRecord, slotId);
+    commitImageManagerRecord(nextRecord, '已删除主图');
+    setImageManagerSelectedSlotIds((current) => current.filter((id) => id !== slotId));
+    if (managerActiveSlotId === slotId) {
+      setManagerActiveSlotId(getEditableProductImageSlotItems(nextRecord)[0]?.slot.id);
+    }
+  };
+
+  const removeSkuImageFromEditor = (skuEntryId: string) => {
+    if (!imageManagerRecord) return;
+    const nextRecord = removeSkuImage(imageManagerRecord, skuEntryId);
+    commitImageManagerRecord(nextRecord, '已删除 SKU 图');
+    setImageManagerSelectedSkuIds((current) => current.filter((id) => id !== skuEntryId));
+  };
+
+  const reorderProductImageFromEditor = (targetSlotId: string) => {
+    if (!imageManagerRecord || !draggingProductSlotId) return;
+    const nextRecord = reorderProductImageSlot(imageManagerRecord, draggingProductSlotId, targetSlotId);
+    commitImageManagerRecord(nextRecord);
+    setManagerActiveSlotId(draggingProductSlotId);
+    setDraggingProductSlotId(undefined);
+  };
+
+  const reorderSkuFromEditor = (targetSkuEntryId: string) => {
+    if (!imageManagerRecord || !draggingSkuEntryId) return;
+    const nextRecord = reorderSkuEntry(imageManagerRecord, draggingSkuEntryId, targetSkuEntryId);
+    commitImageManagerRecord(nextRecord);
+    setImageManagerActiveSkuEntryId(draggingSkuEntryId);
+    setDraggingSkuEntryId(undefined);
   };
 
   const regenerateRecordImageSlot = async (record: LinkListRecord, imageKind?: string) => {
@@ -1315,55 +1793,6 @@ function LinkListPanel({
     }
   };
 
-  const openVisualPublishModal = (
-    record: LinkListRecord,
-    task: ReturnType<typeof getRecordVisualTaskPackages>[number],
-    modeOverride?: VisualPublishMode,
-    referenceUrlOverride?: string,
-    selectedSkuIds: string[] = [],
-  ) => {
-    const defaultMode: VisualPublishMode = modeOverride || (task.id.includes('sku-gallery') ? 'sku_adapt' : 'main_multi');
-    const defaultReferenceUrl = referenceUrlOverride || getRecordMainImageUrl(record) || getVisualReferenceImageOptions(record)[0]?.imageUrl;
-    setVisualPublishRecord(record);
-    setVisualPublishTask(task);
-    setVisualPublishMode(defaultMode);
-    setVisualPublishCount(
-      defaultMode === 'sku_adapt' && selectedSkuIds.length > 0
-        ? selectedSkuIds.length
-        : getDefaultVisualPublishCount(defaultMode, record, task),
-    );
-    setVisualPublishReferenceUrl(defaultReferenceUrl);
-    setVisualPublishSelectedSkuIds(selectedSkuIds);
-    setVisualPublishModalOpen(true);
-  };
-
-  const changeVisualPublishMode = (mode: VisualPublishMode) => {
-    setVisualPublishMode(mode);
-    if (visualPublishRecord && visualPublishTask) {
-      setVisualPublishCount(getDefaultVisualPublishCount(mode, visualPublishRecord, visualPublishTask));
-    } else if (mode === 'single_refine') {
-      setVisualPublishCount(1);
-    }
-  };
-
-  const publishVisualTaskToQueue = () => {
-    if (!visualPublishRecord || !visualPublishTask) return;
-    if (!visualPublishReferenceUrl) {
-      message.warning('请先选择一张参考图');
-      return;
-    }
-    const item = createVisualQueueItem(visualPublishRecord, visualPublishTask, {
-      mode: visualPublishMode,
-      count: visualPublishMode === 'single_refine' ? 1 : visualPublishCount,
-      referenceImageUrl: visualPublishReferenceUrl,
-      selectedSkuIds: visualPublishSelectedSkuIds,
-    });
-    setVisualQueueItems((current) => [item, ...current]);
-    setVisualPublishModalOpen(false);
-    setVisualQueueOpen(true);
-    message.success('已发布到统一任务队列');
-  };
-
   const enqueueVisualTask = (
     record: LinkListRecord,
     task: ReturnType<typeof getRecordVisualTaskPackages>[number],
@@ -1371,6 +1800,8 @@ function LinkListPanel({
       mode: VisualPublishMode;
       count: number;
       referenceImageUrl?: string;
+      referenceImageUrls?: string[];
+      referenceImageLabels?: string[];
       selectedSkuIds?: string[];
       selectedSlotIds?: string[];
     },
@@ -1383,14 +1814,404 @@ function LinkListPanel({
     const item = createVisualQueueItem(record, task, {
       ...options,
       referenceImageUrl,
+      referenceImageUrls: options.referenceImageUrls,
+      referenceImageLabels: options.referenceImageLabels,
     });
     setVisualQueueItems((current) => [item, ...current]);
+    setActiveVisualQueueItemId(item.id);
+    setExpandedVisualQueueItemIds((current) => [item.id, ...current.filter((id) => id !== item.id)]);
     setVisualQueueOpen(true);
     message.success('已加入统一任务队列');
   };
 
+  const enqueueMainGalleryFromSelectedSkus = () => {
+    if (!imageManagerRecord || !imageManagerProductTask) return;
+    if (imageManagerSelectedSkuIds.length === 0) {
+      message.warning('请先选择要作为主图生成依据的 SKU');
+      return;
+    }
+    const referenceImageDescriptors = getSelectedSkuImageRefDescriptors(imageManagerRecord, imageManagerSelectedSkuIds);
+    const referenceImageUrls = referenceImageDescriptors.map((item) => item.url);
+    if (referenceImageUrls.length === 0) {
+      message.warning('选中的 SKU 没有可用图片，不能作为主图生成参数');
+      return;
+    }
+    enqueueVisualTask(imageManagerRecord, imageManagerProductTask, {
+      mode: 'main_multi',
+      count: getRecordProductImageGenerationCount(imageManagerRecord),
+      referenceImageUrl: referenceImageUrls[0],
+      referenceImageUrls,
+      referenceImageLabels: referenceImageDescriptors.map((item) => item.label),
+      selectedSkuIds: imageManagerSelectedSkuIds,
+    });
+  };
+
+  const enqueueSkuAdaptFromSelectedSkus = () => {
+    if (!imageManagerRecord || !imageManagerSkuTask) return;
+    const selectedSkuIds =
+      imageManagerSelectedSkuIds.length > 0
+        ? imageManagerSelectedSkuIds
+        : imageManagerActiveSkuEntry
+          ? [imageManagerActiveSkuEntry.id]
+          : [];
+    if (selectedSkuIds.length === 0) {
+      message.warning('请先选择要适配的 SKU');
+      return;
+    }
+    const referenceImageDescriptors = getSelectedSkuImageRefDescriptors(imageManagerRecord, selectedSkuIds);
+    const referenceImageUrls = referenceImageDescriptors.map((item) => item.url);
+    if (referenceImageUrls.length === 0) {
+      message.warning('选中的 SKU 没有可用图片，不能作为 SKU 适配参数');
+      return;
+    }
+    enqueueVisualTask(imageManagerRecord, imageManagerSkuTask, {
+      mode: 'sku_adapt',
+      count: selectedSkuIds.length,
+      referenceImageUrl: referenceImageUrls[0],
+      referenceImageUrls,
+      referenceImageLabels: referenceImageDescriptors.map((item) => item.label),
+      selectedSkuIds,
+    });
+  };
+
   const removeVisualQueueItem = (queueItemId: string) => {
     setVisualQueueItems((current) => current.filter((item) => item.id !== queueItemId));
+    setExpandedVisualQueueItemIds((current) => current.filter((id) => id !== queueItemId));
+    setVisualWorkflowStageByItemId((current) => {
+      const next = { ...current };
+      delete next[queueItemId];
+      return next;
+    });
+  };
+
+  const patchVisualQueueItem = (
+    queueItemId: string,
+    patcher: (item: VisualQueueItem) => Partial<VisualQueueItem>,
+  ) => {
+    setVisualQueueItems((current) =>
+      current.map((item) => (item.id === queueItemId ? { ...item, ...patcher(item) } : item)),
+    );
+  };
+
+  const executeVisualQueueItem = async (item: VisualQueueItem, recordMap: Map<string, LinkListRecord>) => {
+    const record = recordMap.get(item.recordId) || records.find((candidate) => candidate.id === item.recordId);
+    if (!record) {
+      throw new Error('找不到该链接记录，请刷新后重试');
+    }
+
+    const markModules = (statusLabel: string, statusColor: string) =>
+      item.modules.map((module) => ({
+        ...module,
+        statusLabel,
+        statusColor,
+      }));
+
+    patchVisualQueueItem(item.id, () => ({
+      statusLabel: '创建中',
+      statusColor: 'processing',
+      backendStatus: 'creating',
+      modules: markModules('排队中', 'processing'),
+    }));
+
+    const taskRecord =
+      ['main_multi', 'sku_adapt'].includes(item.mode) && item.selectedSkuIds?.length
+        ? {
+            ...record,
+            skuEntries: record.skuEntries.filter((entry) => item.selectedSkuIds?.includes(entry.id)),
+            componentSkuCount: record.skuEntries
+              .filter((entry) => item.selectedSkuIds?.includes(entry.id))
+              .reduce((total, entry) => total + Math.max(1, entry.componentSkus?.length || 1), 0),
+          }
+        : record;
+
+    const created = await createVisualGenerationTask({
+      record: taskRecord,
+      linkRecordId: record.id,
+      productId: record.productId,
+      mode: getVisualTaskApiMode(item.mode),
+      layout: getVisualTaskLayout(item.requestedCount),
+      requestedCount: item.requestedCount,
+      sourceImageRef: item.referenceImageUrl,
+    });
+
+    patchVisualQueueItem(item.id, () => ({
+      backendTaskId: created.id,
+      backendStatus: created.status,
+      statusLabel: '规划中',
+      statusColor: 'processing',
+      modules: markModules('规划中', 'processing'),
+    }));
+
+    const planned = await planVisualGenerationTask(created.id, {
+      sourceImageRef: item.referenceImageUrl,
+      allowShortLabels: true,
+    });
+
+    patchVisualQueueItem(item.id, () => ({
+      backendTaskId: created.id,
+      backendStatus: 'planned',
+      statusLabel: '生成中',
+      statusColor: 'processing',
+      analysis: planned.analysis,
+      promptText: planned.promptText,
+      modules: markModules('生成中', 'processing'),
+    }));
+
+    const generated = await generateVisualGenerationTask(created.id, {
+      splitAfter: true,
+      uploadToOss: true,
+      useReferenceImage: true,
+    });
+    const itemWithBackendId = { ...item, backendTaskId: created.id };
+    const nextRecord = applyVisualGenerationResult(record, itemWithBackendId, generated);
+    recordMap.set(nextRecord.id, nextRecord);
+    onUpdate(nextRecord);
+    setPreviewRecord((current) => (current?.id === nextRecord.id ? nextRecord : current));
+    setImageManagerRecord((current) => (current?.id === nextRecord.id ? nextRecord : current));
+
+    const generatedModules = [...(generated.modules || [])].sort(
+      (left, right) => (left.panelIndex || 0) - (right.panelIndex || 0),
+    );
+    const completedCount = generatedModules.filter((module) => getVisualTaskResultUrl(module)).length;
+    const remoteCount = generatedModules.filter((module) => isRemoteImageUrl(module.outputUrl || undefined)).length;
+
+    patchVisualQueueItem(item.id, () => ({
+      backendTaskId: created.id,
+      backendStatus: generated.status,
+      statusLabel: completedCount > 0 ? '已回写' : '未返回图片',
+      statusColor: completedCount > 0 ? 'green' : 'gold',
+      completedCount,
+      analysis: generated.analysis || planned.analysis,
+      promptText: generated.promptText || planned.promptText,
+      motherImageUrl: generated.motherImageUrl || undefined,
+      motherImagePath: generated.motherImagePath || undefined,
+      manifest: generated.manifest,
+      errorMessage: generated.errorMessage || undefined,
+      modules: item.modules.map((module, index) => {
+        const generatedModule = generatedModules[index];
+        const resultUrl = generatedModule ? getVisualTaskResultUrl(generatedModule) : undefined;
+        return {
+          ...module,
+          imageUrl: resultUrl || module.imageUrl,
+          outputUrl: generatedModule?.outputUrl || undefined,
+          outputPath: generatedModule?.outputPath || undefined,
+          statusLabel: resultUrl ? '已回写' : '未返回图片',
+          statusColor: resultUrl ? 'green' : 'gold',
+        };
+      }),
+    }));
+
+    if (completedCount > 0 && remoteCount === 0) {
+      message.warning('Generated images are saved locally, but no OSS public URL was returned. Check OSS settings.');
+    }
+  };
+
+  const executeVisualQueue = async () => {
+    const pendingItems = visualQueueItems.filter((item) => item.statusLabel !== '已回写');
+    if (pendingItems.length === 0) {
+      message.info('队列中没有待执行任务');
+      return;
+    }
+
+    setVisualQueueExecuting(true);
+    const recordMap = new Map(records.map((record) => [record.id, record]));
+    let successCount = 0;
+    try {
+      for (const item of pendingItems) {
+        try {
+          await executeVisualQueueItem(item, recordMap);
+          successCount += 1;
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : '生图任务执行失败';
+          patchVisualQueueItem(item.id, () => ({
+            statusLabel: '执行失败',
+            statusColor: 'red',
+            backendStatus: 'failed',
+            errorMessage,
+            modules: item.modules.map((module) => ({
+              ...module,
+              statusLabel: '失败',
+              statusColor: 'red',
+            })),
+          }));
+          message.error(errorMessage);
+        }
+      }
+      if (successCount > 0) {
+        message.success(`已执行 ${successCount} 个生图任务，结果已回写到链接列表`);
+      }
+    } finally {
+      setVisualQueueExecuting(false);
+    }
+  };
+
+  const renderVisualQueueWorkflow = (item: VisualQueueItem) => {
+    const workflowStates = getVisualWorkflowStates(item);
+    const motherImageUrl = getVisualMotherImageUrl(item);
+    const splitModules = item.modules.filter((module) => module.outputUrl || module.outputPath);
+    const stages = [
+      {
+        title: '任务输入',
+        description: '保留参考图、模式、数量和组批策略。',
+        body: (
+          <div className="visual-workflow-fact-grid">
+            <div><span>模式</span><strong>{item.modeLabel}</strong></div>
+            <div><span>请求数量</span><strong>{item.requestedCount}</strong></div>
+            <div><span>网格布局</span><strong>{getVisualQueueLayoutLabel(item.requestedCount)}</strong></div>
+            <div><span>组批策略</span><strong>{item.mixPolicy}</strong></div>
+          </div>
+        ),
+      },
+      {
+        title: '图片分析前提示词',
+        description: '发送给规划阶段前的任务输入摘要。',
+        body: <pre>{getVisualInputPromptText(item)}</pre>,
+      },
+      {
+        title: '图片分析后解读',
+        description: '模型完成图片理解后回填的商品、材质、风险和画风信息。',
+        body: <pre>{formatVisualDetail(item.analysis)}</pre>,
+      },
+      {
+        title: '最终九宫格提示词',
+        description: '真正用于生成母图的最终提示词。',
+        body: <pre>{item.promptText || '等待提示词规划完成后展示。'}</pre>,
+      },
+      {
+        title: '九宫格母图',
+        description: '一次生成的大图，随后按格子切割。',
+        body: motherImageUrl ? (
+          <Image
+            alt="九宫格母图"
+            className="visual-workflow-mother-image"
+            referrerPolicy="no-referrer"
+            src={motherImageUrl}
+          />
+        ) : (
+          <div className="visual-workflow-placeholder">
+            {item.motherImagePath || '生成完成后展示九宫格母图。'}
+          </div>
+        ),
+      },
+      {
+        title: '切割结果',
+        description: '切割后回写到主图、轮播图或 SKU 图的结果。',
+        body: splitModules.length > 0 ? (
+          <div className="visual-workflow-split-grid">
+            {splitModules.map((module, index) => (
+              <div className="visual-workflow-split-item" key={module.id}>
+                <span>{index + 1}</span>
+                {module.outputUrl ? (
+                  <Image
+                    alt={module.title}
+                    height={72}
+                    preview={false}
+                    referrerPolicy="no-referrer"
+                    src={module.outputUrl}
+                    width={72}
+                  />
+                ) : (
+                  <PictureOutlined />
+                )}
+                <Text ellipsis>{module.title}</Text>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="visual-workflow-placeholder">切割完成后展示结果。</div>
+        ),
+      },
+    ];
+
+    const firstActiveStageIndex = workflowStates.findIndex((state) => state === 'active' || state === 'error');
+    const fallbackStageIndex = firstActiveStageIndex >= 0 ? firstActiveStageIndex : Math.max(0, workflowStates.lastIndexOf('done'));
+    const selectedStageIndex = Math.min(
+      stages.length - 1,
+      Math.max(0, visualWorkflowStageByItemId[item.id] ?? fallbackStageIndex),
+    );
+    const selectedStage = stages[selectedStageIndex] || stages[0];
+    const selectedState = workflowStates[selectedStageIndex] || 'waiting';
+    const getStageStatusText = (state: string) => {
+      if (state === 'done') return '完成';
+      if (state === 'active') return '进行中';
+      if (state === 'error') return '失败';
+      return '等待';
+    };
+
+    return (
+      <div className="visual-workflow visual-workflow-line">
+        <div className="visual-workflow-track" role="tablist" aria-label="生图任务阶段">
+          {stages.map((stage, index) => {
+            const state = workflowStates[index] || 'waiting';
+            const selected = index === selectedStageIndex;
+            return (
+              <button
+                aria-selected={selected}
+                className={`visual-workflow-track-step visual-workflow-track-step-${state} ${
+                  selected ? 'visual-workflow-track-step-selected' : ''
+                }`}
+                key={stage.title}
+                role="tab"
+                type="button"
+                onClick={() =>
+                  setVisualWorkflowStageByItemId((current) => ({
+                    ...current,
+                    [item.id]: index,
+                  }))
+                }
+              >
+                <span className="visual-workflow-track-dot">
+                  {state === 'done' ? <CheckCircleOutlined /> : state === 'error' ? <WarningOutlined /> : index + 1}
+                </span>
+                <span className="visual-workflow-track-copy">
+                  <strong>{stage.title}</strong>
+                  <small>{getStageStatusText(state)}</small>
+                </span>
+              </button>
+            );
+          })}
+        </div>
+        <div className={`visual-workflow-detail visual-workflow-detail-${selectedState}`}>
+          <div className="visual-workflow-title-row">
+            <div>
+              <Text strong>{selectedStage.title}</Text>
+              <Text type="secondary">{selectedStage.description}</Text>
+            </div>
+            <Tag color={selectedState === 'done' ? 'green' : selectedState === 'active' ? 'blue' : selectedState === 'error' ? 'red' : 'default'}>
+              {getStageStatusText(selectedState)}
+            </Tag>
+          </div>
+          <div className="visual-workflow-body">{selectedStage.body}</div>
+        </div>
+      </div>
+    );
+
+    return (
+      <div className="visual-workflow visual-workflow-compact">
+        {stages.map((stage, index) => {
+          const state = workflowStates[index] || 'waiting';
+          return (
+            <div className={`visual-workflow-step visual-workflow-step-${state}`} key={stage.title}>
+              <div className="visual-workflow-marker">
+                {state === 'done' ? <CheckCircleOutlined /> : state === 'error' ? <WarningOutlined /> : index + 1}
+              </div>
+              <div className="visual-workflow-content">
+                <div className="visual-workflow-title-row">
+                  <div>
+                    <Text strong>{stage.title}</Text>
+                    <Text type="secondary">{stage.description}</Text>
+                  </div>
+                  <Tag color={state === 'done' ? 'green' : state === 'active' ? 'blue' : state === 'error' ? 'red' : 'default'}>
+                    {state === 'done' ? '完成' : state === 'active' ? '进行中' : state === 'error' ? '失败' : '等待'}
+                  </Tag>
+                </div>
+                <div className="visual-workflow-body">{stage.body}</div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
   };
 
   return (
@@ -1490,26 +2311,6 @@ function LinkListPanel({
                       </a>
                     ))}
                   </div>
-                </div>
-
-                <div className="link-record-sku-preview" aria-label="SKU 顺序预览">
-                  {record.skuEntries.slice(0, 4).map((entry) => (
-                    <span className="link-sku-mini" key={entry.id} title={entry.name}>
-                      <span className="link-sku-mini-order">{entry.order}</span>
-                      {getSkuDisplayImageUrl(entry) ? (
-                        <Image
-                          alt={entry.name}
-                          height={30}
-                          preview={false}
-                          referrerPolicy="no-referrer"
-                          src={getSkuDisplayImageUrl(entry)}
-                          width={30}
-                        />
-                      ) : (
-                        <span>SKU</span>
-                      )}
-                    </span>
-                  ))}
                 </div>
 
                 <div className="link-record-actions">
@@ -1627,10 +2428,7 @@ function LinkListPanel({
                         disabled={!previewActiveSlot || previewImageAssetOptions.length === 0}
                         icon={<SwapOutlined />}
                         size="small"
-                        onClick={() => {
-                          setImageSlotPickerContext('preview');
-                          setImageSlotPickerOpen(true);
-                        }}
+                        onClick={() => setImageSlotPickerOpen(true)}
                       >
                         替换当前图
                       </Button>
@@ -1771,17 +2569,32 @@ function LinkListPanel({
         className="visual-queue-modal"
         footer={
           <Space>
-            <Button disabled={visualQueueItems.length === 0} onClick={() => setVisualQueueItems([])}>
+            <Button
+              disabled={visualQueueExecuting || visualQueueItems.length === 0}
+              onClick={() => {
+                setVisualQueueItems([]);
+                setExpandedVisualQueueItemIds([]);
+                setVisualWorkflowStageByItemId({});
+              }}
+            >
               清空队列
             </Button>
-            <Button type="primary" onClick={() => setVisualQueueOpen(false)}>
+            <Button
+              disabled={visualQueueItems.length === 0}
+              loading={visualQueueExecuting}
+              type="primary"
+              onClick={() => void executeVisualQueue()}
+            >
+              开始执行
+            </Button>
+            <Button onClick={() => setVisualQueueOpen(false)}>
               知道了
             </Button>
           </Space>
         }
         open={visualQueueOpen}
         title="统一任务队列"
-        width={920}
+        width={1120}
         onCancel={() => setVisualQueueOpen(false)}
       >
         <div className="visual-queue-shell">
@@ -1796,233 +2609,100 @@ function LinkListPanel({
             </div>
             <div>
               <span>执行状态</span>
-              <strong>前端待接入</strong>
+              <strong>
+                {visualQueueExecuting
+                  ? '执行中'
+                  : visualQueueItems.some((item) => item.statusColor === 'red')
+                    ? '有失败'
+                    : visualQueueItems.some((item) => item.completedCount > 0)
+                      ? '已接入'
+                      : '待执行'}
+              </strong>
             </div>
           </div>
           {visualQueueItems.length > 0 ? (
-            <div className="visual-queue-list">
-              {visualQueueItems.map((item) => (
-                <div className="visual-queue-card" key={item.id}>
-                  <div className="visual-queue-card-head">
-                    <div>
-                      <Space size={6} wrap>
-                        <Tag color={item.statusColor}>{item.statusLabel}</Tag>
-                        <Tag color="purple">{item.modeLabel}</Tag>
-                        <Tag>{item.typeLabel}</Tag>
-                        <Tag color="blue">{item.generationMode}</Tag>
-                        <Tag color={item.styleLockStatus === 'ready' ? 'green' : 'gold'}>{item.styleLockLabel}</Tag>
-                      </Space>
-                      <Typography.Title level={5}>{item.taskName}</Typography.Title>
-                      <Text type="secondary" ellipsis>
-                        {item.productTitle}
-                      </Text>
-                    </div>
-                    <div className="visual-queue-card-side">
-                      <span>{formatRecordTime(item.createdAt)}</span>
-                      <Button danger size="small" type="text" onClick={() => removeVisualQueueItem(item.id)}>
+            <div className="visual-queue-accordion">
+              {visualQueueItems.map((item) => {
+                const active = activeVisualQueueItem?.id === item.id;
+                const progress = getVisualQueueProgress(item);
+                return (
+                  <details
+                    className={`visual-queue-panel ${active ? 'visual-queue-panel-active' : ''}`}
+                    key={item.id}
+                    open={expandedVisualQueueItemIds.includes(item.id)}
+                    onToggle={(event) => {
+                      if (event.currentTarget.open) {
+                        setActiveVisualQueueItemId(item.id);
+                        setExpandedVisualQueueItemIds((current) => [item.id, ...current.filter((id) => id !== item.id)]);
+                      } else {
+                        setExpandedVisualQueueItemIds((current) => current.filter((id) => id !== item.id));
+                      }
+                    }}
+                  >
+                    <summary className="visual-queue-panel-summary">
+                      <span className="visual-queue-reference-thumb">
+                        {item.referenceImageUrl ? (
+                          <Image
+                            alt={item.productTitle}
+                            height={46}
+                            preview={false}
+                            referrerPolicy="no-referrer"
+                            src={item.referenceImageUrl}
+                            width={46}
+                          />
+                        ) : (
+                          <PictureOutlined />
+                        )}
+                      </span>
+                      <span className="visual-queue-panel-main">
+                        <span className="visual-queue-panel-title">
+                          <strong>{item.modeLabel}</strong>
+                          <Text ellipsis>{item.productTitle}</Text>
+                        </span>
+                        <span className="visual-queue-panel-meta">
+                          <Tag color={item.statusColor}>{item.statusLabel}</Tag>
+                          <Tag color="purple">{item.generationMode}</Tag>
+                          <Tag color={item.styleLockStatus === 'ready' ? 'green' : 'gold'}>{item.styleLockLabel}</Tag>
+                          <span>{item.requestedCount} 张</span>
+                          <span>{getVisualQueueLayoutLabel(item.requestedCount)}</span>
+                          <span>{item.backendTaskId || item.backendStatus || '待创建'}</span>
+                        </span>
+                      </span>
+                      <span className="visual-queue-panel-progress">
+                        <Progress percent={progress} showInfo={false} size="small" status={item.statusColor === 'red' ? 'exception' : 'active'} />
+                        <strong>{progress}%</strong>
+                      </span>
+                      <Button
+                        danger
+                        size="small"
+                        type="text"
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          removeVisualQueueItem(item.id);
+                        }}
+                      >
                         移除
                       </Button>
-                    </div>
-                  </div>
-                  <div className="visual-queue-meta">
-                    <div>
-                      <span>组批策略</span>
-                      <strong>{item.mixPolicy}</strong>
-                    </div>
-                    <div>
-                      <span>模块完成</span>
-                      <strong>
-                        {item.completedCount}/{item.moduleCount}
-                      </strong>
-                    </div>
-                    <div>
-                      <span>请求数量</span>
-                      <strong>{item.requestedCount}</strong>
-                    </div>
-                    <div>
-                      <span>画风 ID</span>
-                      <strong>{item.styleProfileId}</strong>
-                    </div>
-                    <div>
-                      <span>后端执行</span>
-                      <strong>待实现</strong>
-                    </div>
-                  </div>
-                  <div className="visual-queue-module-strip">
-                    {item.modules.map((module) => (
-                      <div className="visual-queue-module" key={module.id}>
-                        <div className="visual-queue-module-thumb">
-                          {module.imageUrl ? (
-                            <Image
-                              alt={module.title}
-                              height={42}
-                              preview={false}
-                              referrerPolicy="no-referrer"
-                              src={module.imageUrl}
-                              width={42}
-                            />
-                          ) : (
-                            <PictureOutlined />
-                          )}
-                        </div>
-                        <div>
-                          <Text strong ellipsis>
-                            {module.title}
-                          </Text>
-                          <Text type="secondary" ellipsis>
-                            {module.targetLabel}
-                          </Text>
-                        </div>
-                        <Tag color={module.statusColor}>{module.statusLabel}</Tag>
+                    </summary>
+                    <div className="visual-queue-panel-body">
+                      <div className="visual-queue-panel-facts">
+                        <div><span>任务包</span><strong>{item.taskName}</strong></div>
+                        <div><span>模块完成</span><strong>{item.completedCount}/{item.moduleCount}</strong></div>
+                        <div><span>请求数量</span><strong>{item.requestedCount}</strong></div>
+                        <div><span>组批策略</span><strong>{item.mixPolicy}</strong></div>
                       </div>
-                    ))}
-                  </div>
-                </div>
-              ))}
+                      {item.errorMessage ? <div className="visual-queue-panel-error">{item.errorMessage}</div> : null}
+                      {renderVisualQueueWorkflow(item)}
+                    </div>
+                  </details>
+                );
+              })}
             </div>
           ) : (
             <Empty description="暂无任务。请在某个商品链接的图片管理中发布任务包。" />
           )}
         </div>
-      </Modal>
-      <Modal
-        className="visual-publish-modal"
-        footer={
-          <Space>
-            <Button onClick={() => setVisualPublishModalOpen(false)}>取消</Button>
-            <Button type="primary" onClick={publishVisualTaskToQueue}>
-              发布到任务队列
-            </Button>
-          </Space>
-        }
-        open={visualPublishModalOpen}
-        title="发布图片任务"
-        width={780}
-        onCancel={() => setVisualPublishModalOpen(false)}
-      >
-        {visualPublishRecord && visualPublishTask ? (
-          <div className="visual-publish-shell">
-            <div className="visual-publish-product">
-              <div className="visual-publish-thumb">
-                {getRecordMainImageUrl(visualPublishRecord) ? (
-                  <Image
-                    alt={visualPublishRecord.productTitle}
-                    height={64}
-                    preview={false}
-                    referrerPolicy="no-referrer"
-                    src={getRecordMainImageUrl(visualPublishRecord)}
-                    width={64}
-                  />
-                ) : (
-                  <PictureOutlined />
-                )}
-              </div>
-              <div>
-                <Typography.Title level={5}>{visualPublishRecord.productTitle}</Typography.Title>
-                <Space size={6} wrap>
-                  <Tag>{visualPublishTask.name}</Tag>
-                  <Tag color={visualPublishRecord.styleProfile ? 'green' : 'gold'}>
-                    {getVisualStyleLockLabel(visualPublishRecord)}
-                  </Tag>
-                  <Tag>{getVisualStyleProfileId(visualPublishRecord)}</Tag>
-                </Space>
-              </div>
-            </div>
-
-            <div className="visual-publish-section">
-              <Text strong>生成模式</Text>
-              <div className="visual-publish-mode-grid">
-                {(['main_multi', 'sku_adapt', 'single_refine'] as VisualPublishMode[]).map((mode) => (
-                  <button
-                    className={visualPublishMode === mode ? 'is-active' : ''}
-                    key={mode}
-                    type="button"
-                    onClick={() => changeVisualPublishMode(mode)}
-                  >
-                    <strong>{getVisualPublishModeLabel(mode)}</strong>
-                    <span>{getVisualPublishModeHint(mode)}</span>
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div className="visual-publish-form-grid">
-              <label>
-                <span>参考图</span>
-                <Select
-                  showSearch
-                  value={visualPublishReferenceUrl}
-                  optionFilterProp="label"
-                  options={visualPublishAssetOptions.map((option, index) => ({
-                    label: `${index + 1}. ${option.asset.alt || option.asset.role}`,
-                    value: option.imageUrl,
-                  }))}
-                  placeholder="选择一张参考图"
-                  onChange={setVisualPublishReferenceUrl}
-                />
-              </label>
-              <label>
-                <span>生成数量</span>
-                <Input
-                  disabled={visualPublishMode === 'single_refine'}
-                  max={30}
-                  min={1}
-                  type="number"
-                  value={visualPublishMode === 'single_refine' ? 1 : visualPublishCount}
-                  onChange={(event) => {
-                    const nextValue = Math.max(1, Math.min(30, Number(event.target.value) || 1));
-                    setVisualPublishCount(nextValue);
-                  }}
-                />
-              </label>
-            </div>
-
-            <div className="visual-publish-reference">
-              <div className="visual-publish-reference-preview">
-                {visualPublishReferenceUrl ? (
-                  <Image
-                    alt="参考图"
-                    height={96}
-                    preview
-                    referrerPolicy="no-referrer"
-                    src={visualPublishReferenceUrl}
-                    width={96}
-                  />
-                ) : (
-                  <PictureOutlined />
-                )}
-              </div>
-              <div>
-                <Text strong>将写入队列的任务信息</Text>
-                <div className="visual-publish-facts">
-                  <div>
-                    <span>模式</span>
-                    <strong>{getVisualPublishModeLabel(visualPublishMode)}</strong>
-                  </div>
-                  <div>
-                    <span>预计模块</span>
-                    <strong>{visualPublishMode === 'single_refine' ? 1 : visualPublishCount}</strong>
-                  </div>
-                  <div>
-                    <span>画风锁</span>
-                    <strong>{visualPublishRecord.styleProfile ? 'ready' : 'pending'}</strong>
-                  </div>
-                  <div>
-                    <span>组批策略</span>
-                    <strong>
-                      {getQueueMixPolicyLabel(
-                        visualPublishMode,
-                        visualPublishMode === 'single_refine' ? 1 : visualPublishCount,
-                      )}
-                    </strong>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        ) : (
-          <Empty description="请先在图片管理中选择一个任务包。" />
-        )}
       </Modal>
       <Drawer
         className="image-manager-drawer"
@@ -2030,7 +2710,10 @@ function LinkListPanel({
         open={Boolean(imageManagerRecord)}
         title="图片管理"
         width={1280}
-        onClose={() => setImageManagerRecord(undefined)}
+        onClose={() => {
+          setImageEditorOpen(false);
+          setImageManagerRecord(undefined);
+        }}
       >
         {imageManagerRecord ? (
           <div className="image-manager-shell">
@@ -2051,6 +2734,14 @@ function LinkListPanel({
               </div>
               <div className="image-manager-title">
                 <Typography.Title level={4}>{imageManagerRecord.productTitle}</Typography.Title>
+                <Space size={8} wrap>
+                  <Button icon={<PictureOutlined />} type="primary" onClick={() => setImageEditorOpen(true)}>
+                    编辑图片
+                  </Button>
+                  <Button icon={<ClockCircleOutlined />} onClick={() => setVisualQueueOpen(true)}>
+                    任务队列{visualQueueItems.length > 0 ? ` ${visualQueueItems.length}` : ''}
+                  </Button>
+                </Space>
                 <Space size={6} wrap>
                   <Tag color="blue">{imageManagerRecord.skuEntries.length} SKU</Tag>
                   <Tag>{imageManagerRecord.sourceLinks.length} 货源</Tag>
@@ -2062,24 +2753,6 @@ function LinkListPanel({
                   {imageManagerProgress?.failed ? <Tag color="red">失败 {imageManagerProgress.failed}</Tag> : null}
                 </Space>
               </div>
-              <Space className="image-manager-head-actions">
-                <Button
-                  icon={<EyeOutlined />}
-                  onClick={() => {
-                    setPreviewRecord(imageManagerRecord);
-                    if (managerActiveSlot) setPreviewActiveImageSlotId(managerActiveSlot.id);
-                  }}
-                >
-                  Temu 预览
-                </Button>
-                <Button
-                  icon={<SyncOutlined />}
-                  loading={syncingRecordId === imageManagerRecord.id}
-                  onClick={() => void syncRecordCreative(imageManagerRecord)}
-                >
-                  同步结果
-                </Button>
-              </Space>
             </div>
 
             <div className="image-manager-temu-preview">
@@ -2129,7 +2802,7 @@ function LinkListPanel({
                       <Image
                         alt={imageManagerRecord.productTitle}
                         height="100%"
-                        preview
+                        preview={false}
                         referrerPolicy="no-referrer"
                         src={imageManagerDisplayedImageUrl}
                         width="100%"
@@ -2137,69 +2810,6 @@ function LinkListPanel({
                     ) : (
                       <span>商品主图</span>
                     )}
-                  </div>
-                  <div className="image-manager-temu-actions">
-                    <div>
-                      <Text type="secondary">当前槽位</Text>
-                      <Text strong>{getImageSlotLabel(imageManagerPreviewActiveSlot || managerActiveSlot)}</Text>
-                      <Tag color="blue">已选 {imageManagerSelectedSlotIds.length}</Tag>
-                    </div>
-                    <Space size={8} wrap>
-                      <Button
-                        size="small"
-                        onClick={() => setImageManagerSelectedSlotIds(imageManagerPreviewGalleryItems.map((item) => item.slot.id))}
-                      >
-                        全选图片
-                      </Button>
-                      <Button size="small" onClick={() => setImageManagerSelectedSlotIds([])}>
-                        清空
-                      </Button>
-                      <Button
-                        icon={<SwapOutlined />}
-                        size="small"
-                        disabled={!imageManagerPreviewActiveSlot && !managerActiveSlot}
-                        onClick={() => {
-                          setImageSlotPickerContext('manager');
-                          setImageSlotPickerOpen(true);
-                        }}
-                      >
-                        替换当前图
-                      </Button>
-                      <Button
-                        icon={<ReloadOutlined />}
-                        size="small"
-                        disabled={!imageManagerProductTask || !imageManagerDisplayedImageUrl}
-                        onClick={() => {
-                          if (!imageManagerProductTask || !(imageManagerPreviewActiveSlot || managerActiveSlot)) return;
-                          enqueueVisualTask(imageManagerRecord, imageManagerProductTask, {
-                            mode: 'single_refine',
-                            count: 1,
-                            referenceImageUrl: imageManagerDisplayedImageUrl,
-                            selectedSlotIds: [(imageManagerPreviewActiveSlot || managerActiveSlot)!.id],
-                          });
-                        }}
-                      >
-                        当前图精修
-                      </Button>
-                      <Button
-                        type="primary"
-                        disabled={!imageManagerProductTask}
-                        onClick={() => {
-                          if (!imageManagerProductTask) return;
-                          enqueueVisualTask(imageManagerRecord, imageManagerProductTask, {
-                            mode: 'main_multi',
-                            count: getRecordProductImageGenerationCount(imageManagerRecord),
-                            referenceImageUrl: imageManagerDisplayedImageUrl,
-                          });
-                        }}
-                      >
-                        主图全量生成
-                      </Button>
-                      <Button icon={<ClockCircleOutlined />} onClick={() => setVisualQueueOpen(true)}>
-                        任务队列
-                        {visualQueueItems.length > 0 ? ` ${visualQueueItems.length}` : ''}
-                      </Button>
-                    </Space>
                   </div>
                 </div>
               </div>
@@ -2291,54 +2901,6 @@ function LinkListPanel({
                       );
                     })}
                   </div>
-                  <Space size={8} wrap>
-                    <Button
-                      size="small"
-                      onClick={() => setImageManagerSelectedSkuIds(imageManagerRecord.skuEntries.map((entry) => entry.id))}
-                    >
-                      全选 SKU
-                    </Button>
-                    <Button size="small" onClick={() => setImageManagerSelectedSkuIds([])}>
-                      清空 SKU
-                    </Button>
-                    <Button
-                      size="small"
-                      type="primary"
-                      disabled={!imageManagerSkuTask || imageManagerRecord.skuEntries.length === 0}
-                      onClick={() => {
-                        if (!imageManagerSkuTask) return;
-                        const selectedSkuIds =
-                          imageManagerSelectedSkuIds.length > 0
-                            ? imageManagerSelectedSkuIds
-                            : imageManagerActiveSkuEntry
-                              ? [imageManagerActiveSkuEntry.id]
-                              : imageManagerRecord.skuEntries.map((entry) => entry.id);
-                        enqueueVisualTask(imageManagerRecord, imageManagerSkuTask, {
-                          mode: 'sku_adapt',
-                          count: selectedSkuIds.length,
-                          referenceImageUrl: imageManagerDisplayedImageUrl,
-                          selectedSkuIds,
-                        });
-                      }}
-                    >
-                      SKU 精修入队
-                    </Button>
-                    <Button
-                      size="small"
-                      disabled={!imageManagerProductTask || imageManagerSelectedSlotIds.length === 0}
-                      onClick={() => {
-                        if (!imageManagerProductTask) return;
-                        enqueueVisualTask(imageManagerRecord, imageManagerProductTask, {
-                          mode: 'single_refine',
-                          count: imageManagerSelectedSlotIds.length,
-                          referenceImageUrl: imageManagerDisplayedImageUrl,
-                          selectedSlotIds: imageManagerSelectedSlotIds,
-                        });
-                      }}
-                    >
-                      批量精修入队
-                    </Button>
-                  </Space>
                 </div>
 
                 <div className="temu-preview-section">
@@ -2380,570 +2942,285 @@ function LinkListPanel({
                     ))}
                   </div>
                 </div>
-
-                <section className="image-manager-temu-library">
-                  <div className="image-manager-library-head">
-                    <div>
-                      <Text strong>统一图库</Text>
-                      <Text type="secondary">点击图片可替换当前预览槽位。</Text>
-                    </div>
-                    <Tag>{imageManagerGalleryOptions.length} 张</Tag>
-                  </div>
-                  {imageManagerGalleryOptions.length > 0 ? (
-                    <div className="image-manager-temu-library-grid">
-                      {imageManagerGalleryOptions.map((option, index) => {
-                        const canUseForProduct = option.asset.role === 'product-main' || option.asset.role === 'product-material';
-                        return (
-                          <button
-                            className="image-manager-temu-library-card"
-                            disabled={!canUseForProduct || !(imageManagerPreviewActiveSlot || managerActiveSlot)}
-                            key={option.asset.id}
-                            type="button"
-                            onClick={() => {
-                              const targetSlot = imageManagerPreviewActiveSlot || managerActiveSlot;
-                              if (!targetSlot || !canUseForProduct) return;
-                              replaceImageSlot(imageManagerRecord, targetSlot, option.asset.id);
-                            }}
-                          >
-                            <Image
-                              alt={option.asset.alt || `图库图片 ${index + 1}`}
-                              height={54}
-                              preview={false}
-                              referrerPolicy="no-referrer"
-                              src={option.imageUrl}
-                              width={54}
-                            />
-                            <span>
-                              <strong>{option.asset.alt || `图片 ${index + 1}`}</strong>
-                              <Text type="secondary">
-                                {option.asset.role === 'sales-sku' ? 'SKU 图' : getImageAssetSourceMeta(option.asset).label}
-                              </Text>
-                            </span>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  ) : (
-                    <Empty description="暂无图库图片" />
-                  )}
-                </section>
               </div>
             </div>
+          </div>
+        ) : null}
+      </Drawer>
+      <Modal
+        className="image-editor-modal"
+        destroyOnClose={false}
+        footer={null}
+        open={Boolean(imageManagerRecord) && imageEditorOpen}
+        title="编辑商品图片"
+        width={1240}
+        onCancel={() => setImageEditorOpen(false)}
+      >
+        {imageManagerRecord ? (
+          <div className="image-editor-shell">
+            <section className="image-editor-toolbar">
+              <div>
+                <Text strong>图片生成</Text>
+                <Text type="secondary">
+                  先选择要作为图片参数的 SKU，再选择生成模式。组合出售时勾选组合内的商品 SKU。
+                </Text>
+              </div>
+              <Space size={8} wrap>
+                <Button
+                  size="small"
+                  onClick={() => setImageManagerSelectedSkuIds(imageManagerRecord.skuEntries.map((entry) => entry.id))}
+                >
+                  全选 SKU
+                </Button>
+                <Button size="small" onClick={() => setImageManagerSelectedSkuIds([])}>
+                  清空 SKU
+                </Button>
+                <Button
+                  type="primary"
+                  disabled={!imageManagerProductTask || imageManagerSelectedSkuIds.length === 0}
+                  onClick={enqueueMainGalleryFromSelectedSkus}
+                >
+                  主图全量生成
+                </Button>
+                <Button
+                  disabled={!imageManagerSkuTask || imageManagerRecord.skuEntries.length === 0}
+                  onClick={enqueueSkuAdaptFromSelectedSkus}
+                >
+                  SKU 适配
+                </Button>
+                <Button
+                  disabled={!imageManagerProductTask || !managerActiveSlotItem?.imageUrl}
+                  onClick={() => {
+                    if (!imageManagerProductTask || !managerActiveSlot) return;
+                    enqueueVisualTask(imageManagerRecord, imageManagerProductTask, {
+                      mode: 'single_refine',
+                      count: 1,
+                      referenceImageUrl: managerActiveSlotItem?.imageUrl || getRecordMainImageUrl(imageManagerRecord),
+                      referenceImageLabels: [`当前槽位：${getImageSlotLabel(managerActiveSlot)}`],
+                      selectedSlotIds: [managerActiveSlot.id],
+                    });
+                  }}
+                >
+                  当前图精修
+                </Button>
+                <Button icon={<ClockCircleOutlined />} onClick={() => setVisualQueueOpen(true)}>
+                  任务队列{visualQueueItems.length > 0 ? ` ${visualQueueItems.length}` : ''}
+                </Button>
+              </Space>
+            </section>
 
-            <div className="image-manager-flow">
-              <section className={`image-manager-style-strip image-manager-style-${imageManagerStyleLock?.status || 'missing'}`}>
-                <div>
-                  <Space size={6} wrap>
-                    <Tag
-                      color={imageManagerStyleLock?.color || 'default'}
-                      icon={imageManagerStyleLock?.status === 'locked' ? <CheckCircleOutlined /> : <ClockCircleOutlined />}
-                    >
-                      风格锁：{imageManagerStyleLock?.label || '待生成'}
-                    </Tag>
-                    <Tag>{imageManagerStyleLock?.providerLabel || '待配置'}</Tag>
-                    <Tag>{imageManagerStyleLock?.referenceLabel || '当前主图'}</Tag>
-                  </Space>
-                  <Typography.Title level={5}>{imageManagerStyleLock?.title || '先分析商品统一风格'}</Typography.Title>
-                  <Text type="secondary">
-                    发布任何生图任务前，后续后端会先为当前链接建立统一画风，再按主图多生、SKU 适配或单图精修执行。
-                  </Text>
-                </div>
-                <Button disabled>分析统一风格</Button>
-              </section>
-
-              <section className="image-manager-preview-strip" aria-label="商品详情预览图">
-                {imageManagerSlotItems.map((item) => (
-                  <button
-                    className={[
-                      managerActiveSlotItem?.slot.id === item.slot.id ? 'is-active' : '',
-                      imageManagerSelectedSlotIds.includes(item.slot.id) ? 'is-selected' : '',
-                    ]
-                      .filter(Boolean)
-                      .join(' ')}
-                    key={item.slot.id}
-                    type="button"
-                    onClick={() => {
-                      setManagerActiveSlotId(item.slot.id);
-                      setImageManagerSelectedSlotIds((current) =>
-                        current.includes(item.slot.id)
-                          ? current.filter((slotId) => slotId !== item.slot.id)
-                          : [...current, item.slot.id],
-                      );
-                    }}
-                  >
-                    <span>{item.order}</span>
-                    {imageManagerSelectedSlotIds.includes(item.slot.id) ? <i>✓</i> : null}
-                    {item.imageUrl ? (
-                      <Image
-                        alt={item.imageLabel}
-                        height={48}
-                        preview={false}
-                        referrerPolicy="no-referrer"
-                        src={item.imageUrl}
-                        width={48}
-                      />
-                    ) : (
-                      <PictureOutlined />
-                    )}
-                  </button>
-                ))}
-              </section>
-
-              <section className="image-manager-mode-panel">
-                <div className="image-manager-mode-head">
+            <div className="image-editor-grid">
+              <aside className="image-editor-library">
+                <div className="image-editor-panel-head">
                   <div>
-                    <Text strong>生成模式</Text>
-                    <Text type="secondary">
-                      已选商品图 {imageManagerSelectedSlotItems.length} 张。点击上方预览图可以单选或多选。
-                    </Text>
+                    <Text strong>统一图库</Text>
+                    <Text type="secondary">批量选择图片后，加入主图或 SKU 图。</Text>
                   </div>
-                  <Space size={6} wrap>
-                    <Button size="small" onClick={() => setImageManagerSelectedSlotIds(imageManagerSlotItems.map((item) => item.slot.id))}>
-                      全选商品图
+                  <Space className="image-editor-library-actions" size={6} wrap>
+                    <Tag className="image-editor-action-count">{imageManagerSelectedAssetIds.length}/{imageManagerGalleryOptions.length} 张</Tag>
+                    <Button size="small" disabled={imageManagerSelectedAssetIds.length === 0} onClick={addSelectedAssetsToProductImages}>
+                      加入主图
                     </Button>
-                    <Button size="small" onClick={() => setImageManagerSelectedSlotIds([])}>
+                    <Button size="small" disabled={imageManagerSelectedAssetIds.length === 0} onClick={addSelectedAssetsToSkuImages}>
+                      加入 SKU 图
+                    </Button>
+                    <Button size="small" disabled={imageManagerSelectedAssetIds.length === 0} onClick={() => setImageManagerSelectedAssetIds([])}>
                       清空
                     </Button>
-                    <Tag color="blue">前端队列</Tag>
                   </Space>
                 </div>
-                <div className="image-manager-mode-actions">
-                  <Button
-                    disabled={!imageManagerProductTask}
-                    type="primary"
-                    onClick={() => {
-                      if (!imageManagerProductTask) return;
-                      enqueueVisualTask(imageManagerRecord, imageManagerProductTask, {
-                        mode: 'main_multi',
-                        count: getRecordProductImageGenerationCount(imageManagerRecord),
-                        referenceImageUrl: managerActiveSlotItem?.imageUrl || getRecordMainImageUrl(imageManagerRecord),
-                      });
-                    }}
-                  >
-                    主图全量生成
-                  </Button>
-                  <Button
-                    disabled={!imageManagerProductTask || !managerActiveSlotItem?.imageUrl}
-                    onClick={() => {
-                      if (!imageManagerProductTask || !managerActiveSlot) return;
-                      enqueueVisualTask(imageManagerRecord, imageManagerProductTask, {
-                        mode: 'single_refine',
-                        count: 1,
-                        referenceImageUrl: managerActiveSlotItem?.imageUrl || getRecordMainImageUrl(imageManagerRecord),
-                        selectedSlotIds: [managerActiveSlot.id],
-                      });
-                    }}
-                  >
-                    当前图精修
-                  </Button>
-                  <Button
-                    disabled={!imageManagerProductTask || imageManagerSelectedSlotIds.length === 0}
-                    onClick={() => {
-                      if (!imageManagerProductTask) return;
-                      enqueueVisualTask(imageManagerRecord, imageManagerProductTask, {
-                        mode: 'single_refine',
-                        count: imageManagerSelectedSlotIds.length,
-                        referenceImageUrl: managerActiveSlotItem?.imageUrl || getRecordMainImageUrl(imageManagerRecord),
-                        selectedSlotIds: imageManagerSelectedSlotIds,
-                      });
-                    }}
-                  >
-                    批量精修入队
-                  </Button>
-                  <Button
-                    disabled={!imageManagerSkuTask || imageManagerRecord.skuEntries.length === 0}
-                    onClick={() => {
-                      if (!imageManagerSkuTask) return;
-                      const selectedSkuIds =
-                        imageManagerSelectedSkuIds.length > 0
-                          ? imageManagerSelectedSkuIds
-                          : imageManagerRecord.skuEntries.map((entry) => entry.id);
-                      enqueueVisualTask(imageManagerRecord, imageManagerSkuTask, {
-                        mode: 'sku_adapt',
-                        count: selectedSkuIds.length,
-                        referenceImageUrl: managerActiveSlotItem?.imageUrl || getRecordMainImageUrl(imageManagerRecord),
-                        selectedSkuIds,
-                      });
-                    }}
-                  >
-                    SKU 精修入队
-                  </Button>
-                </div>
-
-                <div className="image-manager-sku-picker">
-                  <div>
-                    <Text strong>SKU 精修范围</Text>
-                    <Text type="secondary">不选择时默认处理全部 SKU。</Text>
-                  </div>
-                  <div className="image-manager-sku-chip-grid">
-                    {imageManagerRecord.skuEntries.map((entry) => {
-                      const active = imageManagerSelectedSkuIds.includes(entry.id);
+                {imageManagerGalleryOptions.length > 0 ? (
+                  <div className="image-editor-library-grid">
+                    {imageManagerGalleryOptions.map((option, index) => {
+                      const selected = imageManagerSelectedAssetIds.includes(option.asset.id);
+                      const sourceMeta = getImageAssetSourceMeta(option.asset);
+                      const sourceTone =
+                        option.asset.role === 'sales-sku'
+                          ? 'sku'
+                          : sourceMeta.label.includes('AI') || sourceMeta.label.includes('结果')
+                            ? 'generated'
+                            : 'collected';
+                      const sourceLabel = sourceTone === 'generated' ? '生成' : sourceTone === 'sku' ? 'SKU' : '采集';
+                      const assetTitle = option.asset.alt || `图片 ${index + 1}`;
                       return (
                         <button
-                          className={active ? 'is-active' : ''}
-                          key={entry.id}
+                          className={`image-editor-library-card ${selected ? 'is-selected' : ''}`}
+                          key={option.asset.id}
                           type="button"
-                          onClick={() => {
-                            setImageManagerSelectedSkuIds((current) =>
-                              current.includes(entry.id) ? current.filter((id) => id !== entry.id) : [...current, entry.id],
-                            );
-                          }}
+                          onClick={() => toggleImageManagerAsset(option.asset.id)}
                         >
-                          {getSkuDisplayImageUrl(entry) ? (
-                            <Image
-                              alt={entry.name}
-                              height={28}
-                              preview={false}
-                              referrerPolicy="no-referrer"
-                              src={getSkuDisplayImageUrl(entry)}
-                              width={28}
-                            />
-                          ) : null}
-                          <span>{entry.name}</span>
+                          {selected ? <span className="image-editor-library-check">✓</span> : null}
+                          <Image
+                            alt={assetTitle}
+                            height={78}
+                            preview={false}
+                            referrerPolicy="no-referrer"
+                            src={option.imageUrl}
+                            width={112}
+                          />
+                          <span className="image-editor-library-info">
+                            <strong title={assetTitle}>{assetTitle}</strong>
+                            <span className={`image-editor-source-badge image-editor-source-${sourceTone}`}>{sourceLabel}</span>
+                          </span>
                         </button>
                       );
                     })}
                   </div>
-                </div>
-              </section>
-            </div>
+                ) : (
+                  <Empty description="暂无图库图片" />
+                )}
+              </aside>
 
-            <Tabs
-              activeKey={imageManagerActiveTab}
-              className="image-manager-tabs"
-              onChange={setImageManagerActiveTab}
-              items={[
-                {
-                  key: 'product',
-                  label: (
-                    <span>
-                      <PictureOutlined /> 商品图
-                    </span>
-                  ),
-                  children: (
-                    <div className="image-manager-product-layout">
-                      <div className="image-manager-slot-grid">
-                        {imageManagerSlotItems.map((item) => {
-                          const active = managerActiveSlotItem?.slot.id === item.slot.id;
-                          const statusMeta = getImageTaskStatusMeta(item.job?.status, Boolean(item.imageUrl));
-                          const sourceMeta = getImageAssetSourceMeta(item.asset, item.job);
-                          return (
-                            <div
-                              className={`image-manager-slot-card ${active ? 'image-manager-slot-card-active' : ''}`}
-                              key={item.slot.id}
-                              role="button"
-                              tabIndex={0}
-                              onClick={() => setManagerActiveSlotId(item.slot.id)}
-                              onKeyDown={(event) => {
-                                if (event.key !== 'Enter' && event.key !== ' ') return;
+              <section className="image-editor-preview-panel">
+                <div className="image-editor-panel-head">
+                  <div>
+                    <Text strong>商品预览图编辑</Text>
+                    <Text type="secondary">
+                      当前槽位：{getImageSlotLabel(managerActiveSlot)}，已选商品图 {imageManagerSelectedSlotIds.length} 张。
+                    </Text>
+                  </div>
+                  <Space className="image-editor-preview-actions" size={6} wrap>
+                    <Button size="small" onClick={() => setImageManagerSelectedSlotIds(imageEditorProductSlotItems.map((item) => item.slot.id))}>
+                      全选主图
+                    </Button>
+                    <Button size="small" onClick={() => setImageManagerSelectedSlotIds([])}>
+                      清空选择
+                    </Button>
+                    <Button
+                      size="small"
+                      disabled={!imageManagerProductTask || imageManagerSelectedSlotIds.length === 0}
+                      onClick={() => {
+                        if (!imageManagerProductTask) return;
+                        enqueueVisualTask(imageManagerRecord, imageManagerProductTask, {
+                          mode: 'single_refine',
+                          count: imageManagerSelectedSlotIds.length,
+                          referenceImageUrl: managerActiveSlotItem?.imageUrl || getRecordMainImageUrl(imageManagerRecord),
+                          referenceImageLabels: imageEditorProductSlotItems
+                            .filter((item) => imageManagerSelectedSlotIds.includes(item.slot.id))
+                            .map((item) => `主图槽位 ${item.order}：${item.imageLabel}`),
+                          selectedSlotIds: imageManagerSelectedSlotIds,
+                        });
+                      }}
+                    >
+                      批量精修
+                    </Button>
+                  </Space>
+                </div>
+
+                <div className="image-editor-compact-preview">
+                  <section className="image-editor-mini-section">
+                    <div className="image-editor-mini-head">
+                      <Text strong>主图</Text>
+                      <Text type="secondary">批量加入后可拖拽排序，点叉删除。</Text>
+                    </div>
+                    <div className="image-editor-main-thumb-grid">
+                      {imageEditorProductSlotItems.map((item) => {
+                        const active = managerActiveSlotItem?.slot.id === item.slot.id;
+                        const selected = imageManagerSelectedSlotIds.includes(item.slot.id);
+                        return (
+                          <div
+                            className={[
+                              'image-editor-main-thumb-card',
+                              active ? 'is-active' : '',
+                              selected ? 'is-selected' : '',
+                            ]
+                              .filter(Boolean)
+                              .join(' ')}
+                            draggable
+                            key={item.slot.id}
+                            role="button"
+                            tabIndex={0}
+                            title="拖拽调整主图顺序"
+                            onDragEnd={() => setDraggingProductSlotId(undefined)}
+                            onDragOver={(event) => event.preventDefault()}
+                            onDragStart={() => setDraggingProductSlotId(item.slot.id)}
+                            onDrop={() => reorderProductImageFromEditor(item.slot.id)}
+                            onClick={() => {
+                              setManagerActiveSlotId(item.slot.id);
+                              setImageManagerSelectedSlotIds((current) =>
+                                current.includes(item.slot.id)
+                                  ? current.filter((slotId) => slotId !== item.slot.id)
+                                : [...current, item.slot.id],
+                              );
+                            }}
+                            onKeyDown={(event) => {
+                              if (event.key === 'Enter' || event.key === ' ') {
                                 event.preventDefault();
                                 setManagerActiveSlotId(item.slot.id);
+                              }
+                            }}
+                          >
+                            <span className="image-editor-thumb-order">{item.order}</span>
+                            <button
+                              aria-label={`删除图片 ${item.order}`}
+                              className="image-editor-thumb-remove"
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                removeProductImageFromEditor(item.slot.id);
                               }}
                             >
-                              <div className="image-manager-slot-thumb">
-                                <span className="image-manager-slot-index">{item.order}</span>
-                                {item.imageUrl ? (
-                                  <Image
-                                    alt={`${imageManagerRecord.productTitle} ${item.imageLabel}`}
-                                    height={72}
-                                    preview={false}
-                                    referrerPolicy="no-referrer"
-                                    src={item.imageUrl}
-                                    width={72}
-                                  />
-                                ) : (
-                                  <PictureOutlined />
-                                )}
-                              </div>
-                              <div className="image-manager-slot-copy">
-                                <Text strong ellipsis>
-                                  {item.imageLabel}
-                                </Text>
-                                <Space size={4} wrap>
-                                  <Tag color={statusMeta.color} icon={statusMeta.icon}>
-                                    {statusMeta.label}
-                                  </Tag>
-                                  <Tag color={sourceMeta.color}>{sourceMeta.label}</Tag>
-                                </Space>
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-
-                      <div className="image-manager-detail">
-                        {managerActiveSlotItem ? (
-                          <>
-                            <div className="image-manager-detail-preview">
-                              {managerActiveSlotItem.imageUrl ? (
+                              ×
+                            </button>
+                            <span className="image-editor-main-thumb-image">
+                              {item.imageUrl ? (
                                 <Image
-                                  alt={`${imageManagerRecord.productTitle} ${managerActiveSlotItem.imageLabel}`}
-                                  preview
+                                  alt={item.imageLabel}
+                                  height={56}
+                                  preview={false}
                                   referrerPolicy="no-referrer"
-                                  src={managerActiveSlotItem.imageUrl}
+                                  src={item.imageUrl}
+                                  width={56}
                                 />
                               ) : (
-                                <div className="image-manager-detail-empty">
-                                  <PictureOutlined />
-                                  <Text type="secondary">这个槽位还没有图片</Text>
-                                </div>
+                                <PictureOutlined />
                               )}
-                            </div>
-                            <div className="image-manager-detail-body">
-                              <div>
-                                <Text type="secondary">当前槽位</Text>
-                                <Typography.Title level={5}>{managerActiveSlotItem.order}. {managerActiveSlotItem.imageLabel}</Typography.Title>
-                              </div>
-                              <Space size={8} wrap>
-                                <Tag color={getImageTaskStatusMeta(managerActiveSlotItem.job?.status, Boolean(managerActiveSlotItem.imageUrl)).color}>
-                                  {getImageTaskStatusMeta(managerActiveSlotItem.job?.status, Boolean(managerActiveSlotItem.imageUrl)).label}
-                                </Tag>
-                                <Tag color={getImageAssetSourceMeta(managerActiveSlotItem.asset, managerActiveSlotItem.job).color}>
-                                  {getImageAssetSourceMeta(managerActiveSlotItem.asset, managerActiveSlotItem.job).label}
-                                </Tag>
-                                <Tag>{managerActiveSlotItem.imageKind}</Tag>
-                              </Space>
-                              <div className="image-manager-facts">
-                                <div>
-                                  <span>导出位置</span>
-                                  <strong>轮播图 / 产品描述图</strong>
-                                </div>
-                                <div>
-                                  <span>生成任务</span>
-                                  <strong>{managerActiveSlotItem.job?.id || '暂无任务'}</strong>
-                                </div>
-                                <div>
-                                  <span>图片来源</span>
-                                  <strong>{managerActiveSlotItem.asset?.id || '未绑定图片'}</strong>
-                                </div>
-                              </div>
-                              {managerActiveSlotItem.imageUrl ? (
-                                <Text className="image-manager-url" copyable={{ text: managerActiveSlotItem.imageUrl }} ellipsis>
-                                  {managerActiveSlotItem.imageUrl}
-                                </Text>
-                              ) : null}
-                              <Space className="image-manager-detail-actions" wrap>
-                                <Button
-                                  icon={<EyeOutlined />}
-                                  onClick={() => {
-                                    setPreviewRecord(imageManagerRecord);
-                                    setPreviewActiveImageSlotId(managerActiveSlotItem.slot.id);
-                                  }}
-                                >
-                                  商品预览
-                                </Button>
-                                <Button
-                                  disabled={imageManagerAssetOptions.length === 0}
-                                  icon={<SwapOutlined />}
-                                  onClick={() => {
-                                    setImageSlotPickerContext('manager');
-                                    setImageSlotPickerOpen(true);
-                                  }}
-                                >
-                                  替换图片
-                                </Button>
-                                <Button
-                                  icon={<ReloadOutlined />}
-                                  type="primary"
-                                  onClick={() => {
-                                    if (!imageManagerProductTask) return;
-                                    openVisualPublishModal(
-                                      imageManagerRecord,
-                                      imageManagerProductTask,
-                                      'single_refine',
-                                      managerActiveSlotItem.imageUrl || getRecordMainImageUrl(imageManagerRecord),
-                                    );
-                                  }}
-                                >
-                                  单图精修入队
-                                </Button>
-                              </Space>
-                            </div>
-                          </>
-                        ) : (
-                          <Empty description="暂无商品图槽位" />
-                        )}
-                      </div>
+                            </span>
+                            <span className="image-editor-thumb-caption">图片 {item.order}</span>
+                          </div>
+                        );
+                      })}
                     </div>
-                  ),
-                },
-                {
-                  key: 'tasks',
-                  label: (
-                    <span>
-                      <AppstoreOutlined /> 任务包
-                    </span>
-                  ),
-                  children: (
-                    <div className="image-manager-task-workbench">
-                      {imageManagerStyleLock ? (
-                        <div className={`style-lock-card style-lock-${imageManagerStyleLock.status}`}>
-                          <div className="style-lock-main">
-                            <Space size={6} wrap>
-                              <Tag color={imageManagerStyleLock.color} icon={imageManagerStyleLock.status === 'locked' ? <CheckCircleOutlined /> : <ClockCircleOutlined />}>
-                                风格锁：{imageManagerStyleLock.label}
-                              </Tag>
-                              <Tag>{imageManagerStyleLock.providerLabel}</Tag>
-                              <Tag>{imageManagerStyleLock.referenceLabel}</Tag>
-                            </Space>
-                            <Typography.Title level={5}>{imageManagerStyleLock.title}</Typography.Title>
-                            <Text type="secondary">{imageManagerStyleLock.description}</Text>
-                          </div>
-                          <div className="style-lock-side">
-                            <div>
-                              <span>StyleProfile</span>
-                              <strong>{imageManagerStyleLock.status === 'locked' ? 'ready' : 'pending'}</strong>
-                            </div>
-                            <div>
-                              <span>统一画风</span>
-                              <strong>{imageManagerStyleLock.prompt ? '已写入' : '待生成'}</strong>
-                            </div>
-                            <Space wrap>
-                              <Button disabled size="small">
-                                分析风格
-                              </Button>
-                              <Button disabled size="small" type="primary">
-                                确认锁定
-                              </Button>
-                            </Space>
-                          </div>
-                        </div>
-                      ) : null}
+                  </section>
 
-                      <div className="visual-task-list">
-                        {imageManagerVisualTasks.map((task) => {
-                          const completion =
-                            task.statusMeta.total > 0 ? Math.round((task.statusMeta.completed / task.statusMeta.total) * 100) : 0;
-                          return (
-                            <div className="visual-task-card" key={task.id}>
-                              <div className="visual-task-head">
-                                <div>
-                                  <Space size={6} wrap>
-                                    <Tag color={task.statusMeta.color}>{task.statusMeta.label}</Tag>
-                                    <Tag>{task.typeLabel}</Tag>
-                                    <Tag color="blue">{task.generationMode}</Tag>
-                                  </Space>
-                                  <Typography.Title level={5}>{task.name}</Typography.Title>
-                                  <Text type="secondary">{task.description}</Text>
-                                </div>
-                                <div className="visual-task-side">
-                                  <div className="visual-task-stat">
-                                    <strong>
-                                      {task.statusMeta.completed}/{task.statusMeta.total}
-                                    </strong>
-                                    <span>模块完成</span>
-                                  </div>
-                                  <Button
-                                    block
-                                    size="small"
-                                    type="primary"
-                                    onClick={() => openVisualPublishModal(imageManagerRecord, task)}
-                                  >
-                                    发布任务
-                                  </Button>
-                                </div>
-                              </div>
-                              <div className="visual-task-progress" aria-label={`${task.name} 完成度 ${completion}%`}>
-                                <span style={{ width: `${completion}%` }} />
-                              </div>
-                              <div className="visual-task-meta">
-                                <div>
-                                  <span>组批策略</span>
-                                  <strong>{task.mixPolicy}</strong>
-                                </div>
-                                <div>
-                                  <span>模块数量</span>
-                                  <strong>{task.modules.length}</strong>
-                                </div>
-                                <div>
-                                  <span>后端状态</span>
-                                  <strong>展示占位</strong>
-                                </div>
-                              </div>
-                              <div className="visual-module-grid">
-                                {task.modules.map((module) => (
-                                  <div className="visual-module-card" key={module.id}>
-                                    <div className="visual-module-thumb">
-                                      <span>{module.order}</span>
-                                      {module.imageUrl ? (
-                                        <Image
-                                          alt={module.title}
-                                          height={54}
-                                          preview={false}
-                                          referrerPolicy="no-referrer"
-                                          src={module.imageUrl}
-                                          width={54}
-                                        />
-                                      ) : (
-                                        <PictureOutlined />
-                                      )}
-                                    </div>
-                                    <div className="visual-module-copy">
-                                      <Text strong ellipsis>
-                                        {module.title}
-                                      </Text>
-                                      <Text type="secondary" ellipsis>
-                                        {module.targetLabel}
-                                      </Text>
-                                      <Space size={4} wrap>
-                                        <Tag color={module.statusMeta.color} icon={module.statusMeta.icon}>
-                                          {module.statusMeta.label}
-                                        </Tag>
-                                        <Tag color={module.sourceColor}>{module.sourceLabel}</Tag>
-                                      </Space>
-                                    </div>
-                                    <div className="visual-module-actions">
-                                      {module.slotId ? (
-                                        <Button
-                                          size="small"
-                                          onClick={() => {
-                                            setManagerActiveSlotId(module.slotId);
-                                            setImageManagerActiveTab('product');
-                                          }}
-                                        >
-                                          查看槽位
-                                        </Button>
-                                      ) : (
-                                        <Button disabled size="small">
-                                          SKU 槽位
-                                        </Button>
-                                      )}
-                                      {module.imageKind && task.id.includes('product-gallery') ? (
-                                        <Button
-                                          icon={<ReloadOutlined />}
-                                          loading={regeneratingSlotKey === `${imageManagerRecord.id}:${module.imageKind}`}
-                                          size="small"
-                                          onClick={() => void regenerateRecordImageSlot(imageManagerRecord, module.imageKind)}
-                                        >
-                                          单张重生
-                                        </Button>
-                                      ) : null}
-                                    </div>
-                                  </div>
-                                ))}
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
+                  <section className="image-editor-mini-section">
+                    <div className="image-editor-mini-head">
+                      <Text strong>SKU 图</Text>
+                      <Tag color={imageManagerSelectedSkuIds.length > 0 ? 'blue' : 'default'}>
+                        已选 {imageManagerSelectedSkuIds.length}
+                      </Tag>
                     </div>
-                  ),
-                },
-                {
-                  key: 'sku',
-                  label: (
-                    <span>
-                      <AppstoreOutlined /> SKU 图
-                    </span>
-                  ),
-                  children: (
-                    <div className="image-manager-sku-list">
+                    <div className="image-editor-sku-thumb-grid">
                       {imageManagerRecord.skuEntries.map((entry) => {
                         const skuImageUrl = getSkuDisplayImageUrl(entry);
+                        const active = imageManagerSelectedSkuIds.includes(entry.id);
                         return (
-                          <div className="image-manager-sku-row" key={entry.id}>
-                            <span className="image-manager-sku-order">{entry.order}</span>
-                            <span className="image-manager-sku-thumb">
+                          <div
+                            className={active ? 'is-active' : ''}
+                            draggable
+                            key={entry.id}
+                            role="button"
+                            tabIndex={0}
+                            title="拖拽调整 SKU 顺序"
+                            onDragEnd={() => setDraggingSkuEntryId(undefined)}
+                            onDragOver={(event) => event.preventDefault()}
+                            onDragStart={() => setDraggingSkuEntryId(entry.id)}
+                            onDrop={() => reorderSkuFromEditor(entry.id)}
+                            onClick={() => {
+                              setImageManagerActiveSkuEntryId(entry.id);
+                              setImageManagerSelectedSkuIds((current) =>
+                                current.includes(entry.id) ? current.filter((id) => id !== entry.id) : [...current, entry.id],
+                              );
+                            }}
+                            onKeyDown={(event) => {
+                              if (event.key === 'Enter' || event.key === ' ') {
+                                event.preventDefault();
+                                setImageManagerActiveSkuEntryId(entry.id);
+                              }
+                            }}
+                          >
+                            <span className="image-editor-sku-thumb-name">{entry.name}</span>
+                            <span className="image-editor-sku-thumb-image">
                               {skuImageUrl ? (
                                 <Image
                                   alt={entry.name}
@@ -2957,141 +3234,28 @@ function LinkListPanel({
                                 'SKU'
                               )}
                             </span>
-                            <div className="image-manager-sku-copy">
-                              <Text strong>{entry.name}</Text>
-                              <Text type="secondary">{entry.kind === 'combo' ? '组合 SKU' : '单 SKU'} · {entry.componentSkus.length || 1} 个组件</Text>
-                            </div>
-                            <Tag color={skuImageUrl ? 'green' : 'default'}>{skuImageUrl ? '有预览图' : '待图片'}</Tag>
+                            <button
+                              aria-label={`删除 ${entry.name} 的 SKU 图`}
+                              className="image-editor-thumb-remove"
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                removeSkuImageFromEditor(entry.id);
+                              }}
+                            >
+                              ×
+                            </button>
                           </div>
                         );
                       })}
                     </div>
-                  ),
-                },
-                {
-                  key: 'history',
-                  label: (
-                    <span>
-                      <HistoryOutlined /> 候选图片
-                    </span>
-                  ),
-                  children: (
-                    <div className="image-manager-history-grid">
-                      {imageManagerAssetOptions.length > 0 ? (
-                        imageManagerAssetOptions.map((option, index) => (
-                          <button
-                            className="image-manager-history-card"
-                            key={option.asset.id}
-                            type="button"
-                            onClick={() => {
-                              if (!managerActiveSlot) return;
-                              replaceImageSlot(imageManagerRecord, managerActiveSlot, option.asset.id);
-                            }}
-                          >
-                            <Image
-                              alt={option.asset.alt || `候选图片 ${index + 1}`}
-                              height={92}
-                              preview={false}
-                              referrerPolicy="no-referrer"
-                              src={option.imageUrl}
-                              width={92}
-                            />
-                            <span>
-                              <strong>{option.asset.alt || `图片 ${index + 1}`}</strong>
-                              <Text type="secondary">{getImageAssetSourceMeta(option.asset).label}</Text>
-                            </span>
-                          </button>
-                        ))
-                      ) : (
-                        <Empty description="暂无候选图片" />
-                      )}
-                    </div>
-                  ),
-                },
-                {
-                  key: 'jobs',
-                  label: (
-                    <span>
-                      <ClockCircleOutlined /> 生成记录
-                    </span>
-                  ),
-                  children: (
-                    <div className="image-manager-job-list">
-                      {(imageManagerRecord.creativeJobs || []).length > 0 ? (
-                        (imageManagerRecord.creativeJobs || []).map((job) => {
-                          const statusMeta = getImageTaskStatusMeta(job.status, Boolean(job.resultImageUrl));
-                          return (
-                            <div className="image-manager-job-row" key={job.id}>
-                              <Tag color={statusMeta.color} icon={statusMeta.icon}>
-                                {statusMeta.label}
-                              </Tag>
-                              <div>
-                                <Text strong>{job.imageLabel}</Text>
-                                <Text type="secondary">{job.imageKind} · {formatRecordTime(job.updatedAt)}</Text>
-                              </div>
-                              {job.resultImageUrl ? (
-                                <Text copyable={{ text: job.resultImageUrl }} type="secondary">
-                                  OSS
-                                </Text>
-                              ) : null}
-                            </div>
-                          );
-                        })
-                      ) : (
-                        <Empty description="暂无生成任务" />
-                      )}
-                    </div>
-                  ),
-                },
-              ]}
-            />
-
-            <section className="image-manager-library-panel">
-              <div className="image-manager-library-head">
-                <div>
-                  <Text strong>统一图库</Text>
-                  <Text type="secondary">原图、SKU 图和生成图统一放在这里。需要回退时可以直接使用原图替换当前预览图。</Text>
+                  </section>
                 </div>
-                <Tag>{imageManagerGalleryOptions.length} 张</Tag>
-              </div>
-              {imageManagerGalleryOptions.length > 0 ? (
-                <div className="image-manager-library-grid">
-                  {imageManagerGalleryOptions.map((option, index) => {
-                    const canUseForProduct = option.asset.role === 'product-main' || option.asset.role === 'product-material';
-                    return (
-                      <button
-                        className="image-manager-library-card"
-                        disabled={!canUseForProduct || !managerActiveSlot}
-                        key={option.asset.id}
-                        type="button"
-                        onClick={() => {
-                          if (!managerActiveSlot || !canUseForProduct) return;
-                          replaceImageSlot(imageManagerRecord, managerActiveSlot, option.asset.id);
-                        }}
-                      >
-                        <Image
-                          alt={option.asset.alt || `图库图片 ${index + 1}`}
-                          height={72}
-                          preview={false}
-                          referrerPolicy="no-referrer"
-                          src={option.imageUrl}
-                          width={72}
-                        />
-                        <span>
-                          <strong>{option.asset.alt || `图片 ${index + 1}`}</strong>
-                          <Text type="secondary">{option.asset.role === 'sales-sku' ? 'SKU 图' : getImageAssetSourceMeta(option.asset).label}</Text>
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
-              ) : (
-                <Empty description="暂无图库图片" />
-              )}
-            </section>
+              </section>
+            </div>
           </div>
         ) : null}
-      </Drawer>
+      </Modal>
       <Modal
         footer={null}
         open={imageSlotPickerOpen}
