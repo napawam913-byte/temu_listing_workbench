@@ -1,22 +1,43 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any
 
 from app.core import config as app_config
 from app.core.database import get_app_setting_value
 
+try:
+    from PIL import Image, ImageOps
+except Exception:  # pragma: no cover - optional runtime dependency guard
+    Image = None
+    ImageOps = None
 
-DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+
+DEFAULT_OPENAI_BASE_URL = "https://svip.fluapi.com/v1"
+REQUEST_TOO_LARGE_MARKERS = (
+    "HTTP 413",
+    "message_length_exceeds_limit",
+    "request too large",
+    "payload too large",
+    "content too large",
+    "maximum context length",
+)
 
 
 class VisualGenerationError(RuntimeError):
     pass
+
+
+def is_request_too_large_error(error: BaseException | str) -> bool:
+    text = str(error or "").lower()
+    return any(marker.lower() in text for marker in REQUEST_TOO_LARGE_MARKERS)
 
 
 def get_runtime_setting(key: str, default: str = "") -> str:
@@ -31,9 +52,43 @@ def get_ai_settings() -> dict[str, str]:
     return {
         "api_key": get_runtime_setting("OPENAI_API_KEY", app_config.OPENAI_API_KEY).strip(),
         "base_url": base_url or DEFAULT_OPENAI_BASE_URL,
-        "text_model": get_runtime_setting("OPENAI_TEXT_MODEL", app_config.OPENAI_TEXT_MODEL).strip() or "gpt-4.1-mini",
-        "image_model": get_runtime_setting("OPENAI_IMAGE_MODEL", app_config.OPENAI_IMAGE_MODEL).strip() or "gpt-image-1",
+        "text_model": get_runtime_setting("OPENAI_TEXT_MODEL", app_config.OPENAI_TEXT_MODEL).strip() or "gpt-5.5",
+        "image_model": get_runtime_setting("OPENAI_IMAGE_MODEL", app_config.OPENAI_IMAGE_MODEL).strip() or "gpt-image-2",
         "image_quality": get_runtime_setting("OPENAI_IMAGE_QUALITY", app_config.OPENAI_IMAGE_QUALITY).strip() or "medium",
+    }
+
+
+AI_STAGE_SETTING_PREFIXES = {
+    "title": "OPENAI_TITLE",
+    "recommendation": "OPENAI_RECOMMENDATION",
+    "product_attribute": "OPENAI_PRODUCT_ATTRIBUTE",
+    "visual_analysis": "OPENAI_VISUAL_ANALYSIS",
+    "visual_prompt": "OPENAI_VISUAL_PROMPT",
+    "image": "OPENAI_IMAGE",
+}
+
+
+def get_ai_stage_settings(stage: str) -> dict[str, str]:
+    common = get_ai_settings()
+    stage_key = str(stage or "").strip().lower().replace("-", "_")
+    prefix = AI_STAGE_SETTING_PREFIXES.get(stage_key)
+    if not prefix:
+        return {
+            "api_key": common["api_key"],
+            "base_url": common["base_url"],
+            "model": common["text_model"],
+            "image_quality": common["image_quality"],
+        }
+
+    fallback_model = common["image_model"] if stage_key == "image" else common["text_model"]
+    api_key = get_runtime_setting(f"{prefix}_API_KEY", "").strip() or common["api_key"]
+    base_url = get_runtime_setting(f"{prefix}_BASE_URL", "").strip().rstrip("/") or common["base_url"]
+    model = get_runtime_setting(f"{prefix}_MODEL", "").strip() or fallback_model
+    return {
+        "api_key": api_key,
+        "base_url": base_url or DEFAULT_OPENAI_BASE_URL,
+        "model": model,
+        "image_quality": common["image_quality"],
     }
 
 
@@ -66,6 +121,65 @@ def request_json(api_url: str, api_key: str, payload: dict[str, Any], *, timeout
         raise VisualGenerationError(format_http_error(exc.code, error_body)) from exc
     except urllib.error.URLError as exc:
         raise VisualGenerationError(f"AI request failed: {exc}") from exc
+    except TimeoutError as exc:
+        raise VisualGenerationError(f"AI request timed out: {exc}") from exc
+
+    try:
+        return json.loads(response_body)
+    except json.JSONDecodeError as exc:
+        raise VisualGenerationError(f"AI API did not return JSON: {response_body[:500]}") from exc
+
+
+def request_multipart(
+    api_url: str,
+    api_key: str,
+    *,
+    fields: list[tuple[str, str]],
+    files: list[tuple[str, str, str, bytes]],
+    timeout: int = 300,
+) -> dict[str, Any]:
+    if not api_key:
+        raise VisualGenerationError("AI API Key is not configured")
+
+    boundary = f"----TemuWorkbenchBoundary{uuid.uuid4().hex}"
+    body = bytearray()
+    for name, value in fields:
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+        body.extend(str(value).encode("utf-8"))
+        body.extend(b"\r\n")
+    for field_name, filename, content_type, data in files:
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(
+            (
+                f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"\r\n'
+                f"Content-Type: {content_type}\r\n\r\n"
+            ).encode("utf-8")
+        )
+        body.extend(data)
+        body.extend(b"\r\n")
+    body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+
+    request = urllib.request.Request(
+        api_url,
+        data=bytes(body),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response_body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise VisualGenerationError(format_http_error(exc.code, error_body)) from exc
+    except urllib.error.URLError as exc:
+        raise VisualGenerationError(f"AI request failed: {exc}") from exc
+    except TimeoutError as exc:
+        raise VisualGenerationError(f"AI request timed out: {exc}") from exc
 
     try:
         return json.loads(response_body)
@@ -80,6 +194,9 @@ def format_http_error(status_code: int, error_body: str) -> str:
         return f"HTTP {status_code}: {error_body[:500]}"
 
     error = parsed.get("error") if isinstance(parsed, dict) else None
+    detail = parsed.get("detail") if isinstance(parsed, dict) else None
+    if not isinstance(error, dict) and isinstance(detail, dict):
+        error = detail
     if not isinstance(error, dict):
         return f"HTTP {status_code}: {error_body[:500]}"
 
@@ -146,7 +263,29 @@ def download_image(url: str) -> bytes:
     return data
 
 
-def image_file_to_data_url(path: Path) -> str:
+def image_file_to_data_url(path: Path, *, max_side: int | None = None, quality: int = 86) -> str:
+    if max_side and Image is not None and ImageOps is not None:
+        try:
+            with Image.open(path) as image:
+                image = ImageOps.exif_transpose(image)
+                resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+                image.thumbnail((max_side, max_side), resampling)
+                if image.mode not in {"RGB", "L"}:
+                    background = Image.new("RGB", image.size, (255, 255, 255))
+                    if image.mode == "RGBA":
+                        background.paste(image, mask=image.getchannel("A"))
+                    else:
+                        background.paste(image.convert("RGB"))
+                    image = background
+                elif image.mode != "RGB":
+                    image = image.convert("RGB")
+                output = io.BytesIO()
+                image.save(output, format="JPEG", quality=max(45, min(95, quality)), optimize=True)
+                encoded = base64.b64encode(output.getvalue()).decode("ascii")
+                return f"data:image/jpeg;base64,{encoded}"
+        except Exception:
+            pass
+
     suffix = path.suffix.lower()
     mime_type = {
         ".jpg": "image/jpeg",
@@ -157,6 +296,45 @@ def image_file_to_data_url(path: Path) -> str:
     }.get(suffix, "image/jpeg")
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")
     return f"data:{mime_type};base64,{encoded}"
+
+
+def image_file_to_upload(
+    path: Path,
+    *,
+    max_side: int | None = None,
+    quality: int = 86,
+) -> tuple[str, str, bytes]:
+    if max_side and Image is not None and ImageOps is not None:
+        try:
+            with Image.open(path) as image:
+                image = ImageOps.exif_transpose(image)
+                resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+                image.thumbnail((max_side, max_side), resampling)
+                if image.mode not in {"RGB", "L"}:
+                    background = Image.new("RGB", image.size, (255, 255, 255))
+                    if image.mode == "RGBA":
+                        background.paste(image, mask=image.getchannel("A"))
+                    else:
+                        background.paste(image.convert("RGB"))
+                    image = background
+                elif image.mode != "RGB":
+                    image = image.convert("RGB")
+                output = io.BytesIO()
+                image.save(output, format="JPEG", quality=max(45, min(95, quality)), optimize=True)
+                return (f"{path.stem or 'reference'}.jpg", "image/jpeg", output.getvalue())
+        except Exception:
+            pass
+
+    suffix = path.suffix.lower()
+    mime_type = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".bmp": "image/bmp",
+    }.get(suffix, "image/jpeg")
+    filename = path.name or "reference.jpg"
+    return (filename, mime_type, path.read_bytes())
 
 
 def extract_response_text(response_json: dict[str, Any]) -> str:
@@ -255,6 +433,9 @@ def request_generated_image(
     size: str,
     prompt: str,
     reference_image_path: Path | None = None,
+    reference_image_paths: list[Path] | None = None,
+    reference_image_max_side: int | None = None,
+    reference_image_quality: int = 86,
 ) -> bytes:
     normalized_api_url = api_url.rstrip("/")
     if normalized_api_url.endswith("/chat/completions"):
@@ -262,14 +443,45 @@ def request_generated_image(
 
     if normalized_api_url.endswith("/responses"):
         content: list[dict[str, str]] = [{"type": "input_text", "text": prompt}]
-        if reference_image_path and reference_image_path.exists():
-            content.append({"type": "input_image", "image_url": image_file_to_data_url(reference_image_path)})
+        resolved_reference_paths = [path for path in (reference_image_paths or []) if path and path.exists()]
+        if not resolved_reference_paths and reference_image_path and reference_image_path.exists():
+            resolved_reference_paths = [reference_image_path]
+        for path in resolved_reference_paths:
+            content.append(
+                {
+                    "type": "input_image",
+                    "image_url": image_file_to_data_url(
+                        path,
+                        max_side=reference_image_max_side,
+                        quality=reference_image_quality,
+                    ),
+                }
+            )
         payload = {
             "model": model,
             "input": [{"role": "user", "content": content}],
             "tools": [{"type": "image_generation"}],
         }
         response_json = request_json(api_url, api_key, payload)
+    elif normalized_api_url.endswith("/images/edits"):
+        resolved_reference_paths = [path for path in (reference_image_paths or []) if path and path.exists()]
+        if not resolved_reference_paths and reference_image_path and reference_image_path.exists():
+            resolved_reference_paths = [reference_image_path]
+        if not resolved_reference_paths:
+            raise VisualGenerationError("image edits API requires at least one reference image")
+        image_field_name = "image[]" if len(resolved_reference_paths) > 1 else "image"
+        fields = [("model", model), ("prompt", prompt)]
+        if size:
+            fields.append(("size", size))
+        files = []
+        for index, path in enumerate(resolved_reference_paths, start=1):
+            filename, content_type, data = image_file_to_upload(
+                path,
+                max_side=reference_image_max_side,
+                quality=reference_image_quality,
+            )
+            files.append((image_field_name, f"reference_{index}_{filename}", content_type, data))
+        response_json = request_multipart(api_url, api_key, fields=fields, files=files)
     else:
         payload = {"model": model, "prompt": prompt, "n": 1}
         if size:
@@ -291,4 +503,3 @@ def request_generated_image(
         "image generation result did not contain base64 or URL: "
         f"{json.dumps(response_json, ensure_ascii=False)[:1000]}"
     )
-

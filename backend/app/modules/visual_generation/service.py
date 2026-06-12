@@ -7,17 +7,21 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import STORAGE_DIR
-from app.core.database import get_connection, utc_now_text
+from app.core.database import get_connection, list_link_list_records, upsert_link_list_record, utc_now_text
 from app.modules.image_storage.aliyun_oss import ImageStorageError, read_image_ref, upload_image_bytes
 from app.modules.visual_generation.clients import (
     VisualGenerationError,
     build_api_url,
     get_ai_settings,
+    get_ai_stage_settings,
     get_runtime_setting,
+    is_request_too_large_error,
     request_generated_image,
 )
 from app.modules.visual_generation.planner import (
+    build_compact_mother_prompt_from_plan,
     build_mother_prompt_from_plan,
+    compact_json_value,
     request_product_analysis,
     request_prompt_plan,
 )
@@ -33,6 +37,12 @@ TASK_STATUS_COMPLETED = "completed"
 TASK_STATUS_FAILED = "failed"
 
 BOOL_TRUE_VALUES = {"1", "true", "yes", "on"}
+IMAGE_PAYLOAD_RETRY_PROFILES = [
+    {"max_side": None, "quality": 86, "label": "original"},
+    {"max_side": 1280, "quality": 82, "label": "compressed-1280"},
+    {"max_side": 960, "quality": 78, "label": "compressed-960"},
+    {"max_side": 768, "quality": 74, "label": "compressed-768"},
+]
 
 
 class VisualTaskError(ValueError):
@@ -130,13 +140,18 @@ def create_visual_task(
     layout: str | None = None,
     requested_count: int | None = None,
     source_image_ref: str | None = None,
+    reference_image_refs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    record = record or {}
+    record = dict(record or {})
     now = utc_now_text()
     task_id = f"visual_{uuid.uuid4().hex}"
+    reference_refs = normalize_reference_image_refs(reference_image_refs or record.get("visualReferenceImages"))
     clean_link_record_id = clean_text(link_record_id) or clean_text(record.get("id"))
     clean_product_id = clean_text(product_id) or clean_text(record.get("productId"))
-    clean_source_image_ref = clean_text(source_image_ref) or pick_record_image(record)
+    clean_source_image_ref = clean_text(source_image_ref) or (reference_refs[0]["url"] if reference_refs else "") or pick_record_image(record)
+    if reference_refs:
+        record["visualReferenceImages"] = reference_refs
+        record["visualReferenceImageCount"] = len(reference_refs)
     resolved_mode = clean_text(mode) or visual_setting("VISUAL_DEFAULT_MODE", "main-gallery")
     resolved_layout = clean_text(layout) or visual_setting("VISUAL_DEFAULT_LAYOUT", "3x3")
     resolved_count = requested_count or visual_int_setting("VISUAL_DEFAULT_REQUESTED_COUNT", 9, minimum=1, maximum=9)
@@ -205,58 +220,135 @@ def get_visual_task(*, task_id: str, user_id: str) -> dict[str, Any]:
     return task_row_to_api(row, modules=modules)
 
 
+def request_product_analysis_with_payload_retry(
+    *,
+    api_url: str,
+    api_key: str,
+    model: str,
+    product_image_path: Path | None,
+    product_image_paths: list[Path],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    last_error: Exception | None = None
+    for index, profile in enumerate(IMAGE_PAYLOAD_RETRY_PROFILES):
+        try:
+            return request_product_analysis(
+                api_url=api_url,
+                api_key=api_key,
+                model=model,
+                product_image_path=product_image_path,
+                product_image_paths=product_image_paths,
+                context=context,
+                image_max_side=profile["max_side"],
+                image_quality=profile["quality"],
+            )
+        except Exception as exc:
+            if not is_request_too_large_error(exc) or index == len(IMAGE_PAYLOAD_RETRY_PROFILES) - 1:
+                raise
+            last_error = exc
+    raise last_error or VisualTaskError("product analysis failed")
+
+
+def request_generated_image_with_payload_retry(
+    *,
+    api_url: str,
+    api_key: str,
+    model: str,
+    size: str,
+    prompt: str,
+    compact_prompt: str,
+    reference_image_path: Path | None,
+    reference_image_paths: list[Path],
+) -> bytes:
+    last_error: Exception | None = None
+    for active_prompt in (prompt, compact_prompt):
+        for index, image_profile in enumerate(IMAGE_PAYLOAD_RETRY_PROFILES):
+            try:
+                return request_generated_image(
+                    api_url=api_url,
+                    api_key=api_key,
+                    model=model,
+                    size=size,
+                    prompt=active_prompt,
+                    reference_image_path=reference_image_path,
+                    reference_image_paths=reference_image_paths,
+                    reference_image_max_side=image_profile["max_side"],
+                    reference_image_quality=image_profile["quality"],
+                )
+            except Exception as exc:
+                if not is_request_too_large_error(exc):
+                    raise
+                last_error = exc
+                if index < len(IMAGE_PAYLOAD_RETRY_PROFILES) - 1:
+                    continue
+                break
+    raise last_error or VisualTaskError("image generation failed")
+
+
 def plan_visual_task(
     *,
     task_id: str,
     user_id: str,
     source_image_ref: str | None = None,
+    reference_image_refs: list[dict[str, Any]] | None = None,
     allow_short_labels: bool | None = None,
     analysis_model: str | None = None,
     prompt_model: str | None = None,
 ) -> dict[str, Any]:
     task = get_visual_task(task_id=task_id, user_id=user_id)
-    source_ref = clean_text(source_image_ref) or clean_text(task.get("sourceImageRef"))
+    record = task.get("record") or {}
+    reference_refs = normalize_reference_image_refs(reference_image_refs or record.get("visualReferenceImages"))
+    source_ref = clean_text(source_image_ref) or (reference_refs[0]["url"] if reference_refs else "") or clean_text(task.get("sourceImageRef"))
+    reference_refs = normalize_reference_image_refs(reference_refs, fallback_ref=source_ref)
     if not source_ref:
         raise VisualTaskError("source image is required before planning")
 
-    settings = get_ai_settings()
-    base_url = settings["base_url"]
-    api_key = settings["api_key"]
-    text_model = analysis_model or settings["text_model"]
-    plan_model = prompt_model or settings["text_model"]
+    analysis_settings = get_ai_stage_settings("visual_analysis")
+    prompt_settings = get_ai_stage_settings("visual_prompt")
+    text_model = analysis_model or analysis_settings["model"]
+    plan_model = prompt_model or prompt_settings["model"]
     resolved_allow_short_labels = (
         visual_bool_setting("VISUAL_ALLOW_SHORT_LABELS", True) if allow_short_labels is None else allow_short_labels
     )
-    analysis_url = build_api_url(base_url, "/chat/completions")
-    prompt_url = build_api_url(base_url, "/chat/completions")
+    analysis_url = build_api_url(analysis_settings["base_url"], "/chat/completions")
+    prompt_url = build_api_url(prompt_settings["base_url"], "/chat/completions")
     task_dir = task_output_dir(user_id, task_id)
     task_dir.mkdir(parents=True, exist_ok=True)
-    source_path = materialize_image_ref(source_ref, task_dir / "source_image")
+    reference_paths = materialize_reference_image_refs(reference_refs, task_dir)
+    source_path = reference_paths[0] if reference_paths else materialize_image_ref(source_ref, task_dir / "source_image")
 
-    context = {
-        "linkRecordId": task.get("linkRecordId"),
-        "productId": task.get("productId"),
-        "mode": task.get("mode"),
-        "requestedCount": task.get("requestedCount"),
-        "record": task.get("record") or {},
-    }
+    context = build_visual_prompt_context(task=task, record=record, reference_refs=reference_refs)
     update_task_status(task_id, user_id, TASK_STATUS_RUNNING)
     try:
-        product_analysis = request_product_analysis(
+        product_analysis = request_product_analysis_with_payload_retry(
             api_url=analysis_url,
-            api_key=api_key,
+            api_key=analysis_settings["api_key"],
             model=text_model,
             product_image_path=source_path,
+            product_image_paths=reference_paths,
             context=context,
         )
-        plan = request_prompt_plan(
-            api_url=prompt_url,
-            api_key=api_key,
-            model=plan_model,
-            product_analysis=product_analysis,
-            layout=task["layout"],
-            allow_short_labels=resolved_allow_short_labels,
-        )
+        try:
+            plan = request_prompt_plan(
+                api_url=prompt_url,
+                api_key=prompt_settings["api_key"],
+                model=plan_model,
+                product_analysis=product_analysis,
+                layout=task["layout"],
+                allow_short_labels=resolved_allow_short_labels,
+            )
+        except Exception as exc:
+            if not is_request_too_large_error(exc):
+                raise
+            compact_analysis = compact_json_value(product_analysis, max_items=6, max_chars=140)
+            plan = request_prompt_plan(
+                api_url=prompt_url,
+                api_key=prompt_settings["api_key"],
+                model=plan_model,
+                product_analysis=compact_analysis if isinstance(compact_analysis, dict) else product_analysis,
+                layout=task["layout"],
+                allow_short_labels=resolved_allow_short_labels,
+            )
         mother_prompt = build_mother_prompt_from_plan(plan, task["layout"], resolved_allow_short_labels)
         persist_plan(task_id, user_id, source_ref, plan, mother_prompt)
     except Exception as exc:
@@ -281,9 +373,9 @@ def generate_visual_task(
     if not prompt_text:
         raise VisualTaskError("task has no mother prompt; run plan first")
 
-    settings = get_ai_settings()
-    image_url = build_api_url(settings["base_url"], "/images/generations")
+    settings = get_ai_stage_settings("image")
     source_ref = clean_text(task.get("sourceImageRef"))
+    reference_refs = normalize_reference_image_refs((task.get("record") or {}).get("visualReferenceImages"), fallback_ref=source_ref)
     task_dir = task_output_dir(user_id, task_id)
     task_dir.mkdir(parents=True, exist_ok=True)
     resolved_split_after = True if split_after is None else split_after
@@ -294,19 +386,27 @@ def generate_visual_task(
     resolved_use_reference_image = (
         visual_bool_setting("VISUAL_USE_REFERENCE_IMAGE", True) if use_reference_image is None else use_reference_image
     )
-    reference_path = (
-        materialize_image_ref(source_ref, task_dir / "source_image") if resolved_use_reference_image and source_ref else None
+    reference_paths = materialize_reference_image_refs(reference_refs, task_dir) if resolved_use_reference_image else []
+    reference_path = reference_paths[0] if reference_paths else None
+    image_endpoint = "/images/edits" if reference_paths else "/images/generations"
+    image_url = build_api_url(settings["base_url"], image_endpoint)
+    compact_prompt_text = build_compact_mother_prompt_from_plan(
+        task.get("analysis") if isinstance(task.get("analysis"), dict) else {},
+        clean_text(task.get("layout")) or "3x3",
+        visual_bool_setting("VISUAL_ALLOW_SHORT_LABELS", True),
     )
 
     update_task_status(task_id, user_id, TASK_STATUS_RUNNING)
     try:
-        image_bytes = request_generated_image(
+        image_bytes = request_generated_image_with_payload_retry(
             api_url=image_url,
             api_key=settings["api_key"],
-            model=image_model or settings["image_model"],
+            model=image_model or settings["model"],
             size=resolved_image_size,
             prompt=prompt_text,
+            compact_prompt=compact_prompt_text,
             reference_image_path=reference_path,
+            reference_image_paths=reference_paths,
         )
         mother_path = task_dir / "generated_mother.png"
         mother_path.write_bytes(image_bytes)
@@ -396,6 +496,244 @@ def split_visual_task(
     result = get_visual_task(task_id=task_id, user_id=user_id)
     result["modules"] = modules
     return result
+
+
+def run_visual_task_pipeline(
+    *,
+    task_id: str,
+    user_id: str,
+    source_image_ref: str | None = None,
+    reference_image_refs: list[dict[str, Any]] | None = None,
+    allow_short_labels: bool | None = None,
+    analysis_model: str | None = None,
+    prompt_model: str | None = None,
+    split_after: bool | None = True,
+    upload_to_oss: bool | None = True,
+    image_model: str | None = None,
+    image_size: str | None = None,
+    use_reference_image: bool | None = True,
+    apply_to_link_record: bool = True,
+) -> dict[str, Any]:
+    """Run plan -> generate -> split and optionally write generated images back to the link record."""
+    planned = plan_visual_task(
+        task_id=task_id,
+        user_id=user_id,
+        source_image_ref=source_image_ref,
+        reference_image_refs=reference_image_refs,
+        allow_short_labels=allow_short_labels,
+        analysis_model=analysis_model,
+        prompt_model=prompt_model,
+    )
+    generated = generate_visual_task(
+        task_id=task_id,
+        user_id=user_id,
+        split_after=split_after,
+        upload_to_oss=upload_to_oss,
+        image_model=image_model,
+        image_size=image_size,
+        use_reference_image=use_reference_image,
+    )
+    if apply_to_link_record:
+        try:
+            update_task_status(task_id, user_id, TASK_STATUS_RUNNING)
+            apply_visual_task_results_to_link_record(task_id=task_id, user_id=user_id)
+            update_task_status(task_id, user_id, TASK_STATUS_COMPLETED)
+        except Exception as exc:
+            # The generated assets should remain usable even if link-list persistence fails.
+            mark_task_failed(task_id, user_id, f"generated, but link record update failed: {exc}")
+            raise
+    return get_visual_task(task_id=task_id, user_id=user_id) if apply_to_link_record else generated or planned
+
+
+def apply_visual_task_results_to_link_record(*, task_id: str, user_id: str) -> dict[str, Any] | None:
+    task = get_visual_task(task_id=task_id, user_id=user_id)
+    link_record_id = clean_text(task.get("linkRecordId"))
+    if not link_record_id:
+        return None
+
+    record = load_link_record_for_visual_task(link_record_id=link_record_id, user_id=user_id)
+    if record is None:
+        record = task.get("record") if isinstance(task.get("record"), dict) else {}
+    if not isinstance(record, dict) or not record:
+        return None
+
+    modules = sorted(
+        [module for module in task.get("modules") or [] if visual_module_result_ref(module)],
+        key=lambda module: int(module.get("panelIndex") or 0),
+    )
+    if not modules:
+        return record
+
+    mode = clean_text(task.get("mode"))
+    if mode == "sku-gallery":
+        next_record = apply_visual_sku_gallery_result(record, task, modules)
+    else:
+        next_record = apply_visual_product_gallery_result(record, task, modules)
+
+    now = utc_now_text()
+    visual_history = next_record.get("visualGenerationTaskIds")
+    if not isinstance(visual_history, list):
+        visual_history = []
+    if task_id not in visual_history:
+        visual_history.append(task_id)
+    next_record["visualGenerationTaskIds"] = visual_history[-20:]
+    next_record["visualGenerationStatus"] = task.get("status") or TASK_STATUS_COMPLETED
+    next_record["visualGeneratedAt"] = now
+    next_record["updatedAt"] = now
+    return upsert_link_list_record(next_record, user_id=user_id)
+
+
+def load_link_record_for_visual_task(*, link_record_id: str, user_id: str) -> dict[str, Any] | None:
+    records = list_link_list_records(user_id=user_id, include_deleted=False, limit=1000)
+    for record in records:
+        if clean_text(record.get("id")) == link_record_id:
+            return record
+    return None
+
+
+def visual_module_result_ref(module: dict[str, Any]) -> str:
+    return clean_text(module.get("outputUrl")) or clean_text(module.get("outputPath"))
+
+
+def build_visual_result_asset(
+    *,
+    record: dict[str, Any],
+    task: dict[str, Any],
+    module: dict[str, Any],
+    order: int,
+    role: str,
+) -> dict[str, Any]:
+    result_ref = visual_module_result_ref(module)
+    is_remote = result_ref.startswith("http://") or result_ref.startswith("https://")
+    record_id = clean_text(record.get("id")) or clean_text(task.get("linkRecordId")) or "link"
+    task_id = clean_text(task.get("id")) or "visual"
+    module_id = clean_text(module.get("targetSkuEntryId")) or str(order)
+    if role == "sales-sku":
+        asset_id = f"{record_id}-visual-sku-{task_id}-{module_id}"
+    elif role == "product-main":
+        asset_id = f"{record_id}-visual-main-{task_id}"
+    else:
+        asset_id = f"{record_id}-visual-product-{task_id}-{order}"
+    asset = {
+        "id": asset_id,
+        "role": role,
+        "sourceUrl": clean_text(module.get("outputPath")) or result_ref,
+        "displayUrl": result_ref,
+        "editedUrl": result_ref,
+        "alt": clean_text(module.get("title")) or clean_text(module.get("purpose")) or f"{record.get('productTitle') or 'Product'} {order}",
+    }
+    if is_remote:
+        asset["displayCloudUrl"] = result_ref
+        asset["editedCloudUrl"] = result_ref
+    return asset
+
+
+def apply_visual_product_gallery_result(
+    record: dict[str, Any],
+    task: dict[str, Any],
+    modules: list[dict[str, Any]],
+) -> dict[str, Any]:
+    next_record = dict(record)
+    slot_map: dict[str, dict[str, Any]] = {}
+    for slot in record.get("imageSlots") or []:
+        if isinstance(slot, dict) and clean_text(slot.get("id")):
+            slot_map[clean_text(slot.get("id"))] = dict(slot)
+
+    generated_assets: list[dict[str, Any]] = []
+    main_image = record.get("mainImage") if isinstance(record.get("mainImage"), dict) else {}
+    for index, module in enumerate(modules, start=1):
+        order = int(module.get("panelIndex") or index)
+        is_main = order == 1
+        asset = build_visual_result_asset(
+            record=record,
+            task=task,
+            module=module,
+            order=order,
+            role="product-main" if is_main else "product-material",
+        )
+        generated_assets.append(asset)
+        if is_main:
+            main_image = {**main_image, **asset, "role": "product-main"}
+            asset_id = clean_text(main_image.get("id")) or asset["id"]
+            main_image["id"] = asset_id
+            slot_map[f"{record.get('id')}-slot-main"] = {
+                "id": f"{record.get('id')}-slot-main",
+                "type": "main",
+                "order": 0,
+                "assetId": asset_id,
+            }
+            slot_map[f"{record.get('id')}-slot-carousel-1"] = {
+                "id": f"{record.get('id')}-slot-carousel-1",
+                "type": "carousel",
+                "order": 1,
+                "assetId": asset_id,
+            }
+        else:
+            slot_map[f"{record.get('id')}-slot-carousel-{order}"] = {
+                "id": f"{record.get('id')}-slot-carousel-{order}",
+                "type": "carousel",
+                "order": order,
+                "assetId": asset["id"],
+            }
+
+    existing_assets = [
+        asset
+        for asset in record.get("productMaterialImages") or []
+        if isinstance(asset, dict) and not clean_text(asset.get("id")).startswith(f"{record.get('id')}-visual-product-")
+    ]
+    product_assets = [asset for asset in generated_assets if asset.get("role") == "product-material"]
+    next_record["schemaVersion"] = 3
+    next_record["mainImage"] = main_image
+    next_record["productMaterialImages"] = product_assets + existing_assets
+    next_record["productImageGenerationCount"] = max(
+        int(record.get("productImageGenerationCount") or 0),
+        len(generated_assets),
+    )
+    next_record["imageSlots"] = sorted(slot_map.values(), key=lambda slot: int(slot.get("order") or 0))
+    return next_record
+
+
+def apply_visual_sku_gallery_result(
+    record: dict[str, Any],
+    task: dict[str, Any],
+    modules: list[dict[str, Any]],
+) -> dict[str, Any]:
+    next_record = dict(record)
+    sku_entries = record.get("skuEntries") if isinstance(record.get("skuEntries"), list) else []
+    module_by_sku: dict[str, dict[str, Any]] = {}
+    for index, module in enumerate(modules):
+        sku_id = clean_text(module.get("targetSkuEntryId"))
+        if not sku_id and index < len(sku_entries) and isinstance(sku_entries[index], dict):
+            sku_id = clean_text(sku_entries[index].get("id"))
+        if sku_id:
+            module_by_sku[sku_id] = module
+
+    next_skus: list[dict[str, Any]] = []
+    for index, entry in enumerate(sku_entries, start=1):
+        if not isinstance(entry, dict):
+            continue
+        module = module_by_sku.get(clean_text(entry.get("id")))
+        if not module:
+            next_skus.append(entry)
+            continue
+        result_ref = visual_module_result_ref(module)
+        asset = build_visual_result_asset(record=record, task=task, module=module, order=index, role="sales-sku")
+        next_skus.append(
+            {
+                **entry,
+                "imageUrl": result_ref or entry.get("imageUrl"),
+                "imageAsset": {
+                    **(entry.get("imageAsset") if isinstance(entry.get("imageAsset"), dict) else {}),
+                    **asset,
+                    "sourceUrl": clean_text((entry.get("imageAsset") or {}).get("sourceUrl") if isinstance(entry.get("imageAsset"), dict) else "")
+                    or clean_text(entry.get("imageUrl"))
+                    or asset.get("sourceUrl"),
+                },
+            }
+        )
+    next_record["schemaVersion"] = 3
+    next_record["skuEntries"] = next_skus
+    return next_record
 
 
 def split_mother_image_stateless(
@@ -663,6 +1001,7 @@ def task_row_to_api(row, *, modules: list[dict[str, Any]]) -> dict[str, Any]:
         "requestedCount": int(row["requested_count"] or 0),
         "status": row["status"],
         "sourceImageRef": row["source_image_ref"],
+        "referenceImageRefs": record.get("visualReferenceImages") if isinstance(record.get("visualReferenceImages"), list) else [],
         "record": record,
         "analysis": analysis,
         "promptText": row["prompt_text"],
@@ -695,6 +1034,100 @@ def module_row_to_api(row) -> dict[str, Any]:
         "updatedAt": row["updated_at"],
     }
 
+
+def normalize_reference_image_refs(value: Any, fallback_ref: str | None = None) -> list[dict[str, str]]:
+    raw_items = value if isinstance(value, list) else []
+    refs: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add_ref(url_value: Any, label_value: Any = "", role_value: Any = "") -> None:
+        url = clean_text(url_value)
+        if not url or url in seen:
+            return
+        seen.add(url)
+        refs.append(
+            {
+                "url": url,
+                "label": clean_text(label_value) or f"Reference image {len(refs) + 1}",
+                "role": clean_text(role_value) or "reference-image",
+            }
+        )
+
+    for item in raw_items:
+        if isinstance(item, dict):
+            add_ref(
+                item.get("url") or item.get("imageUrl") or item.get("sourceUrl"),
+                item.get("label") or item.get("name"),
+                item.get("role"),
+            )
+        else:
+            add_ref(item)
+    add_ref(fallback_ref, "Primary reference image", "primary-reference")
+
+    limit = visual_int_setting("VISUAL_MAX_REFERENCE_IMAGES", 4, minimum=1, maximum=9)
+    return refs[:limit]
+
+
+def build_visual_prompt_context(*, task: dict[str, Any], record: dict[str, Any], reference_refs: list[dict[str, Any]]) -> dict[str, Any]:
+    product_title = (
+        clean_text(record.get("productTitle"))
+        or clean_text(record.get("title"))
+        or clean_text(record.get("productName"))
+        or clean_text(task.get("productTitle"))
+        or "Untitled product"
+    )
+    return {
+        "linkRecordId": clean_text(task.get("linkRecordId")) or clean_text(record.get("id")),
+        "productId": clean_text(task.get("productId")) or clean_text(record.get("productId")),
+        "mode": clean_text(task.get("mode")),
+        "requestedCount": task.get("requestedCount"),
+        "productTitle": product_title,
+        "skuNames": extract_record_sku_names(record),
+        "referenceImageBindingRule": (
+            "All reference images are selected SKU/product image parameters. "
+            "They must be treated as binding visual references. Preserve the exact product subject appearance "
+            "and do not replace selected SKU components with generic category items."
+        ),
+        "referenceImages": [
+            {
+                "index": index + 1,
+                "label": clean_text(ref.get("label") if isinstance(ref, dict) else ref) or f"Reference image {index + 1}",
+                "role": clean_text(ref.get("role") if isinstance(ref, dict) else "") or "reference-image",
+            }
+            for index, ref in enumerate(reference_refs)
+        ],
+    }
+
+
+def extract_record_sku_names(record: dict[str, Any]) -> list[str]:
+    sku_entries = record.get("skuEntries")
+    if not isinstance(sku_entries, list):
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(sku_entries, start=1):
+        if not isinstance(entry, dict):
+            continue
+        name = clean_text(entry.get("name")) or f"SKU {index}"
+        if name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names[:50]
+
+
+def materialize_reference_image_refs(reference_refs: list[dict[str, Any]], task_dir: Path) -> list[Path]:
+    paths: list[Path] = []
+    for index, ref in enumerate(reference_refs, start=1):
+        url = clean_text(ref.get("url") if isinstance(ref, dict) else ref)
+        if not url:
+            continue
+        try:
+            paths.append(materialize_image_ref(url, task_dir / f"reference_{index:02d}"))
+        except Exception as exc:
+            label = clean_text(ref.get("label") if isinstance(ref, dict) else "") or f"Reference image {index}"
+            raise VisualTaskError(f"reference image download failed ({label}): {exc}") from exc
+    return paths
 
 def materialize_image_ref(source_ref: str, target_without_suffix: Path) -> Path:
     clean_ref = clean_text(source_ref)

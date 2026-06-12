@@ -208,6 +208,19 @@ export type Link1688ImportResponse = YunqiImportResponse;
 
 export type DianxiaomiExportMode = 'distribution' | 'curated';
 
+export type DianxiaomiProductAttributeQueueSummary = {
+  queued: number;
+  running: number;
+  done: number;
+  failed: number;
+  pending: number;
+  total: number;
+  queuedNow?: number;
+  reused?: number;
+  processedNow?: number;
+  failedNow?: number;
+};
+
 export type LinkListRecordsResponse = {
   items: LinkListRecord[];
 };
@@ -276,6 +289,11 @@ export type VisualGenerationModule = {
   updatedAt: string;
 };
 
+export type VisualReferenceImageRef = {
+  url: string;
+  label?: string;
+};
+
 export type VisualGenerationTask = {
   id: string;
   userId: string;
@@ -286,6 +304,7 @@ export type VisualGenerationTask = {
   requestedCount: number;
   status: string;
   sourceImageRef?: string | null;
+  referenceImageRefs?: VisualReferenceImageRef[];
   record?: Record<string, unknown>;
   analysis?: Record<string, unknown>;
   promptText?: string;
@@ -306,10 +325,12 @@ export type VisualTaskCreatePayload = {
   layout?: '1x1' | '2x2' | '3x3' | string;
   requestedCount?: number;
   sourceImageRef?: string;
+  referenceImageRefs?: VisualReferenceImageRef[];
 };
 
 export type VisualTaskPlanPayload = {
   sourceImageRef?: string;
+  referenceImageRefs?: VisualReferenceImageRef[];
   allowShortLabels?: boolean;
   analysisModel?: string;
   promptModel?: string;
@@ -321,6 +342,10 @@ export type VisualTaskGeneratePayload = {
   imageModel?: string;
   imageSize?: string;
   useReferenceImage?: boolean;
+};
+
+export type VisualTaskRunPayload = VisualTaskPlanPayload & VisualTaskGeneratePayload & {
+  applyToLinkRecord?: boolean;
 };
 
 export type VisualTaskSplitPayload = {
@@ -651,6 +676,33 @@ export async function deleteProduct(productId: string, scope: 'pool' | 'all' = '
   }
 }
 
+export async function prepareDianxiaomiProductAttributes(
+  records: LinkListRecord[],
+  processNow = false,
+): Promise<DianxiaomiProductAttributeQueueSummary> {
+  const response = await fetch(`${API_BASE_URL}/api/exports/dianxiaomi/product-attributes/prepare`, withSession({
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ records, process_now: processNow }),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json();
+}
+
+export async function fetchDianxiaomiProductAttributeStatus(): Promise<DianxiaomiProductAttributeQueueSummary> {
+  const response = await fetch(`${API_BASE_URL}/api/exports/dianxiaomi/product-attributes/status`, withSession({
+    headers: authHeaders(),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json();
+}
+
 export async function exportDianxiaomiTemuTemplate(
   records: LinkListRecord[],
   exportMode: DianxiaomiExportMode = 'curated',
@@ -884,6 +936,23 @@ export async function generateVisualGenerationTask(
   payload: VisualTaskGeneratePayload = {},
 ): Promise<VisualGenerationTask> {
   const response = await fetch(`${API_BASE_URL}/api/visual/tasks/${encodeURIComponent(taskId)}/generate`, withSession({
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.item;
+}
+
+export async function runVisualGenerationTask(
+  taskId: string,
+  payload: VisualTaskRunPayload = {},
+): Promise<VisualGenerationTask> {
+  const response = await fetch(`${API_BASE_URL}/api/visual/tasks/${encodeURIComponent(taskId)}/run`, withSession({
     method: 'POST',
     headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify(payload),

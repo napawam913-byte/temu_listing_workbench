@@ -56,9 +56,9 @@ ALIYUN_OSS_PUBLIC_BASE_URL = os.getenv("ALIYUN_OSS_PUBLIC_BASE_URL", "").strip()
 ALIYUN_OSS_OBJECT_PREFIX = os.getenv("ALIYUN_OSS_OBJECT_PREFIX", "temu-listing").strip().strip("/")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
-OPENAI_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-4.1-mini").strip()
-OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1").strip()
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://svip.fluapi.com/v1").strip().rstrip("/")
+OPENAI_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-5.5").strip()
+OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2").strip()
 OPENAI_IMAGE_QUALITY = os.getenv("OPENAI_IMAGE_QUALITY", "medium").strip()
 
 VISUAL_DEFAULT_MODE = os.getenv("VISUAL_DEFAULT_MODE", "main-gallery").strip()

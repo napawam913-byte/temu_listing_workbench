@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.api.auth import require_current_user
@@ -14,12 +14,24 @@ from app.modules.visual_generation.service import (
     get_visual_task,
     list_visual_tasks,
     plan_visual_task,
+    run_visual_task_pipeline,
     split_mother_image_stateless,
     split_visual_task,
 )
 from app.modules.visual_generation.splitter import GridSplitError
 
 router = APIRouter(prefix="/api/visual", tags=["visual-generation"])
+
+
+class VisualReferenceImageRef(BaseModel):
+    url: str
+    label: str | None = None
+    role: str | None = None
+
+
+
+def visual_ref_to_dict(item: VisualReferenceImageRef) -> dict[str, Any]:
+    return item.model_dump() if hasattr(item, "model_dump") else item.dict()
 
 
 class VisualTaskCreateRequest(BaseModel):
@@ -30,10 +42,12 @@ class VisualTaskCreateRequest(BaseModel):
     layout: str | None = None
     requestedCount: int | None = Field(default=None, ge=1, le=9)
     sourceImageRef: str | None = None
+    referenceImageRefs: list[VisualReferenceImageRef] | None = None
 
 
 class VisualTaskPlanRequest(BaseModel):
     sourceImageRef: str | None = None
+    referenceImageRefs: list[VisualReferenceImageRef] | None = None
     allowShortLabels: bool | None = None
     analysisModel: str | None = None
     promptModel: str | None = None
@@ -45,6 +59,10 @@ class VisualTaskGenerateRequest(BaseModel):
     imageModel: str | None = None
     imageSize: str | None = None
     useReferenceImage: bool | None = None
+
+
+class VisualTaskRunRequest(VisualTaskPlanRequest, VisualTaskGenerateRequest):
+    applyToLinkRecord: bool | None = True
 
 
 class VisualTaskSplitRequest(BaseModel):
@@ -83,6 +101,7 @@ def create_task(payload: VisualTaskCreateRequest, current_user: dict[str, Any] =
             layout=payload.layout,
             requested_count=payload.requestedCount,
             source_image_ref=payload.sourceImageRef,
+            reference_image_refs=[visual_ref_to_dict(item) for item in payload.referenceImageRefs or []],
         )
     except (VisualTaskError, GridSplitError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -109,6 +128,7 @@ def plan_task(
                 task_id=task_id,
                 user_id=current_user["id"],
                 source_image_ref=payload.sourceImageRef,
+                reference_image_refs=[visual_ref_to_dict(item) for item in payload.referenceImageRefs or []],
                 allow_short_labels=payload.allowShortLabels,
                 analysis_model=payload.analysisModel,
                 prompt_model=payload.promptModel,
@@ -142,6 +162,38 @@ def generate_task(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except VisualGenerationError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post("/tasks/{task_id}/run")
+def run_task(
+    task_id: str,
+    payload: VisualTaskRunRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict[str, Any] = Depends(require_current_user),
+):
+    user_id = str(current_user["id"])
+    try:
+        task = get_visual_task(task_id=task_id, user_id=user_id)
+    except VisualTaskError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    background_tasks.add_task(
+        run_visual_task_pipeline,
+        task_id=task_id,
+        user_id=user_id,
+        source_image_ref=payload.sourceImageRef,
+        reference_image_refs=[visual_ref_to_dict(item) for item in payload.referenceImageRefs or []],
+        allow_short_labels=payload.allowShortLabels,
+        analysis_model=payload.analysisModel,
+        prompt_model=payload.promptModel,
+        split_after=True if payload.splitAfter is None else payload.splitAfter,
+        upload_to_oss=True if payload.uploadToOss is None else payload.uploadToOss,
+        image_model=payload.imageModel,
+        image_size=payload.imageSize,
+        use_reference_image=True if payload.useReferenceImage is None else payload.useReferenceImage,
+        apply_to_link_record=True if payload.applyToLinkRecord is None else payload.applyToLinkRecord,
+    )
+    return {"item": task, "queued": True}
 
 
 @router.post("/tasks/{task_id}/split")

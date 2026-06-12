@@ -38,6 +38,59 @@ type PasswordResetState = {
 };
 
 const SETTING_CATEGORY_ORDER = ['ai', 'visual', '1688', 'oss'];
+const AI_STAGE_CONFIGS = [
+  {
+    title: '标题生成',
+    apiKeyKey: 'OPENAI_TITLE_API_KEY',
+    baseUrlKey: 'OPENAI_TITLE_BASE_URL',
+    modelKey: 'OPENAI_TITLE_MODEL',
+    modelFallbackKey: 'OPENAI_TEXT_MODEL',
+    description: '中文标题、英文标题、变种值英文翻译',
+  },
+  {
+    title: '智能推荐',
+    apiKeyKey: 'OPENAI_RECOMMENDATION_API_KEY',
+    baseUrlKey: 'OPENAI_RECOMMENDATION_BASE_URL',
+    modelKey: 'OPENAI_RECOMMENDATION_MODEL',
+    modelFallbackKey: 'OPENAI_TEXT_MODEL',
+    description: '商品标题、类目、图片分析和推荐关键词',
+  },
+  {
+    title: '产品属性填写',
+    apiKeyKey: 'OPENAI_PRODUCT_ATTRIBUTE_API_KEY',
+    baseUrlKey: 'OPENAI_PRODUCT_ATTRIBUTE_BASE_URL',
+    modelKey: 'OPENAI_PRODUCT_ATTRIBUTE_MODEL',
+    modelFallbackKey: 'OPENAI_TEXT_MODEL',
+    description: '导出时根据类目属性库和商品信息填写产品属性',
+  },
+  {
+    title: '图片理解',
+    apiKeyKey: 'OPENAI_VISUAL_ANALYSIS_API_KEY',
+    baseUrlKey: 'OPENAI_VISUAL_ANALYSIS_BASE_URL',
+    modelKey: 'OPENAI_VISUAL_ANALYSIS_MODEL',
+    modelFallbackKey: 'OPENAI_TEXT_MODEL',
+    description: '生图前分析主体、材质、结构、风险和画风',
+  },
+  {
+    title: '提示词规划',
+    apiKeyKey: 'OPENAI_VISUAL_PROMPT_API_KEY',
+    baseUrlKey: 'OPENAI_VISUAL_PROMPT_BASE_URL',
+    modelKey: 'OPENAI_VISUAL_PROMPT_MODEL',
+    modelFallbackKey: 'OPENAI_TEXT_MODEL',
+    description: '把分析结果转成九宫格或四宫格母图提示词',
+  },
+  {
+    title: '图片生成',
+    apiKeyKey: 'OPENAI_IMAGE_API_KEY',
+    baseUrlKey: 'OPENAI_IMAGE_BASE_URL',
+    modelKey: 'OPENAI_IMAGE_MODEL',
+    description: '实际生成母图、单图精修和 SKU 适配图',
+  },
+];
+
+const AI_STAGE_SETTING_KEYS = new Set(
+  AI_STAGE_CONFIGS.flatMap((stage) => [stage.apiKeyKey, stage.baseUrlKey, stage.modelKey]),
+);
 
 function categoryLabel(category: string) {
   if (category === 'ai') return 'AI 配置';
@@ -48,7 +101,7 @@ function categoryLabel(category: string) {
 }
 
 function categoryDescription(category: string) {
-  if (category === 'ai') return '管理 LaoZhang / OpenAI 兼容接口、文本模型和基础生图模型。';
+  if (category === 'ai') return '管理 FluAPI / OpenAI 兼容接口、文本模型和基础生图模型。';
   if (category === 'visual') return '管理母图任务、九宫格切图、图生图参考和 OSS 上传默认策略。';
   if (category === '1688') return '管理 1688 搜图 API 服务，用于后续同款或相关货源检索。';
   if (category === 'oss') return '管理阿里云 OSS 图片存储，用于导出模板中的公网图片链接。';
@@ -62,11 +115,21 @@ function sourceLabel(source: string) {
   return source;
 }
 
+function settingValue(setting?: AdminSetting) {
+  return setting?.value || setting?.maskedValue || '';
+}
+
+function secretSettingDisplay(setting?: AdminSetting, fallbackSetting?: AdminSetting) {
+  return setting?.maskedValue || fallbackSetting?.maskedValue || '';
+}
+
 export function AdminPage() {
   const [form] = Form.useForm<UserCreateForm>();
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [settings, setSettings] = useState<AdminSetting[]>([]);
   const [settingDrafts, setSettingDrafts] = useState<Record<string, string>>({});
+  const [secretEditingKeys, setSecretEditingKeys] = useState<Record<string, boolean>>({});
+  const [editingAiStageKey, setEditingAiStageKey] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
   const [creatingUser, setCreatingUser] = useState(false);
@@ -81,6 +144,7 @@ export function AdminPage() {
       setSettingDrafts(
         Object.fromEntries(nextSettings.map((setting) => [setting.key, setting.isSecret ? '' : setting.value || ''])),
       );
+      setSecretEditingKeys({});
     } catch (error) {
       message.error(error instanceof Error ? error.message : '管理员数据读取失败');
     } finally {
@@ -134,11 +198,22 @@ export function AdminPage() {
 
   const saveSettings = async () => {
     const items: AdminSettingsUpdateItem[] = [];
+    const knownSettingKeys = new Set<string>();
     settings.forEach((setting) => {
+      knownSettingKeys.add(setting.key);
       const value = settingDrafts[setting.key] ?? '';
       if (setting.isSecret && !value) return;
       if (!setting.isSecret && value === (setting.value || '')) return;
       items.push({ key: setting.key, value });
+    });
+
+    AI_STAGE_CONFIGS.forEach((stage) => {
+      [stage.apiKeyKey, stage.baseUrlKey, stage.modelKey].forEach((key) => {
+        if (knownSettingKeys.has(key)) return;
+        const value = settingDrafts[key] ?? '';
+        if (!value) return;
+        items.push({ key, value });
+      });
     });
 
     if (items.length === 0) {
@@ -153,6 +228,7 @@ export function AdminPage() {
       setSettingDrafts(
         Object.fromEntries(nextSettings.map((setting) => [setting.key, setting.isSecret ? '' : setting.value || ''])),
       );
+      setSecretEditingKeys({});
       message.success('配置已保存');
     } catch (error) {
       message.error(error instanceof Error ? error.message : '配置保存失败');
@@ -172,6 +248,13 @@ export function AdminPage() {
         (SETTING_CATEGORY_ORDER.indexOf(right) === -1 ? 99 : SETTING_CATEGORY_ORDER.indexOf(right)),
     );
   }, [settings]);
+
+  const settingsByKey = useMemo(() => new Map(settings.map((setting) => [setting.key, setting])), [settings]);
+
+  const editingAiStage = useMemo(
+    () => AI_STAGE_CONFIGS.find((stage) => stage.modelKey === editingAiStageKey) || null,
+    [editingAiStageKey],
+  );
 
   const userColumns: ColumnsType<AdminUser> = [
     {
@@ -238,6 +321,19 @@ export function AdminPage() {
       ),
     },
   ];
+
+  const editingStageApiKeySetting = editingAiStage ? settingsByKey.get(editingAiStage.apiKeyKey) : undefined;
+  const editingStageBaseUrlSetting = editingAiStage ? settingsByKey.get(editingAiStage.baseUrlKey) : undefined;
+  const editingStageModelSetting = editingAiStage ? settingsByKey.get(editingAiStage.modelKey) : undefined;
+  const editingStageFallbackModelSetting =
+    editingAiStage && editingAiStage.modelFallbackKey ? settingsByKey.get(editingAiStage.modelFallbackKey) : undefined;
+  const commonApiKeySetting = settingsByKey.get('OPENAI_API_KEY');
+  const commonBaseUrlSetting = settingsByKey.get('OPENAI_BASE_URL');
+  const editingStageApiKeyEditing = editingAiStage ? Boolean(secretEditingKeys[editingAiStage.apiKeyKey]) : false;
+  const editingStageApiKeyDraft = editingAiStage ? settingDrafts[editingAiStage.apiKeyKey] ?? '' : '';
+  const editingStageApiKeyDisplay = secretSettingDisplay(editingStageApiKeySetting, commonApiKeySetting);
+  const editingStageBaseUrlDraft = editingAiStage ? settingDrafts[editingAiStage.baseUrlKey] ?? '' : '';
+  const editingStageModelDraft = editingAiStage ? settingDrafts[editingAiStage.modelKey] ?? '' : '';
 
   return (
     <div className="admin-page">
@@ -324,7 +420,57 @@ export function AdminPage() {
                           <Typography.Text strong>{categoryLabel(category)}</Typography.Text>
                           <Typography.Text type="secondary">{categoryDescription(category)}</Typography.Text>
                         </div>
-                        {groupSettings.map((setting) => (
+                        {category === 'ai' ? (
+                          <div className="admin-model-stage-grid">
+                            {AI_STAGE_CONFIGS.map((stage) => {
+                              const settingMap = new Map(groupSettings.map((setting) => [setting.key, setting]));
+                              const apiKeySetting = settingMap.get(stage.apiKeyKey);
+                              const baseUrlSetting = settingMap.get(stage.baseUrlKey);
+                              const modelSetting = settingMap.get(stage.modelKey);
+                              const fallbackSetting = stage.modelFallbackKey
+                                ? settingMap.get(stage.modelFallbackKey)
+                                : undefined;
+                              const modelDraft = settingDrafts[stage.modelKey] ?? '';
+                              const modelValue = modelDraft || settingValue(modelSetting) || settingValue(fallbackSetting) || '未配置';
+                              const apiKeyInherited = !apiKeySetting?.configured && !settingDrafts[stage.apiKeyKey];
+                              const baseUrlInherited = !baseUrlSetting?.configured && !settingDrafts[stage.baseUrlKey];
+                              return (
+                                <div className="admin-model-stage-card" key={stage.modelKey}>
+                                  <div className="admin-model-stage-title">
+                                    <Typography.Text strong>{stage.title}</Typography.Text>
+                                    <Typography.Text type="secondary">{stage.description}</Typography.Text>
+                                  </div>
+                                  <div className="admin-model-stage-summary">
+                                    <div className="admin-model-stage-model">
+                                      <span>当前模型</span>
+                                      <Tag color={modelSetting?.configured || modelDraft ? 'blue' : 'default'}>{modelValue}</Tag>
+                                    </div>
+                                    <Button size="small" onClick={() => setEditingAiStageKey(stage.modelKey)}>
+                                      编辑接口
+                                    </Button>
+                                  </div>
+                                  <Space size={6} wrap>
+                                    <Tag color={apiKeyInherited ? 'gold' : 'green'}>
+                                      {apiKeyInherited ? 'Key 继承通用' : 'Key 独立配置'}
+                                    </Tag>
+                                    <Tag color={baseUrlInherited ? 'gold' : 'green'}>
+                                      {baseUrlInherited ? 'URL 继承通用' : 'URL 独立配置'}
+                                    </Tag>
+                                    <Tag color={modelSetting?.configured ? 'blue' : 'default'}>{modelValue}</Tag>
+                                  </Space>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        ) : null}
+                        {(category === 'ai'
+                          ? groupSettings.filter((setting) => !AI_STAGE_SETTING_KEYS.has(setting.key))
+                          : groupSettings
+                        ).map((setting) => {
+                          const settingSecretEditing = Boolean(secretEditingKeys[setting.key]);
+                          const settingSecretDraft = settingDrafts[setting.key] ?? '';
+                          const settingSecretDisplay = setting.maskedValue || '';
+                          return (
                           <div className="admin-setting-row" key={setting.key}>
                             <div className="admin-setting-meta">
                               <Typography.Text strong>{setting.label}</Typography.Text>
@@ -340,8 +486,22 @@ export function AdminPage() {
                             </div>
                             {setting.isSecret ? (
                               <Input.Password
-                                placeholder="留空表示不修改密钥"
-                                value={settingDrafts[setting.key] ?? ''}
+                                placeholder={settingSecretEditing ? '输入新的密钥，留空不修改' : '未配置密钥'}
+                                value={settingSecretEditing ? settingSecretDraft : settingSecretDraft || settingSecretDisplay}
+                                onFocus={() =>
+                                  setSecretEditingKeys((current) => ({
+                                    ...current,
+                                    [setting.key]: true,
+                                  }))
+                                }
+                                onBlur={() => {
+                                  if (settingDrafts[setting.key]) return;
+                                  setSecretEditingKeys((current) => {
+                                    const next = { ...current };
+                                    delete next[setting.key];
+                                    return next;
+                                  });
+                                }}
                                 onChange={(event) =>
                                   setSettingDrafts((current) => ({
                                     ...current,
@@ -362,7 +522,8 @@ export function AdminPage() {
                               />
                             )}
                           </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     ),
                   }))}
@@ -372,6 +533,96 @@ export function AdminPage() {
           },
         ]}
       />
+
+      <Modal
+        title={editingAiStage ? `${editingAiStage.title}接口配置` : '接口配置'}
+        open={Boolean(editingAiStage)}
+        okText="保存配置"
+        cancelText="关闭"
+        confirmLoading={savingSettings}
+        onOk={async () => {
+          await saveSettings();
+          setEditingAiStageKey(null);
+        }}
+        onCancel={() => setEditingAiStageKey(null)}
+      >
+        {editingAiStage ? (
+          <div className="admin-stage-config-modal">
+            <div className="admin-stage-config-head">
+              <Typography.Text type="secondary">{editingAiStage.description}</Typography.Text>
+              <Space size={6} wrap>
+                <Tag color={editingStageApiKeySetting?.configured ? 'green' : 'gold'}>
+                  {editingStageApiKeySetting?.configured ? 'Key 独立配置' : 'Key 继承通用'}
+                </Tag>
+                <Tag color={editingStageBaseUrlSetting?.configured ? 'green' : 'gold'}>
+                  {editingStageBaseUrlSetting?.configured ? 'URL 独立配置' : 'URL 继承通用'}
+                </Tag>
+              </Space>
+            </div>
+            <label className="admin-stage-config-field">
+              <span>模型名称</span>
+              <Input
+                placeholder={settingValue(editingStageFallbackModelSetting) || 'gpt-5.5'}
+                value={editingStageModelDraft}
+                onChange={(event) =>
+                  setSettingDrafts((current) => ({
+                    ...current,
+                    [editingAiStage.modelKey]: event.target.value,
+                  }))
+                }
+              />
+            </label>
+            <label className="admin-stage-config-field">
+              <span>API Key</span>
+              <Input.Password
+                placeholder={editingStageApiKeyEditing ? '输入新的 API Key，留空不修改' : '未配置 API Key'}
+                value={
+                  editingStageApiKeyEditing
+                    ? editingStageApiKeyDraft
+                    : editingStageApiKeyDraft || editingStageApiKeyDisplay
+                }
+                onFocus={() =>
+                  setSecretEditingKeys((current) => ({
+                    ...current,
+                    [editingAiStage.apiKeyKey]: true,
+                  }))
+                }
+                onBlur={() => {
+                  if (settingDrafts[editingAiStage.apiKeyKey]) return;
+                  setSecretEditingKeys((current) => {
+                    const next = { ...current };
+                    delete next[editingAiStage.apiKeyKey];
+                    return next;
+                  });
+                }}
+                onChange={(event) =>
+                  setSettingDrafts((current) => ({
+                    ...current,
+                    [editingAiStage.apiKeyKey]: event.target.value,
+                  }))
+                }
+              />
+            </label>
+            <label className="admin-stage-config-field">
+              <span>Base URL</span>
+              <Input
+                placeholder={
+                  settingValue(commonBaseUrlSetting)
+                    ? `留空继承通用 Base URL：${settingValue(commonBaseUrlSetting)}`
+                    : '留空继承通用 Base URL'
+                }
+                value={editingStageBaseUrlDraft}
+                onChange={(event) =>
+                  setSettingDrafts((current) => ({
+                    ...current,
+                    [editingAiStage.baseUrlKey]: event.target.value,
+                  }))
+                }
+              />
+            </label>
+          </div>
+        ) : null}
+      </Modal>
 
       <Modal
         title={`重置密码：${passwordReset.user?.username || ''}`}

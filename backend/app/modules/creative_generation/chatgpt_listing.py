@@ -73,9 +73,10 @@ class OpenAISettings:
 
 
 def generate_listing_package(record: dict[str, Any], *, generate_images: bool = True) -> dict[str, Any]:
-    settings = get_openai_settings()
+    title_settings = get_openai_settings("title")
+    image_settings = get_openai_settings("image")
     safe_title_cn, blocked_terms = sanitize_marketplace_text(record.get("productTitle"))
-    safe_title_en = generate_safe_english_title(record, safe_title_cn, settings if settings.api_key else None)
+    safe_title_en = generate_safe_english_title(record, safe_title_cn, title_settings if title_settings.api_key else None)
     title_terms = find_sensitive_terms(safe_title_en)
     if title_terms:
         safe_title_en, _ = sanitize_marketplace_text(safe_title_en)
@@ -98,14 +99,14 @@ def generate_listing_package(record: dict[str, Any], *, generate_images: bool = 
             "record": updated_record,
         }
 
-    if not settings.api_key:
+    if not image_settings.api_key:
         raise CreativeGenerationError("缺少 OPENAI_API_KEY，无法调用 ChatGPT 生图。已支持生成规划，请先配置 OpenAI API Key。")
 
     generated_images = []
     product_id = clean_key_part(record.get("productId") or record.get("id") or "product")
     for index, plan in enumerate(image_plan, start=1):
         prompt = build_image_prompt(record, safe_title_en, plan)
-        image_bytes = generate_image_bytes(prompt, settings)
+        image_bytes = generate_image_bytes(prompt, image_settings)
         upload = upload_generated_image(image_bytes, product_id, plan["key"])
         generated_images.append(
             {
@@ -155,12 +156,38 @@ def generate_listing_package(record: dict[str, Any], *, generate_images: bool = 
     }
 
 
-def get_openai_settings() -> OpenAISettings:
+def get_openai_settings(stage: str | None = None) -> OpenAISettings:
+    common_api_key = get_runtime_setting("OPENAI_API_KEY", OPENAI_API_KEY).strip()
+    common_base_url = get_runtime_setting("OPENAI_BASE_URL", OPENAI_BASE_URL).strip().rstrip("/")
+    common_text_model = get_runtime_setting("OPENAI_TEXT_MODEL", OPENAI_TEXT_MODEL).strip() or "gpt-5.5"
+    common_image_model = get_runtime_setting("OPENAI_IMAGE_MODEL", OPENAI_IMAGE_MODEL).strip() or "gpt-image-2"
+    stage_prefixes = {
+        "title": "OPENAI_TITLE",
+        "recommendation": "OPENAI_RECOMMENDATION",
+        "product_attribute": "OPENAI_PRODUCT_ATTRIBUTE",
+        "visual_analysis": "OPENAI_VISUAL_ANALYSIS",
+        "visual_prompt": "OPENAI_VISUAL_PROMPT",
+        "image": "OPENAI_IMAGE",
+    }
+    stage_key = clean_text(stage).lower().replace("-", "_")
+    prefix = stage_prefixes.get(stage_key)
+    if prefix:
+        api_key = get_runtime_setting(f"{prefix}_API_KEY", "").strip() or common_api_key
+        base_url = get_runtime_setting(f"{prefix}_BASE_URL", "").strip().rstrip("/") or common_base_url
+        text_model = get_runtime_setting(f"{prefix}_MODEL", "").strip() or common_text_model
+        image_model = get_runtime_setting("OPENAI_IMAGE_MODEL", OPENAI_IMAGE_MODEL).strip() or common_image_model
+        if stage_key == "image":
+            image_model = get_runtime_setting("OPENAI_IMAGE_MODEL", "").strip() or common_image_model
+    else:
+        api_key = common_api_key
+        base_url = common_base_url
+        text_model = common_text_model
+        image_model = common_image_model
     return OpenAISettings(
-        api_key=get_runtime_setting("OPENAI_API_KEY", OPENAI_API_KEY).strip(),
-        base_url=get_runtime_setting("OPENAI_BASE_URL", OPENAI_BASE_URL).strip().rstrip("/"),
-        text_model=get_runtime_setting("OPENAI_TEXT_MODEL", OPENAI_TEXT_MODEL).strip() or "gpt-4.1-mini",
-        image_model=get_runtime_setting("OPENAI_IMAGE_MODEL", OPENAI_IMAGE_MODEL).strip() or "gpt-image-1",
+        api_key=api_key,
+        base_url=base_url,
+        text_model=text_model,
+        image_model=image_model,
         image_quality=get_runtime_setting("OPENAI_IMAGE_QUALITY", OPENAI_IMAGE_QUALITY).strip() or "medium",
     )
 

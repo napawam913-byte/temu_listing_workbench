@@ -35,13 +35,15 @@ import {
   deleteProduct as deleteBackendProduct,
   deleteLinkListRecord,
   exportDianxiaomiTemuTemplate,
+  fetchVisualGenerationTask,
   fetchLinkListRecords,
   fetchProductCategories,
   fetchProductStats,
   fetchProducts,
   mapBackendProduct,
-  generateVisualGenerationTask,
-  planVisualGenerationTask,
+  prepareDianxiaomiProductAttributes,
+  fetchDianxiaomiProductAttributeStatus,
+  runVisualGenerationTask,
   saveLinkListRecord,
   saveLinkListRecords,
   regeneratePluginCreativeJob,
@@ -138,6 +140,8 @@ type VisualQueueItem = {
 
 const LINK_LIST_STORAGE_KEY = 'temuListingWorkbenchLinkListRecords';
 const CURATED_EXPORT_IMAGE_COUNT = 8;
+const FULL_MAIN_GALLERY_IMAGE_COUNT = 9;
+const COMPACT_MAIN_GALLERY_IMAGE_COUNT = 4;
 const MAX_EXPORT_CAROUSEL_IMAGE_COUNT = 10;
 const PRODUCT_IMAGE_SLOT_ROLES = [
   { kind: '01-hero-main', label: '主图' },
@@ -148,6 +152,7 @@ const PRODUCT_IMAGE_SLOT_ROLES = [
   { kind: '06-detail-size', label: '尺寸结构' },
   { kind: '07-comparison', label: '对比图' },
   { kind: '08-package-lineup', label: '组合包装' },
+  { kind: '09-selling-point', label: '卖点图' },
 ];
 
 function getLinkListStorageKey(userId: string) {
@@ -491,20 +496,45 @@ function getSelectedSkuImageRefDescriptors(record: LinkListRecord, selectedSkuId
   const entries =
     selectedSet.size > 0 ? record.skuEntries.filter((entry) => selectedSet.has(entry.id)) : record.skuEntries;
   const refs: Array<{ url: string; label: string }> = [];
-  const addRef = (value: string | undefined, label: string) => {
+  const seenUrls = new Set<string>();
+  const seenSubjects = new Set<string>();
+  const subjectKey = (value: string | undefined) => String(value || '').trim().toLowerCase().replace(/\s+/g, '');
+  const addRef = (value: string | undefined, label: string, subject?: string) => {
     const clean = String(value || '').trim();
-    if (clean && !refs.some((item) => item.url === clean)) refs.push({ url: clean, label });
+    const key = subjectKey(subject || label);
+    if (!clean || seenUrls.has(clean) || seenSubjects.has(key)) return false;
+    seenUrls.add(clean);
+    seenSubjects.add(key);
+    refs.push({ url: clean, label });
+    return true;
   };
 
   entries.forEach((entry) => {
-    const skuLabel = `SKU ${entry.order || ''}：${entry.name}`.trim();
-    addRef(getSkuDisplayImageUrl(entry), skuLabel);
-    (entry.sourceSkuLinks || []).forEach((link) => {
-      addRef(link.imageUrl, `货源 SKU：${link.specText || link.optionText || entry.name}`);
-    });
-    (entry.componentSkus || []).forEach((component) => {
-      addRef(component.sourceImageUrl || component.imageUrl, `组件：${component.name || component.specText || component.sourceTitle}`);
-    });
+    const skuName = String(entry.name || `SKU ${entry.order || ''}`).trim();
+    const skuLabel = `Selected SKU: ${skuName}`;
+    const components = entry.componentSkus || [];
+
+    if (entry.kind === 'combo' && components.length > 0) {
+      const addedComponentRef = components.reduce((added, component) => {
+        const componentName = String(component.name || component.specText || component.sourceTitle || skuName).trim();
+        return (
+          addRef(
+            component.sourceImageUrl || component.imageUrl,
+            `Selected SKU component: ${componentName}`,
+            componentName,
+          ) || added
+        );
+      }, false);
+      if (!addedComponentRef) {
+        addRef(getSkuDisplayImageUrl(entry), skuLabel, skuName);
+      }
+      return;
+    }
+
+    const addedEntryRef = addRef(getSkuDisplayImageUrl(entry), skuLabel, skuName);
+    if (!addedEntryRef) {
+      (entry.sourceSkuLinks || []).some((link) => addRef(link.imageUrl, skuLabel, skuName));
+    }
   });
 
   return refs;
@@ -1250,6 +1280,27 @@ function getVisualMotherImageUrl(item?: VisualQueueItem) {
   return item.motherImageUrl || (isRemoteImageUrl(item.motherImagePath) ? item.motherImagePath : undefined);
 }
 
+function getVisualReferenceImageRefs(item: VisualQueueItem) {
+  const urls = item.referenceImageUrls?.length
+    ? item.referenceImageUrls
+    : item.referenceImageUrl
+      ? [item.referenceImageUrl]
+      : [];
+  const labels = item.referenceImageLabels || [];
+  const seen = new Set<string>();
+  return urls
+    .map((url, index) => ({
+      url: String(url || '').trim(),
+      label: String(labels[index] || `Reference image ${index + 1}`).trim(),
+      role: item.mode === 'main_multi' || item.mode === 'sku_adapt' ? 'selected-sku-image' : 'reference-image',
+    }))
+    .filter((ref) => {
+      if (!ref.url || seen.has(ref.url)) return false;
+      seen.add(ref.url);
+      return true;
+    });
+}
+
 function getVisualInputPromptText(item: VisualQueueItem) {
   const fallbackReferenceCount =
     item.referenceImageUrls?.length || (item.referenceImageUrl ? 1 : 0);
@@ -1448,6 +1499,24 @@ function applyVisualGenerationResult(record: LinkListRecord, item: VisualQueueIt
     productImageGenerationCount: Math.max(record.productImageGenerationCount || 0, generatedModules.length),
     imageSlots: [...slotMap.values()].sort((left, right) => left.order - right.order),
   };
+}
+
+function waitForMs(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+async function waitForVisualGenerationTask(taskId: string, maxAttempts = 180): Promise<VisualGenerationTask> {
+  let lastTask: VisualGenerationTask | undefined;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const task = await fetchVisualGenerationTask(taskId);
+    lastTask = task;
+    if (task.status === 'completed' || task.status === 'split') return task;
+    if (task.status === 'failed') {
+      throw new Error(task.errorMessage || '生图任务执行失败');
+    }
+    await waitForMs(3000);
+  }
+  throw new Error(lastTask?.errorMessage || '生图任务仍在执行，请稍后打开任务队列查看');
 }
 
 function downloadBlob(blob: Blob, filename: string) {
@@ -1824,7 +1893,7 @@ function LinkListPanel({
     message.success('已加入统一任务队列');
   };
 
-  const enqueueMainGalleryFromSelectedSkus = () => {
+  const enqueueMainGalleryFromSelectedSkus = (requestedCount?: number) => {
     if (!imageManagerRecord || !imageManagerProductTask) return;
     if (imageManagerSelectedSkuIds.length === 0) {
       message.warning('请先选择要作为主图生成依据的 SKU');
@@ -1838,7 +1907,7 @@ function LinkListPanel({
     }
     enqueueVisualTask(imageManagerRecord, imageManagerProductTask, {
       mode: 'main_multi',
-      count: getRecordProductImageGenerationCount(imageManagerRecord),
+      count: requestedCount || getRecordProductImageGenerationCount(imageManagerRecord),
       referenceImageUrl: referenceImageUrls[0],
       referenceImageUrls,
       referenceImageLabels: referenceImageDescriptors.map((item) => item.label),
@@ -1924,6 +1993,9 @@ function LinkListPanel({
           }
         : record;
 
+    const referenceImageRefs = getVisualReferenceImageRefs(item);
+    const primaryReferenceImageUrl = referenceImageRefs[0]?.url || item.referenceImageUrl;
+
     const created = await createVisualGenerationTask({
       record: taskRecord,
       linkRecordId: record.id,
@@ -1931,39 +2003,45 @@ function LinkListPanel({
       mode: getVisualTaskApiMode(item.mode),
       layout: getVisualTaskLayout(item.requestedCount),
       requestedCount: item.requestedCount,
-      sourceImageRef: item.referenceImageUrl,
+      sourceImageRef: primaryReferenceImageUrl,
+      referenceImageRefs,
     });
 
     patchVisualQueueItem(item.id, () => ({
       backendTaskId: created.id,
       backendStatus: created.status,
-      statusLabel: '规划中',
+      statusLabel: '后台执行中',
       statusColor: 'processing',
-      modules: markModules('规划中', 'processing'),
+      modules: markModules('等待回写', 'processing'),
     }));
 
-    const planned = await planVisualGenerationTask(created.id, {
-      sourceImageRef: item.referenceImageUrl,
+    await runVisualGenerationTask(created.id, {
+      sourceImageRef: primaryReferenceImageUrl,
+      referenceImageRefs,
       allowShortLabels: true,
+      splitAfter: true,
+      uploadToOss: true,
+      useReferenceImage: true,
+      applyToLinkRecord: true,
     });
 
     patchVisualQueueItem(item.id, () => ({
       backendTaskId: created.id,
-      backendStatus: 'planned',
+      backendStatus: 'running',
       statusLabel: '生成中',
       statusColor: 'processing',
-      analysis: planned.analysis,
-      promptText: planned.promptText,
       modules: markModules('生成中', 'processing'),
     }));
 
-    const generated = await generateVisualGenerationTask(created.id, {
-      splitAfter: true,
-      uploadToOss: true,
-      useReferenceImage: true,
-    });
+    const generated = await waitForVisualGenerationTask(created.id);
     const itemWithBackendId = { ...item, backendTaskId: created.id };
-    const nextRecord = applyVisualGenerationResult(record, itemWithBackendId, generated);
+    let nextRecord = applyVisualGenerationResult(record, itemWithBackendId, generated);
+    try {
+      const refreshedRecords = await fetchLinkListRecords();
+      nextRecord = refreshedRecords.find((candidate) => candidate.id === record.id) || nextRecord;
+    } catch {
+      // The backend has the durable record; keep the task result visible if refresh is temporarily unavailable.
+    }
     recordMap.set(nextRecord.id, nextRecord);
     onUpdate(nextRecord);
     setPreviewRecord((current) => (current?.id === nextRecord.id ? nextRecord : current));
@@ -1981,8 +2059,8 @@ function LinkListPanel({
       statusLabel: completedCount > 0 ? '已回写' : '未返回图片',
       statusColor: completedCount > 0 ? 'green' : 'gold',
       completedCount,
-      analysis: generated.analysis || planned.analysis,
-      promptText: generated.promptText || planned.promptText,
+      analysis: generated.analysis,
+      promptText: generated.promptText,
       motherImageUrl: generated.motherImageUrl || undefined,
       motherImagePath: generated.motherImagePath || undefined,
       manifest: generated.manifest,
@@ -2976,10 +3054,24 @@ function LinkListPanel({
                 </Button>
                 <Button
                   type="primary"
-                  disabled={!imageManagerProductTask || imageManagerSelectedSkuIds.length === 0}
-                  onClick={enqueueMainGalleryFromSelectedSkus}
+                  disabled={
+                    !imageManagerProductTask ||
+                    imageManagerSelectedSkuIds.length === 0 ||
+                    getSelectedSkuImageRefDescriptors(imageManagerRecord, imageManagerSelectedSkuIds).length === 0
+                  }
+                  onClick={() => enqueueMainGalleryFromSelectedSkus(FULL_MAIN_GALLERY_IMAGE_COUNT)}
                 >
-                  主图全量生成
+                  主图全量生成 9张
+                </Button>
+                <Button
+                  disabled={
+                    !imageManagerProductTask ||
+                    imageManagerSelectedSkuIds.length === 0 ||
+                    getSelectedSkuImageRefDescriptors(imageManagerRecord, imageManagerSelectedSkuIds).length === 0
+                  }
+                  onClick={() => enqueueMainGalleryFromSelectedSkus(COMPACT_MAIN_GALLERY_IMAGE_COUNT)}
+                >
+                  主图全量生成 4张
                 </Button>
                 <Button
                   disabled={!imageManagerSkuTask || imageManagerRecord.skuEntries.length === 0}
@@ -3751,12 +3843,35 @@ export function SelectProductPage({
 
     setExportingTemplate(true);
     try {
-      const syncResult = await syncPluginCreativeJobs(linkListRecords);
-      const recordsForExport = syncResult.records;
-      if (syncResult.records.length > 0) {
-        setLinkListRecords(syncResult.records);
-        writeLinkListRecords(syncResult.records, currentUser.id);
-        void saveLinkListRecords(syncResult.records).catch(warnLinkPersistenceFailure);
+      let recordsForExport = linkListRecords;
+      try {
+        const syncResult = await syncPluginCreativeJobs(linkListRecords);
+        recordsForExport = syncResult.records.length > 0 ? syncResult.records : linkListRecords;
+        if (syncResult.records.length > 0) {
+          setLinkListRecords(syncResult.records);
+          writeLinkListRecords(syncResult.records, currentUser.id);
+          void saveLinkListRecords(syncResult.records).catch(warnLinkPersistenceFailure);
+        }
+      } catch {
+        message.warning('插件旧任务同步失败，已跳过同步并继续使用当前链接列表数据导出');
+      }
+
+      let attributeSummary = await prepareDianxiaomiProductAttributes(recordsForExport);
+      if (attributeSummary.pending > 0) {
+        const closeLoading = message.loading('Product attributes are being generated before export...', 0);
+        try {
+          for (let index = 0; index < 60 && attributeSummary.pending > 0; index += 1) {
+            await waitForMs(2000);
+            attributeSummary = await fetchDianxiaomiProductAttributeStatus();
+          }
+        } finally {
+          closeLoading();
+        }
+      }
+      if (attributeSummary.pending > 0) {
+        message.warning('Product attribute queue is still running. The export will use completed attributes and leave unfinished ones blank.');
+      } else if (attributeSummary.failed > 0) {
+        message.warning('Some product attributes failed to generate. Those rows will be exported with blank attributes.');
       }
 
       const blob = await exportDianxiaomiTemuTemplate(recordsForExport);

@@ -215,7 +215,7 @@ def normalize_selected_keywords(keywords: list[dict[str, Any] | str] | None) -> 
 
 
 def analyze_product_for_1688(product: dict[str, Any]) -> dict[str, Any]:
-    settings = get_openai_settings()
+    settings = get_openai_settings("recommendation")
     title = clean_text(product.get("title") or product.get("titleEn"))
     category = clean_text(product.get("category") or product.get("categoryPath"))
     main_image_url = clean_text(product.get("mainImageUrl") or product.get("main_image_url"))

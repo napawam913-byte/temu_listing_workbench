@@ -265,6 +265,7 @@ def init_db() -> None:
         ensure_column(conn, "products", "source_type", "source_type TEXT NOT NULL DEFAULT 'yunqi'")
         ensure_column(conn, "products", "in_product_pool", "in_product_pool INTEGER NOT NULL DEFAULT 1")
         ensure_link_list_schema(conn)
+        ensure_export_product_attribute_schema(conn)
         seed_default_user(conn)
         ensure_product_identity_index(conn)
         ensure_yunqi_category_schema(conn)
@@ -312,6 +313,36 @@ def ensure_link_list_schema(conn: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_link_list_records_user_status
             ON link_list_records(user_id, status)
+        """
+    )
+
+
+def ensure_export_product_attribute_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS export_product_attribute_jobs (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL DEFAULT 'default-user',
+            link_record_id TEXT NOT NULL,
+            product_id TEXT,
+            product_title TEXT,
+            category_id TEXT,
+            category_path TEXT,
+            product_attribute_text TEXT NOT NULL DEFAULT '',
+            product_attributes_json TEXT NOT NULL DEFAULT '{}',
+            record_hash TEXT NOT NULL DEFAULT '',
+            record_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'queued',
+            error_message TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_export_attr_jobs_user_status
+            ON export_product_attribute_jobs(user_id, status, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_export_attr_jobs_record
+            ON export_product_attribute_jobs(user_id, link_record_id, record_hash);
         """
     )
 

@@ -273,10 +273,13 @@ def has_moq_marker(value: str) -> bool:
 
 
 def get_title_optimizer_settings() -> TitleOptimizerSettings:
+    common_api_key = get_runtime_setting("OPENAI_API_KEY", OPENAI_API_KEY).strip()
+    common_base_url = get_runtime_setting("OPENAI_BASE_URL", OPENAI_BASE_URL).strip().rstrip("/")
+    common_text_model = get_runtime_setting("OPENAI_TEXT_MODEL", OPENAI_TEXT_MODEL).strip() or "gpt-5.5"
     return TitleOptimizerSettings(
-        api_key=get_runtime_setting("OPENAI_API_KEY", OPENAI_API_KEY).strip(),
-        base_url=get_runtime_setting("OPENAI_BASE_URL", OPENAI_BASE_URL).strip().rstrip("/"),
-        text_model=get_runtime_setting("OPENAI_TEXT_MODEL", OPENAI_TEXT_MODEL).strip() or "gpt-4.1-mini",
+        api_key=get_runtime_setting("OPENAI_TITLE_API_KEY", "").strip() or common_api_key,
+        base_url=get_runtime_setting("OPENAI_TITLE_BASE_URL", "").strip().rstrip("/") or common_base_url,
+        text_model=get_runtime_setting("OPENAI_TITLE_MODEL", "").strip() or common_text_model,
     )
 
 
