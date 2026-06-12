@@ -1,4 +1,4 @@
-﻿* {
+* {
   box-sizing: border-box;
 }
 
@@ -1505,6 +1505,430 @@ body {
 .image-manager-task-workbench {
   display: grid;
   gap: 14px;
+}
+
+
+.image-editor-modal .ant-modal-body {
+  background: #f6f8fb;
+  max-height: min(760px, calc(100vh - 150px));
+  overflow: auto;
+  padding: 16px;
+}
+
+.image-editor-shell {
+  display: grid;
+  gap: 12px;
+}
+
+.image-editor-toolbar {
+  align-items: center;
+  background: #ffffff;
+  border: 1px solid #dbe3ef;
+  border-radius: 12px;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  padding: 12px;
+}
+
+.image-editor-toolbar > div:first-child,
+.image-editor-panel-head > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.image-editor-grid {
+  align-items: start;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 320px minmax(0, 1fr);
+}
+
+.image-editor-library,
+.image-editor-preview-panel {
+  background: #ffffff;
+  border: 1px solid #dbe3ef;
+  border-radius: 12px;
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  padding: 12px;
+}
+
+.image-editor-panel-head {
+  align-items: start;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.image-editor-library .image-editor-panel-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.image-editor-library-actions {
+  display: grid !important;
+  gap: 6px !important;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  width: 100%;
+}
+
+.image-editor-library-actions .ant-space-item {
+  min-width: 0;
+}
+
+.image-editor-library-actions .ant-space-item:first-child {
+  grid-column: 1 / -1;
+  justify-self: end;
+}
+
+.image-editor-library-actions .ant-btn {
+  border-radius: 7px;
+  font-weight: 600;
+  padding-inline: 6px;
+  width: 100%;
+}
+
+.image-editor-library-actions .ant-btn[disabled] {
+  background: #f8fafc;
+  color: #94a3b8;
+}
+
+.image-editor-action-count {
+  background: #f8fafc;
+  border-color: #dbe3ef;
+  color: #334155;
+  font-weight: 600;
+  margin-inline-end: 0;
+}
+
+.image-editor-preview-panel .image-editor-panel-head {
+  align-items: center;
+}
+
+.image-editor-preview-actions {
+  flex: 0 0 auto;
+  justify-content: flex-end;
+  max-width: 360px;
+}
+
+.image-editor-preview-actions .ant-btn {
+  border-radius: 7px;
+  font-weight: 600;
+}
+
+.image-editor-library-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  max-height: 590px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.image-editor-library-card {
+  align-content: start;
+  align-items: stretch;
+  background: #fbfdff;
+  border: 1px solid #e2e8f0;
+  border-radius: 9px;
+  color: inherit;
+  cursor: pointer;
+  display: grid;
+  gap: 7px;
+  grid-template-rows: 78px minmax(0, 1fr);
+  height: 126px;
+  padding: 7px;
+  position: relative;
+  text-align: left;
+}
+
+.image-editor-library-card:hover,
+.image-editor-library-card:focus-visible {
+  border-color: #1677ff;
+  outline: 0;
+}
+
+.image-editor-library-card.is-selected {
+  background: #eef6ff;
+  border-color: #1677ff;
+  box-shadow: inset 0 0 0 1px #1677ff;
+}
+
+.image-editor-library-check {
+  align-items: center;
+  background: #1677ff;
+  border-radius: 999px;
+  color: #ffffff;
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 700;
+  height: 20px;
+  justify-content: center;
+  position: absolute;
+  right: 7px;
+  top: 7px;
+  width: 20px;
+  z-index: 2;
+}
+
+.image-editor-library-card:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.image-editor-library-card .ant-image,
+.image-editor-library-card .ant-image-img {
+  border-radius: 8px;
+  display: block;
+  height: 78px;
+  object-fit: cover;
+  width: 100%;
+}
+
+.image-editor-library-card > span,
+.image-editor-main-thumb-card,
+.image-editor-sku-thumb-grid > div {
+  min-width: 0;
+}
+
+.image-editor-library-info {
+  align-items: start;
+  display: grid;
+  gap: 3px;
+}
+
+.image-editor-library-card strong,
+.image-editor-sku-thumb-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.image-editor-library-card strong {
+  color: #0f172a;
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.image-editor-source-badge {
+  border: 1px solid #dbeafe;
+  border-radius: 5px;
+  display: inline-flex;
+  font-size: 11px;
+  font-weight: 600;
+  justify-self: start;
+  line-height: 16px;
+  padding: 0 5px;
+}
+
+.image-editor-source-collected {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+  color: #2563eb;
+}
+
+.image-editor-source-generated {
+  background: #f5f3ff;
+  border-color: #ddd6fe;
+  color: #7c3aed;
+}
+
+.image-editor-source-sku {
+  background: #fff7ed;
+  border-color: #fed7aa;
+  color: #c2410c;
+}
+
+.image-editor-compact-preview {
+  display: grid;
+  gap: 14px;
+}
+
+.image-editor-mini-section {
+  background: #ffffff;
+  border: 1px solid #edf2f7;
+  border-radius: 10px;
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+}
+
+.image-editor-mini-head {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.image-editor-mini-head .ant-typography-secondary {
+  font-size: 12px;
+  overflow: hidden;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.image-editor-main-thumb-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+  max-height: 248px;
+  overflow: auto;
+  padding: 1px 2px 2px 1px;
+}
+
+.image-editor-main-thumb-card {
+  align-items: center;
+  background: #fbfdff;
+  border: 1px solid #dbe3ef;
+  border-radius: 9px;
+  color: #334155;
+  cursor: pointer;
+  display: grid;
+  gap: 6px;
+  justify-items: center;
+  min-height: 98px;
+  padding: 9px 7px 8px;
+  position: relative;
+  user-select: none;
+}
+
+.image-editor-main-thumb-card.is-active {
+  background: #eef6ff;
+  border-color: #1677ff;
+}
+
+.image-editor-main-thumb-card.is-selected {
+  box-shadow: inset 0 0 0 1px #1677ff;
+}
+
+.image-editor-thumb-order {
+  align-items: center;
+  background: #1677ff;
+  border-radius: 0 0 7px 0;
+  color: #ffffff;
+  display: inline-flex;
+  font-size: 11px;
+  font-weight: 700;
+  height: 20px;
+  justify-content: center;
+  left: 0;
+  position: absolute;
+  top: 0;
+  width: 20px;
+}
+
+.image-editor-thumb-remove {
+  align-items: center;
+  background: rgba(15, 23, 42, 0.76);
+  border: 0;
+  border-radius: 999px;
+  color: #ffffff;
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 14px;
+  height: 20px;
+  justify-content: center;
+  line-height: 20px;
+  opacity: 0;
+  padding: 0;
+  position: absolute;
+  right: 6px;
+  top: 6px;
+  transition: opacity 0.16s ease, background-color 0.16s ease;
+  width: 20px;
+  z-index: 3;
+}
+
+.image-editor-main-thumb-card:hover .image-editor-thumb-remove,
+.image-editor-sku-thumb-grid > div:hover .image-editor-thumb-remove,
+.image-editor-thumb-remove:focus-visible {
+  opacity: 1;
+}
+
+.image-editor-thumb-remove:hover {
+  background: #ef4444;
+}
+
+.image-editor-main-thumb-image,
+.image-editor-sku-thumb-image {
+  align-items: center;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 7px;
+  color: #94a3b8;
+  display: flex;
+  font-size: 11px;
+  font-weight: 700;
+  height: 56px;
+  justify-content: center;
+  overflow: hidden;
+  width: 56px;
+}
+
+.image-editor-thumb-caption {
+  color: #475569;
+  font-size: 12px;
+  line-height: 16px;
+}
+
+.image-editor-main-thumb-image .ant-image,
+.image-editor-main-thumb-image .ant-image-img,
+.image-editor-sku-thumb-image .ant-image,
+.image-editor-sku-thumb-image .ant-image-img {
+  display: block;
+  height: 100% !important;
+  object-fit: cover;
+  width: 100% !important;
+}
+
+.image-editor-sku-thumb-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  max-height: 330px;
+  overflow: auto;
+  padding: 1px 2px 2px 1px;
+}
+
+.image-editor-sku-thumb-grid > div {
+  align-items: center;
+  background: #fbfdff;
+  border: 1px solid #dbe3ef;
+  border-radius: 9px;
+  color: inherit;
+  cursor: pointer;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) 48px;
+  min-height: 68px;
+  padding: 8px;
+  position: relative;
+  text-align: left;
+  user-select: none;
+}
+
+.image-editor-sku-thumb-grid > div.is-active {
+  background: #eef6ff;
+  border-color: #1677ff;
+  box-shadow: inset 0 0 0 1px #1677ff;
+}
+
+.image-editor-sku-thumb-name {
+  color: #111827;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 18px;
+}
+
+.image-editor-sku-thumb-image {
+  height: 48px;
+  justify-self: end;
+  width: 48px;
 }
 
 .style-lock-card {

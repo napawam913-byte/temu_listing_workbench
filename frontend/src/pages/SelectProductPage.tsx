@@ -2783,7 +2783,6 @@ function LinkListPanel({
                         }}
                       >
                         <span className="image-manager-preview-thumb-index">{index + 1}</span>
-                        {selected ? <span className="image-manager-preview-thumb-check">✓</span> : null}
                         <Image
                           alt={`${imageManagerRecord.productTitle} 商品图 ${index + 1}`}
                           height={64}
