@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from app.modules.visual_generation.clients import (
     get_ai_settings,
     get_ai_stage_settings,
     get_runtime_setting,
+    is_rate_limit_error,
     is_request_too_large_error,
     request_generated_image,
 )
@@ -43,6 +45,7 @@ IMAGE_PAYLOAD_RETRY_PROFILES = [
     {"max_side": 960, "quality": 78, "label": "compressed-960"},
     {"max_side": 768, "quality": 74, "label": "compressed-768"},
 ]
+IMAGE_RATE_LIMIT_RETRY_DELAYS_SECONDS = (0, 8, 16, 30)
 
 
 class VisualTaskError(ValueError):
@@ -273,27 +276,38 @@ def request_generated_image_with_payload_retry(
     reference_image_paths: list[Path],
 ) -> bytes:
     last_error: Exception | None = None
-    for active_prompt in (prompt, compact_prompt):
-        for index, image_profile in enumerate(IMAGE_PAYLOAD_RETRY_PROFILES):
-            try:
-                return request_generated_image(
-                    api_url=api_url,
-                    api_key=api_key,
-                    model=model,
-                    size=size,
-                    prompt=active_prompt,
-                    reference_image_path=reference_image_path,
-                    reference_image_paths=reference_image_paths,
-                    reference_image_max_side=image_profile["max_side"],
-                    reference_image_quality=image_profile["quality"],
-                )
-            except Exception as exc:
-                if not is_request_too_large_error(exc):
-                    raise
-                last_error = exc
-                if index < len(IMAGE_PAYLOAD_RETRY_PROFILES) - 1:
-                    continue
+    for rate_attempt, delay_seconds in enumerate(IMAGE_RATE_LIMIT_RETRY_DELAYS_SECONDS):
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
+        try:
+            for active_prompt in (prompt, compact_prompt):
+                for index, image_profile in enumerate(IMAGE_PAYLOAD_RETRY_PROFILES):
+                    try:
+                        return request_generated_image(
+                            api_url=api_url,
+                            api_key=api_key,
+                            model=model,
+                            size=size,
+                            prompt=active_prompt,
+                            reference_image_path=reference_image_path,
+                            reference_image_paths=reference_image_paths,
+                            reference_image_max_side=image_profile["max_side"],
+                            reference_image_quality=image_profile["quality"],
+                        )
+                    except Exception as exc:
+                        if not is_request_too_large_error(exc):
+                            raise
+                        last_error = exc
+                        if index < len(IMAGE_PAYLOAD_RETRY_PROFILES) - 1:
+                            continue
+                        break
+            if last_error:
                 break
+        except Exception as exc:
+            if is_rate_limit_error(exc) and rate_attempt < len(IMAGE_RATE_LIMIT_RETRY_DELAYS_SECONDS) - 1:
+                last_error = exc
+                continue
+            raise
     raise last_error or VisualTaskError("image generation failed")
 
 

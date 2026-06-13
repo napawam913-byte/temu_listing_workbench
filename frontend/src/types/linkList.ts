@@ -126,6 +126,13 @@ export type LinkListRecord = {
   productId: string;
   productTitle: string;
   productTitleEn?: string;
+  category?: string;
+  categoryLevel1?: string;
+  categoryLevel2?: string;
+  categoryPath?: string;
+  categoryId?: string;
+  temuCategoryId?: string;
+  dxmCategoryId?: string;
   mainImage?: LinkListImageAsset;
   productMaterialImages?: LinkListImageAsset[];
   imageSlots?: LinkListImageSlot[];

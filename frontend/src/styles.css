@@ -6828,6 +6828,84 @@ body {
   }
 }
 
+.admin-api-channel-tab {
+  padding: 14px;
+}
+
+.admin-api-channel-panel {
+  background: #fbfdff;
+  border: 1px solid #dce8f7;
+  border-radius: 10px;
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+}
+
+.admin-api-section-head {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.admin-api-section-head > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.admin-api-section-head .ant-typography {
+  margin: 0;
+}
+
+.admin-api-channel-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+
+.admin-api-channel-card {
+  background: #ffffff;
+  border: 1px solid #e6edf5;
+  border-radius: 8px;
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px;
+}
+
+.admin-api-channel-title {
+  align-items: center;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.admin-api-channel-title .ant-input[disabled] {
+  color: #0f172a;
+  font-weight: 700;
+}
+
+.admin-api-channel-card .ant-typography {
+  margin: 0;
+}
+
+.admin-api-channel-fields {
+  display: grid;
+  gap: 8px;
+}
+
+.admin-api-channel-fields label {
+  display: grid;
+  gap: 5px;
+}
+
+.admin-api-channel-fields label > span {
+  color: #475569;
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .admin-settings-list {
   display: flex;
   flex-direction: column;

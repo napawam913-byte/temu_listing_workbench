@@ -1261,6 +1261,10 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
       productId: product.id,
       productTitle: product.title,
       productTitleEn: product.titleEn,
+      category: product.category,
+      categoryLevel1: product.categoryLevel1,
+      categoryLevel2: product.categoryLevel2,
+      categoryPath: product.categoryPath || product.category,
       mainImage: {
         id: mainImageAssetId,
         role: 'product-main',

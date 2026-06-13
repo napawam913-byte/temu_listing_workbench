@@ -29,6 +29,16 @@ REQUEST_TOO_LARGE_MARKERS = (
     "content too large",
     "maximum context length",
 )
+RATE_LIMIT_MARKERS = (
+    "HTTP 429",
+    "rate_limit",
+    "rate limit",
+    "too frequent",
+    "too many requests",
+    "concurrency limit",
+    "concurrency_limit",
+    "please retry later",
+)
 
 
 class VisualGenerationError(RuntimeError):
@@ -38,6 +48,27 @@ class VisualGenerationError(RuntimeError):
 def is_request_too_large_error(error: BaseException | str) -> bool:
     text = str(error or "").lower()
     return any(marker.lower() in text for marker in REQUEST_TOO_LARGE_MARKERS)
+
+
+def is_rate_limit_error(error: BaseException | str) -> bool:
+    text = str(error or "").lower()
+    return any(marker.lower() in text for marker in RATE_LIMIT_MARKERS)
+
+
+def format_response_error(response_json: object) -> str:
+    if not isinstance(response_json, dict):
+        return ""
+    error = response_json.get("error")
+    if not isinstance(error, dict):
+        return ""
+    code = str(error.get("code") or "")
+    message = str(error.get("message") or "")
+    error_type = str(error.get("type") or "")
+    if error_type == "rate_limit_error" or is_rate_limit_error(f"{code} {message} {error_type}"):
+        return f"AI rate limit: {message or error_type or code}"
+    if code or error_type or message:
+        return f"AI API error {code or error_type}: {message}"
+    return ""
 
 
 def get_runtime_setting(key: str, default: str = "") -> str:
@@ -125,9 +156,13 @@ def request_json(api_url: str, api_key: str, payload: dict[str, Any], *, timeout
         raise VisualGenerationError(f"AI request timed out: {exc}") from exc
 
     try:
-        return json.loads(response_body)
+        parsed = json.loads(response_body)
     except json.JSONDecodeError as exc:
         raise VisualGenerationError(f"AI API did not return JSON: {response_body[:500]}") from exc
+    response_error = format_response_error(parsed)
+    if response_error:
+        raise VisualGenerationError(response_error)
+    return parsed
 
 
 def request_multipart(
@@ -182,9 +217,13 @@ def request_multipart(
         raise VisualGenerationError(f"AI request timed out: {exc}") from exc
 
     try:
-        return json.loads(response_body)
+        parsed = json.loads(response_body)
     except json.JSONDecodeError as exc:
         raise VisualGenerationError(f"AI API did not return JSON: {response_body[:500]}") from exc
+    response_error = format_response_error(parsed)
+    if response_error:
+        raise VisualGenerationError(response_error)
+    return parsed
 
 
 def format_http_error(status_code: int, error_body: str) -> str:

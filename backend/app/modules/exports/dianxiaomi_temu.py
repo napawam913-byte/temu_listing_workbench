@@ -16,7 +16,7 @@ from app.modules.creative_generation.listing_title_optimizer import (
     optimize_listing_titles,
     translate_variant_values_to_english,
 )
-from app.modules.exports.product_attributes import get_cached_product_attribute_for_record
+from app.modules.exports.product_attributes import get_product_attribute_for_export_record
 from app.modules.image_storage.aliyun_oss import ImageStorageError, mirror_export_image
 
 TEMPLATE_SHEET_NAME = "popTemu_product"
@@ -126,17 +126,21 @@ def build_template_rows(
     description = build_description_from_images(carousel_image_urls)
     source_url = pick_record_source_url(record)
 
-    product_attribute = get_cached_product_attribute_for_record(record, user_id=user_id)
+    product_attribute = get_product_attribute_for_export_record(record, user_id=user_id)
     product_attribute_text = clean_text(product_attribute.get("product_attribute_text"))
     category_id = clean_text(product_attribute.get("category_id"))
 
     prepared_skus: list[tuple[dict[str, Any], str, list[tuple[str, str]]]] = []
-    raw_variant_values: list[str] = []
     for index, sku_entry in enumerate(sku_entries, start=1):
         sku_name = clean_text(sku_entry.get("name")) or f"SKU {index}"
         variant_pairs = derive_variant_pairs(sku_entry, sku_name)
         prepared_skus.append((sku_entry, sku_name, variant_pairs))
-        raw_variant_values.extend(value for _name, value in variant_pairs)
+    prepared_skus = enforce_consistent_variant_schema(prepared_skus)
+    raw_variant_values = [
+        value
+        for _sku_entry, _sku_name, variant_pairs in prepared_skus
+        for _name, value in variant_pairs
+    ]
 
     variant_value_translations = (
         translate_variant_values_to_english(raw_variant_values)
@@ -191,7 +195,7 @@ def build_template_rows(
                 "sku_attributes": "",
                 "site_price": "",
                 "source_url": source_url,
-                "origin": "",
+                "origin": _cn("\\u4e2d\\u56fd-\\u6d59\\u6c5f\\u7701"),
                 "sensitive_attributes": "",
                 "notes": "",
                 "sku_category": "",
@@ -218,6 +222,26 @@ def build_template_rows(
                 "updated_at": "",
             }
         )
+    return enforce_consistent_variant_rows(rows)
+
+
+def enforce_consistent_variant_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    signatures = {
+        (
+            clean_text(row.get("variant_attr_name_1")),
+            clean_text(row.get("variant_attr_name_2")),
+        )
+        for row in rows
+    }
+    signatures.discard(("", ""))
+    if len(signatures) <= 1:
+        return rows
+    for row in rows:
+        fallback_value = clean_text(row.get("variant_name")) or clean_text(row.get("variant_attr_value_1")) or _cn("\\u9ed8\\u8ba4\\u6b3e")
+        row["variant_attr_name_1"] = VARIANT_LABELS["model"]
+        row["variant_attr_value_1"] = fallback_translate_variant_value(fallback_value)
+        row["variant_attr_name_2"] = ""
+        row["variant_attr_value_2"] = ""
     return rows
 
 
@@ -535,6 +559,26 @@ def derive_variant_pairs(sku_entry: dict[str, Any], fallback_value: str) -> list
     if pairs:
         return pairs[:2]
     return [(VARIANT_LABELS["model"], clean_text(fallback_value) or _cn("\\u9ed8\\u8ba4\\u6b3e"))]
+
+
+def enforce_consistent_variant_schema(
+    prepared_skus: list[tuple[dict[str, Any], str, list[tuple[str, str]]]],
+) -> list[tuple[dict[str, Any], str, list[tuple[str, str]]]]:
+    signatures = {
+        tuple(name for name, value in variant_pairs[:2] if clean_text(name) and clean_text(value))
+        for _sku_entry, _sku_name, variant_pairs in prepared_skus
+    }
+    signatures.discard(())
+    if len(signatures) <= 1:
+        return prepared_skus
+    return [
+        (
+            sku_entry,
+            sku_name,
+            [(VARIANT_LABELS["model"], clean_text(sku_name) or _cn("\\u9ed8\\u8ba4\\u6b3e"))],
+        )
+        for sku_entry, sku_name, _variant_pairs in prepared_skus
+    ]
 
 
 def add_variant_candidate(candidates: list[tuple[str, str]], raw_name: Any, raw_value: Any) -> None:

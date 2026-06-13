@@ -7,6 +7,7 @@ import {
   Modal,
   Select,
   Space,
+  Switch,
   Table,
   Tabs,
   Tag,
@@ -18,14 +19,24 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { CSSProperties } from 'react';
 import {
   createAdminUser,
+  fetchAdminApiChannels,
   fetchAdminApiUsage,
   fetchAdminSettings,
   fetchAdminUsers,
   resetAdminUserPassword,
+  updateAdminApiChannels,
   updateAdminSettings,
   updateAdminUser,
 } from '../api/backendApi';
-import type { AdminApiUsageItem, AdminApiUsageSummary, AdminSetting, AdminSettingsUpdateItem, AdminUser } from '../api/backendApi';
+import type {
+  AdminApiChannel,
+  AdminApiChannelUpdateItem,
+  AdminApiUsageItem,
+  AdminApiUsageSummary,
+  AdminSetting,
+  AdminSettingsUpdateItem,
+  AdminUser,
+} from '../api/backendApi';
 
 type UserCreateForm = {
   username: string;
@@ -38,6 +49,16 @@ type UserCreateForm = {
 type PasswordResetState = {
   user?: AdminUser;
   password: string;
+};
+
+type ApiChannelDraft = {
+  name: string;
+  enabled: boolean;
+  baseUrl: string;
+  textModel: string;
+  imageModel: string;
+  apiKey: string;
+  clearApiKey?: boolean;
 };
 
 const EMPTY_API_USAGE: AdminApiUsageSummary = {
@@ -210,11 +231,30 @@ function apiUsagePercent(count: number, total: number) {
   return Math.round((count / total) * 1000) / 10;
 }
 
+function apiChannelDraftsFromChannels(channels: AdminApiChannel[]) {
+  return Object.fromEntries(
+    channels.map((channel) => [
+      channel.id,
+      {
+        name: channel.name,
+        enabled: channel.enabled,
+        baseUrl: channel.baseUrl,
+        textModel: channel.textModel,
+        imageModel: channel.imageModel,
+        apiKey: '',
+        clearApiKey: false,
+      },
+    ]),
+  );
+}
+
 export function AdminPage() {
   const [form] = Form.useForm<UserCreateForm>();
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [settings, setSettings] = useState<AdminSetting[]>([]);
   const [apiUsage, setApiUsage] = useState<AdminApiUsageSummary>(EMPTY_API_USAGE);
+  const [apiChannels, setApiChannels] = useState<AdminApiChannel[]>([]);
+  const [apiChannelDrafts, setApiChannelDrafts] = useState<Record<string, ApiChannelDraft>>({});
   const [settingDrafts, setSettingDrafts] = useState<Record<string, string>>({});
   const [secretEditingKeys, setSecretEditingKeys] = useState<Record<string, boolean>>({});
   const [editingAiStageKey, setEditingAiStageKey] = useState<string | null>(null);
@@ -227,14 +267,17 @@ export function AdminPage() {
   const loadAdminData = useCallback(async () => {
     setLoading(true);
     try {
-      const [nextUsers, nextSettings, nextApiUsage] = await Promise.all([
+      const [nextUsers, nextSettings, nextApiUsage, nextApiChannels] = await Promise.all([
         fetchAdminUsers(),
         fetchAdminSettings(),
         fetchAdminApiUsage(),
+        fetchAdminApiChannels(),
       ]);
       setUsers(nextUsers);
       setSettings(nextSettings);
       setApiUsage(nextApiUsage);
+      setApiChannels(nextApiChannels.channels);
+      setApiChannelDrafts(apiChannelDraftsFromChannels(nextApiChannels.channels));
       setSettingDrafts(
         Object.fromEntries(nextSettings.map((setting) => [setting.key, setting.isSecret ? '' : setting.value || ''])),
       );
@@ -340,6 +383,43 @@ export function AdminPage() {
       message.error(error instanceof Error ? error.message : 'API 调用统计读取失败');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const syncApiChannelBundle = (bundle: { channels: AdminApiChannel[] }) => {
+    setApiChannels(bundle.channels);
+    setApiChannelDrafts(apiChannelDraftsFromChannels(bundle.channels));
+  };
+
+  const saveApiChannels = async (options?: { silent?: boolean }) => {
+    setSavingSettings(true);
+    try {
+      const items: AdminApiChannelUpdateItem[] = apiChannels.map((channel) => {
+        const draft = apiChannelDrafts[channel.id];
+        return {
+          id: channel.id,
+          name: draft?.name,
+          enabled: draft?.enabled,
+          apiKey: draft?.apiKey?.trim() || undefined,
+          clearApiKey: Boolean(draft?.clearApiKey),
+          baseUrl: draft?.baseUrl,
+          textModel: draft?.textModel,
+          imageModel: draft?.imageModel,
+        };
+      });
+      const bundle = await updateAdminApiChannels(items);
+      syncApiChannelBundle(bundle);
+      if (!options?.silent) {
+        message.success('API 渠道已保存');
+      }
+      return bundle;
+    } catch (error) {
+      if (!options?.silent) {
+        message.error(error instanceof Error ? error.message : 'API 渠道保存失败');
+      }
+      throw error;
+    } finally {
+      setSavingSettings(false);
     }
   };
 
@@ -527,11 +607,18 @@ export function AdminPage() {
     editingAiStage && editingAiStage.modelFallbackKey ? settingsByKey.get(editingAiStage.modelFallbackKey) : undefined;
   const commonApiKeySetting = settingsByKey.get('OPENAI_API_KEY');
   const commonBaseUrlSetting = settingsByKey.get('OPENAI_BASE_URL');
+  const settingDraftValue = (key: string, setting?: AdminSetting) =>
+    Object.prototype.hasOwnProperty.call(settingDrafts, key) ? settingDrafts[key] || '' : settingValue(setting);
   const editingStageApiKeyEditing = editingAiStage ? Boolean(secretEditingKeys[editingAiStage.apiKeyKey]) : false;
   const editingStageApiKeyDraft = editingAiStage ? settingDrafts[editingAiStage.apiKeyKey] ?? '' : '';
   const editingStageApiKeyDisplay = secretSettingDisplay(editingStageApiKeySetting, commonApiKeySetting);
   const editingStageBaseUrlDraft = editingAiStage ? settingDrafts[editingAiStage.baseUrlKey] ?? '' : '';
   const editingStageModelDraft = editingAiStage ? settingDrafts[editingAiStage.modelKey] ?? '' : '';
+  const editingStageFallbackModelValue =
+    editingAiStage && editingAiStage.modelFallbackKey
+      ? settingDraftValue(editingAiStage.modelFallbackKey, editingStageFallbackModelSetting)
+      : '';
+  const commonBaseUrlValue = settingDraftValue('OPENAI_BASE_URL', commonBaseUrlSetting);
 
   return (
     <div className="admin-page">
@@ -750,7 +837,159 @@ export function AdminPage() {
               >
                 <Tabs
                   tabPosition="left"
-                  items={settingGroups.map(([category, groupSettings]) => ({
+                  items={[
+                    {
+                      key: 'api-channels',
+                      label: '渠道管理',
+                      children: (
+                        <div className="admin-api-channel-tab">
+                  <section className="admin-api-channel-panel">
+                    <div className="admin-api-section-head">
+                      <div>
+                        <Typography.Text strong>渠道管理</Typography.Text>
+                        <Typography.Text type="secondary">管理第三方 API 渠道，接口不稳定时可切换已启用渠道。</Typography.Text>
+                      </div>
+                      <Button loading={savingSettings} onClick={() => void saveApiChannels()}>
+                        保存渠道
+                      </Button>
+                    </div>
+                    <div className="admin-api-channel-grid">
+                      {apiChannels.map((channel) => {
+                        const draft = apiChannelDrafts[channel.id] || {
+                          name: channel.name,
+                          enabled: channel.enabled,
+                          baseUrl: channel.baseUrl,
+                          textModel: channel.textModel,
+                          imageModel: channel.imageModel,
+                          apiKey: '',
+                        };
+                        return (
+                          <div className="admin-api-channel-card" key={channel.id}>
+                            <div className="admin-api-channel-title">
+                              <Input
+                                disabled={channel.isCommon}
+                                value={draft.name}
+                                onChange={(event) =>
+                                  setApiChannelDrafts((current) => ({
+                                    ...current,
+                                    [channel.id]: {
+                                      ...draft,
+                                      name: event.target.value,
+                                    },
+                                  }))
+                                }
+                              />
+                              <Switch
+                                checked={draft.enabled}
+                                disabled={channel.isCommon}
+                                onChange={(enabled) =>
+                                  setApiChannelDrafts((current) => ({
+                                    ...current,
+                                    [channel.id]: {
+                                      ...draft,
+                                      enabled,
+                                    },
+                                  }))
+                                }
+                              />
+                            </div>
+                            <Typography.Text type="secondary">{channel.description}</Typography.Text>
+                            <Space size={6} wrap>
+                              <Tag color={draft.enabled ? 'green' : 'default'}>{draft.enabled ? '启用' : '停用'}</Tag>
+                              <Tag color={channel.apiKeyConfigured && !draft.clearApiKey ? 'green' : 'gold'}>
+                                {channel.apiKeyConfigured && !draft.clearApiKey ? channel.maskedApiKey || 'Key 已配置' : 'Key 待配置'}
+                              </Tag>
+                            </Space>
+                            <div className="admin-api-channel-fields">
+                              <label>
+                                <span>API Key</span>
+                                <Input.Password
+                                  placeholder={channel.apiKeyConfigured ? '输入新 Key 才会替换' : '输入 API Key'}
+                                  value={draft.apiKey}
+                                  onChange={(event) =>
+                                    setApiChannelDrafts((current) => ({
+                                      ...current,
+                                      [channel.id]: {
+                                        ...draft,
+                                        apiKey: event.target.value,
+                                        clearApiKey: false,
+                                      },
+                                    }))
+                                  }
+                                />
+                              </label>
+                              <label>
+                                <span>Base URL</span>
+                                <Input
+                                  value={draft.baseUrl}
+                                  onChange={(event) =>
+                                    setApiChannelDrafts((current) => ({
+                                      ...current,
+                                      [channel.id]: {
+                                        ...draft,
+                                        baseUrl: event.target.value,
+                                      },
+                                    }))
+                                  }
+                                />
+                              </label>
+                              <label>
+                                <span>文本模型</span>
+                                <Input
+                                  value={draft.textModel}
+                                  onChange={(event) =>
+                                    setApiChannelDrafts((current) => ({
+                                      ...current,
+                                      [channel.id]: {
+                                        ...draft,
+                                        textModel: event.target.value,
+                                      },
+                                    }))
+                                  }
+                                />
+                              </label>
+                              <label>
+                                <span>生图模型</span>
+                                <Input
+                                  value={draft.imageModel}
+                                  onChange={(event) =>
+                                    setApiChannelDrafts((current) => ({
+                                      ...current,
+                                      [channel.id]: {
+                                        ...draft,
+                                        imageModel: event.target.value,
+                                      },
+                                    }))
+                                  }
+                                />
+                              </label>
+                            </div>
+                            <Button
+                              danger
+                              disabled={!channel.apiKeyConfigured && !draft.apiKey}
+                              size="small"
+                              onClick={() =>
+                                setApiChannelDrafts((current) => ({
+                                  ...current,
+                                  [channel.id]: {
+                                    ...draft,
+                                    apiKey: '',
+                                    clearApiKey: true,
+                                  },
+                                }))
+                              }
+                            >
+                              清除 Key
+                            </Button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                          </section>
+                        </div>
+                      ),
+                    },
+                    ...settingGroups.map(([category, groupSettings]) => ({
                     key: category,
                     label: categoryLabel(category),
                     children: (
@@ -769,8 +1008,22 @@ export function AdminPage() {
                               const fallbackSetting = stage.modelFallbackKey
                                 ? settingMap.get(stage.modelFallbackKey)
                                 : undefined;
-                              const modelDraft = settingDrafts[stage.modelKey] ?? '';
-                              const modelValue = modelDraft || settingValue(modelSetting) || settingValue(fallbackSetting) || '未配置';
+                              const hasModelFallback = Boolean(stage.modelFallbackKey);
+                              const storedStageModelValue = settingValue(modelSetting);
+                              const modelDraft = settingDraftValue(stage.modelKey, modelSetting);
+                              const fallbackModelValue = stage.modelFallbackKey
+                                ? settingDraftValue(stage.modelFallbackKey, fallbackSetting)
+                                : '';
+                              const hasStoredStageModel =
+                                Boolean(storedStageModelValue) && modelSetting?.source !== 'default';
+                              const hasEditedStageModel =
+                                Object.prototype.hasOwnProperty.call(settingDrafts, stage.modelKey) &&
+                                modelDraft !== storedStageModelValue;
+                              const hasStageModel = hasModelFallback
+                                ? Boolean(modelDraft) && (hasStoredStageModel || hasEditedStageModel)
+                                : Boolean(modelDraft);
+                              const modelValue = (hasStageModel ? modelDraft : fallbackModelValue) || '未配置';
+                              const modelTagColor = hasStageModel ? 'blue' : fallbackModelValue ? 'gold' : 'default';
                               const apiKeyInherited = !apiKeySetting?.configured && !settingDrafts[stage.apiKeyKey];
                               const baseUrlInherited = !baseUrlSetting?.configured && !settingDrafts[stage.baseUrlKey];
                               return (
@@ -782,7 +1035,7 @@ export function AdminPage() {
                                   <div className="admin-model-stage-summary">
                                     <div className="admin-model-stage-model">
                                       <span>当前模型</span>
-                                      <Tag color={modelSetting?.configured || modelDraft ? 'blue' : 'default'}>{modelValue}</Tag>
+                                      <Tag color={modelTagColor}>{modelValue}</Tag>
                                     </div>
                                     <Button size="small" onClick={() => setEditingAiStageKey(stage.modelKey)}>
                                       编辑接口
@@ -795,7 +1048,9 @@ export function AdminPage() {
                                     <Tag color={baseUrlInherited ? 'gold' : 'green'}>
                                       {baseUrlInherited ? 'URL 继承通用' : 'URL 独立配置'}
                                     </Tag>
-                                    <Tag color={modelSetting?.configured ? 'blue' : 'default'}>{modelValue}</Tag>
+                                    <Tag color={modelTagColor}>
+                                      {hasStageModel ? modelValue : `模型继承 ${modelValue}`}
+                                    </Tag>
                                   </Space>
                                 </div>
                               );
@@ -865,7 +1120,7 @@ export function AdminPage() {
                         })}
                       </div>
                     ),
-                  }))}
+                  }))]}
                 />
               </Card>
             ),
@@ -901,7 +1156,7 @@ export function AdminPage() {
             <label className="admin-stage-config-field">
               <span>模型名称</span>
               <Input
-                placeholder={settingValue(editingStageFallbackModelSetting) || 'gpt-5.5'}
+                placeholder={editingStageFallbackModelValue || 'gpt-5.5'}
                 value={editingStageModelDraft}
                 onChange={(event) =>
                   setSettingDrafts((current) => ({
@@ -946,8 +1201,8 @@ export function AdminPage() {
               <span>Base URL</span>
               <Input
                 placeholder={
-                  settingValue(commonBaseUrlSetting)
-                    ? `留空继承通用 Base URL：${settingValue(commonBaseUrlSetting)}`
+                  commonBaseUrlValue
+                    ? `留空继承通用 Base URL：${commonBaseUrlValue}`
                     : '留空继承通用 Base URL'
                 }
                 value={editingStageBaseUrlDraft}

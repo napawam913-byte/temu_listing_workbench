@@ -77,6 +77,48 @@ export type AdminApiUsageSummary = {
   inferredCalls: number;
 };
 
+export type AdminApiChannel = {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  baseUrl: string;
+  textModel: string;
+  imageModel: string;
+  apiKeyConfigured: boolean;
+  maskedApiKey: string;
+  isCommon: boolean;
+};
+
+export type AdminApiRoute = {
+  stage: string;
+  title: string;
+  description: string;
+  modelType: 'text' | 'image' | string;
+  channelId: string;
+  channelName: string;
+  model: string;
+  baseUrl: string;
+  apiKeyConfigured: boolean;
+  isInherited: boolean;
+};
+
+export type AdminApiChannelBundle = {
+  channels: AdminApiChannel[];
+  routes: AdminApiRoute[];
+};
+
+export type AdminApiChannelUpdateItem = {
+  id: string;
+  name?: string;
+  enabled?: boolean;
+  apiKey?: string;
+  clearApiKey?: boolean;
+  baseUrl?: string;
+  textModel?: string;
+  imageModel?: string;
+};
+
 export function clearLegacyAuthToken() {
   localStorage.removeItem(LEGACY_AUTH_TOKEN_STORAGE_KEY);
 }
@@ -714,10 +756,20 @@ export async function prepareDianxiaomiProductAttributes(
   return response.json();
 }
 
-export async function fetchDianxiaomiProductAttributeStatus(): Promise<DianxiaomiProductAttributeQueueSummary> {
-  const response = await fetch(`${API_BASE_URL}/api/exports/dianxiaomi/product-attributes/status`, withSession({
-    headers: authHeaders(),
-  }));
+export async function fetchDianxiaomiProductAttributeStatus(
+  records?: LinkListRecord[],
+): Promise<DianxiaomiProductAttributeQueueSummary> {
+  const response = await fetch(`${API_BASE_URL}/api/exports/dianxiaomi/product-attributes/status`, withSession(
+    records
+      ? {
+          method: 'POST',
+          headers: authHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ records }),
+        }
+      : {
+          headers: authHeaders(),
+        },
+  ));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -1116,6 +1168,80 @@ export async function fetchAdminApiUsage(): Promise<AdminApiUsageSummary> {
     totalCalls: body.totalCalls || 0,
     exactCalls: body.exactCalls || 0,
     inferredCalls: body.inferredCalls || 0,
+  };
+}
+
+export async function fetchAdminApiChannels(): Promise<AdminApiChannelBundle> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/api-channels`, withSession({
+    headers: authHeaders(),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return {
+    channels: body.channels || [],
+    routes: body.routes || [],
+  };
+}
+
+export async function updateAdminApiChannels(items: AdminApiChannelUpdateItem[]): Promise<AdminApiChannelBundle> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/api-channels`, withSession({
+    method: 'PUT',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ items }),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return {
+    channels: body.channels || [],
+    routes: body.routes || [],
+  };
+}
+
+export async function applyAdminApiRoute(payload: {
+  stage: string;
+  channelId: string;
+  model?: string;
+}): Promise<AdminApiChannelBundle> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/api-channels/apply`, withSession({
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return {
+    channels: body.channels || [],
+    routes: body.routes || [],
+  };
+}
+
+export async function applyAdminApiRoutesToAll(payload: {
+  channelId: string;
+  textModel?: string;
+  imageModel?: string;
+}): Promise<AdminApiChannelBundle> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/api-channels/apply-all`, withSession({
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return {
+    channels: body.channels || [],
+    routes: body.routes || [],
   };
 }
 

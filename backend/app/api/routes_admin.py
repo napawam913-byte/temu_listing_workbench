@@ -32,6 +32,28 @@ class SettingDefinition:
     is_secret: bool = False
 
 
+@dataclass(frozen=True)
+class ApiChannelDefinition:
+    id: str
+    name: str
+    description: str
+    default_base_url: str = ""
+    default_text_model: str = "gpt-5.5"
+    default_image_model: str = "gpt-image-2"
+    is_common: bool = False
+
+
+@dataclass(frozen=True)
+class ApiRouteStageDefinition:
+    id: str
+    title: str
+    description: str
+    api_key_key: str
+    base_url_key: str
+    model_key: str
+    model_type: str = "text"
+
+
 SETTING_DEFINITIONS: tuple[SettingDefinition, ...] = (
     SettingDefinition("OPENAI_API_KEY", "ai", "OpenAI API Key", "FluAPI / OpenAI 兼容 API 密钥", is_secret=True),
     SettingDefinition("OPENAI_BASE_URL", "ai", "OpenAI Base URL", "FluAPI 地址，例如 https://svip.fluapi.com/v1"),
@@ -82,6 +104,90 @@ SETTING_DEFINITIONS: tuple[SettingDefinition, ...] = (
 )
 
 
+API_CHANNEL_DEFINITIONS: tuple[ApiChannelDefinition, ...] = (
+    ApiChannelDefinition(
+        "common",
+        "通用配置",
+        "继承当前 OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_TEXT_MODEL",
+        is_common=True,
+    ),
+    ApiChannelDefinition(
+        "fluapi",
+        "FluAPI",
+        "当前常用的 OpenAI 兼容代理渠道",
+        "https://svip.fluapi.com/v1",
+    ),
+    ApiChannelDefinition(
+        "openai",
+        "OpenAI 官方",
+        "OpenAI 官方兼容接口",
+        "https://api.openai.com/v1",
+    ),
+    ApiChannelDefinition("custom_a", "备用渠道 A", "自定义 OpenAI 兼容渠道"),
+    ApiChannelDefinition("custom_b", "备用渠道 B", "自定义 OpenAI 兼容渠道"),
+)
+
+API_ROUTE_STAGE_DEFINITIONS: tuple[ApiRouteStageDefinition, ...] = (
+    ApiRouteStageDefinition(
+        "title",
+        "标题生成",
+        "中文标题、英文标题、变种值英文翻译",
+        "OPENAI_TITLE_API_KEY",
+        "OPENAI_TITLE_BASE_URL",
+        "OPENAI_TITLE_MODEL",
+    ),
+    ApiRouteStageDefinition(
+        "title_split",
+        "标题拆分",
+        "把商品标题拆成 1688 采购搜索关键词",
+        "OPENAI_TITLE_SPLIT_API_KEY",
+        "OPENAI_TITLE_SPLIT_BASE_URL",
+        "OPENAI_TITLE_SPLIT_MODEL",
+    ),
+    ApiRouteStageDefinition(
+        "recommendation",
+        "智能推荐",
+        "商品标题、类目、图片分析和推荐关键词",
+        "OPENAI_RECOMMENDATION_API_KEY",
+        "OPENAI_RECOMMENDATION_BASE_URL",
+        "OPENAI_RECOMMENDATION_MODEL",
+    ),
+    ApiRouteStageDefinition(
+        "product_attribute",
+        "产品属性填写",
+        "导出时根据类目属性库和商品信息填写属性",
+        "OPENAI_PRODUCT_ATTRIBUTE_API_KEY",
+        "OPENAI_PRODUCT_ATTRIBUTE_BASE_URL",
+        "OPENAI_PRODUCT_ATTRIBUTE_MODEL",
+    ),
+    ApiRouteStageDefinition(
+        "visual_analysis",
+        "图片理解",
+        "生图前分析主体、材质、结构、风险和画风",
+        "OPENAI_VISUAL_ANALYSIS_API_KEY",
+        "OPENAI_VISUAL_ANALYSIS_BASE_URL",
+        "OPENAI_VISUAL_ANALYSIS_MODEL",
+    ),
+    ApiRouteStageDefinition(
+        "visual_prompt",
+        "提示词规划",
+        "把分析结果转成九宫格或四宫格母图提示词",
+        "OPENAI_VISUAL_PROMPT_API_KEY",
+        "OPENAI_VISUAL_PROMPT_BASE_URL",
+        "OPENAI_VISUAL_PROMPT_MODEL",
+    ),
+    ApiRouteStageDefinition(
+        "image",
+        "图片生成",
+        "实际生成母图、单图精修和 SKU 适配图",
+        "OPENAI_IMAGE_API_KEY",
+        "OPENAI_IMAGE_BASE_URL",
+        "OPENAI_IMAGE_MODEL",
+        "image",
+    ),
+)
+
+
 class AdminUserCreateRequest(BaseModel):
     username: str = Field(..., min_length=2)
     password: str = Field(..., min_length=6)
@@ -108,6 +214,33 @@ class AdminSettingUpdateItem(BaseModel):
 
 class AdminSettingsUpdateRequest(BaseModel):
     items: list[AdminSettingUpdateItem]
+
+
+class AdminApiChannelUpdateItem(BaseModel):
+    id: str
+    name: str | None = None
+    enabled: bool | None = None
+    apiKey: str | None = None
+    clearApiKey: bool = False
+    baseUrl: str | None = None
+    textModel: str | None = None
+    imageModel: str | None = None
+
+
+class AdminApiChannelsUpdateRequest(BaseModel):
+    items: list[AdminApiChannelUpdateItem]
+
+
+class AdminApiRouteApplyRequest(BaseModel):
+    stage: str
+    channelId: str
+    model: str | None = None
+
+
+class AdminApiRoutesApplyRequest(BaseModel):
+    channelId: str
+    textModel: str | None = None
+    imageModel: str | None = None
 
 
 @router.get("/users")
@@ -172,6 +305,70 @@ def admin_api_usage_summary(_admin: dict[str, Any] = Depends(require_admin_user)
     return get_api_usage_summary()
 
 
+@router.get("/api-channels")
+def admin_api_channels(_admin: dict[str, Any] = Depends(require_admin_user)):
+    return serialize_api_channel_bundle()
+
+
+@router.put("/api-channels")
+def admin_update_api_channels(
+    payload: AdminApiChannelsUpdateRequest,
+    admin: dict[str, Any] = Depends(require_admin_user),
+):
+    definitions = {definition.id: definition for definition in API_CHANNEL_DEFINITIONS}
+    for item in payload.items:
+        definition = definitions.get(normalize_api_identifier(item.id))
+        if not definition:
+            raise HTTPException(status_code=400, detail=f"未知 API 渠道：{item.id}")
+        update_api_channel(definition, item, admin["id"])
+    return serialize_api_channel_bundle()
+
+
+@router.post("/api-channels/apply")
+def admin_apply_api_channel(
+    payload: AdminApiRouteApplyRequest,
+    admin: dict[str, Any] = Depends(require_admin_user),
+):
+    stage = {definition.id: definition for definition in API_ROUTE_STAGE_DEFINITIONS}.get(
+        normalize_api_identifier(payload.stage)
+    )
+    if not stage:
+        raise HTTPException(status_code=400, detail=f"未知能力：{payload.stage}")
+
+    channel = {definition.id: definition for definition in API_CHANNEL_DEFINITIONS}.get(
+        normalize_api_identifier(payload.channelId)
+    )
+    if not channel:
+        raise HTTPException(status_code=400, detail=f"未知 API 渠道：{payload.channelId}")
+
+    saved_settings = get_app_settings_map()
+    channel_values = api_channel_runtime_values(channel, saved_settings)
+    requested_model = str(payload.model or "").strip()
+    apply_api_channel_to_stage(stage, channel, channel_values, admin["id"], requested_model)
+    return serialize_api_channel_bundle()
+
+
+@router.post("/api-channels/apply-all")
+def admin_apply_api_channel_to_all(
+    payload: AdminApiRoutesApplyRequest,
+    admin: dict[str, Any] = Depends(require_admin_user),
+):
+    channel = {definition.id: definition for definition in API_CHANNEL_DEFINITIONS}.get(
+        normalize_api_identifier(payload.channelId)
+    )
+    if not channel:
+        raise HTTPException(status_code=400, detail=f"未知 API 渠道：{payload.channelId}")
+
+    saved_settings = get_app_settings_map()
+    channel_values = api_channel_runtime_values(channel, saved_settings)
+    text_model = str(payload.textModel or "").strip()
+    image_model = str(payload.imageModel or "").strip()
+    for stage in API_ROUTE_STAGE_DEFINITIONS:
+        model = image_model if stage.model_type == "image" else text_model
+        apply_api_channel_to_stage(stage, channel, channel_values, admin["id"], model)
+    return serialize_api_channel_bundle()
+
+
 @router.put("/settings")
 def admin_update_settings(
     payload: AdminSettingsUpdateRequest,
@@ -233,6 +430,260 @@ def serialize_setting(
         "source": source,
         "updatedAt": saved.get("updatedAt") if saved else None,
     }
+
+
+def serialize_api_channel_bundle() -> dict[str, Any]:
+    saved_settings = get_app_settings_map()
+    channels = [serialize_api_channel(definition, saved_settings) for definition in API_CHANNEL_DEFINITIONS]
+    routes = [serialize_api_route(stage, saved_settings) for stage in API_ROUTE_STAGE_DEFINITIONS]
+    return {"channels": channels, "routes": routes}
+
+
+def serialize_api_channel(definition: ApiChannelDefinition, saved_settings: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    values = api_channel_runtime_values(definition, saved_settings)
+    return {
+        "id": definition.id,
+        "name": values["name"],
+        "description": definition.description,
+        "enabled": values["enabled"],
+        "baseUrl": values["baseUrl"],
+        "textModel": values["textModel"],
+        "imageModel": values["imageModel"],
+        "apiKeyConfigured": bool(values["apiKey"]),
+        "maskedApiKey": mask_secret(values["apiKey"]) if values["apiKey"] else "",
+        "isCommon": definition.is_common,
+    }
+
+
+def serialize_api_route(stage: ApiRouteStageDefinition, saved_settings: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    common_channel = api_channel_runtime_values(API_CHANNEL_DEFINITIONS[0], saved_settings)
+    specific_api_key = setting_runtime_value(saved_settings, stage.api_key_key, "")
+    specific_base_url = setting_runtime_value(saved_settings, stage.base_url_key, "")
+    specific_model = setting_runtime_value(saved_settings, stage.model_key, "")
+    fallback_model = common_channel["imageModel"] if stage.model_type == "image" else common_channel["textModel"]
+    effective_api_key = specific_api_key or common_channel["apiKey"]
+    effective_base_url = specific_base_url or common_channel["baseUrl"]
+    effective_model = specific_model or fallback_model
+    is_inherited = not (specific_api_key or specific_base_url or specific_model)
+    channel_id = "common" if is_inherited else "manual"
+    channel_name = "通用配置" if is_inherited else "手动配置"
+
+    if not is_inherited:
+        for channel_definition in API_CHANNEL_DEFINITIONS[1:]:
+            channel_values = api_channel_runtime_values(channel_definition, saved_settings)
+            if not channel_values["enabled"]:
+                continue
+            if channel_values["apiKey"] and channel_values["apiKey"] == effective_api_key and channel_values["baseUrl"] == effective_base_url:
+                channel_id = channel_definition.id
+                channel_name = channel_values["name"]
+                break
+
+    return {
+        "stage": stage.id,
+        "title": stage.title,
+        "description": stage.description,
+        "modelType": stage.model_type,
+        "channelId": channel_id,
+        "channelName": channel_name,
+        "model": effective_model,
+        "baseUrl": effective_base_url,
+        "apiKeyConfigured": bool(effective_api_key),
+        "isInherited": is_inherited,
+    }
+
+
+def api_channel_runtime_values(
+    definition: ApiChannelDefinition,
+    saved_settings: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    if definition.is_common:
+        return {
+            "name": definition.name,
+            "enabled": True,
+            "apiKey": setting_runtime_value(saved_settings, "OPENAI_API_KEY", ""),
+            "baseUrl": setting_runtime_value(saved_settings, "OPENAI_BASE_URL", app_config.OPENAI_BASE_URL),
+            "textModel": setting_runtime_value(saved_settings, "OPENAI_TEXT_MODEL", definition.default_text_model),
+            "imageModel": setting_runtime_value(saved_settings, "OPENAI_IMAGE_MODEL", definition.default_image_model),
+        }
+    return {
+        "name": setting_runtime_value(saved_settings, api_channel_setting_key(definition, "NAME"), definition.name),
+        "enabled": parse_enabled(setting_runtime_value(saved_settings, api_channel_setting_key(definition, "ENABLED"), "0")),
+        "apiKey": setting_runtime_value(saved_settings, api_channel_setting_key(definition, "API_KEY"), ""),
+        "baseUrl": setting_runtime_value(
+            saved_settings,
+            api_channel_setting_key(definition, "BASE_URL"),
+            definition.default_base_url,
+        ).rstrip("/"),
+        "textModel": setting_runtime_value(
+            saved_settings,
+            api_channel_setting_key(definition, "TEXT_MODEL"),
+            definition.default_text_model,
+        ),
+        "imageModel": setting_runtime_value(
+            saved_settings,
+            api_channel_setting_key(definition, "IMAGE_MODEL"),
+            definition.default_image_model,
+        ),
+    }
+
+
+def update_api_channel(
+    definition: ApiChannelDefinition,
+    item: AdminApiChannelUpdateItem,
+    admin_id: str,
+) -> None:
+    if definition.is_common:
+        if item.apiKey:
+            upsert_defined_setting("OPENAI_API_KEY", item.apiKey.strip(), admin_id)
+        elif item.clearApiKey:
+            upsert_defined_setting("OPENAI_API_KEY", "", admin_id)
+        if item.baseUrl is not None:
+            upsert_defined_setting("OPENAI_BASE_URL", item.baseUrl.strip().rstrip("/"), admin_id)
+        if item.textModel is not None:
+            upsert_defined_setting("OPENAI_TEXT_MODEL", item.textModel.strip(), admin_id)
+        if item.imageModel is not None:
+            upsert_defined_setting("OPENAI_IMAGE_MODEL", item.imageModel.strip(), admin_id)
+        return
+
+    if item.name is not None:
+        upsert_app_setting(
+            key=api_channel_setting_key(definition, "NAME"),
+            value=item.name.strip() or definition.name,
+            category="ai_channel",
+            label=f"{definition.name} 名称",
+            description="管理员后台 API 渠道名称",
+            updated_by=admin_id,
+        )
+    if item.enabled is not None:
+        upsert_app_setting(
+            key=api_channel_setting_key(definition, "ENABLED"),
+            value="1" if item.enabled else "0",
+            category="ai_channel",
+            label=f"{definition.name} 启用状态",
+            description="1 表示启用，0 表示停用",
+            updated_by=admin_id,
+        )
+    if item.apiKey:
+        upsert_app_setting(
+            key=api_channel_setting_key(definition, "API_KEY"),
+            value=item.apiKey.strip(),
+            category="ai_channel",
+            label=f"{definition.name} API Key",
+            description="管理员后台 API 渠道密钥",
+            is_secret=True,
+            updated_by=admin_id,
+        )
+    elif item.clearApiKey:
+        upsert_app_setting(
+            key=api_channel_setting_key(definition, "API_KEY"),
+            value="",
+            category="ai_channel",
+            label=f"{definition.name} API Key",
+            description="管理员后台 API 渠道密钥",
+            is_secret=True,
+            updated_by=admin_id,
+        )
+    if item.baseUrl is not None:
+        upsert_app_setting(
+            key=api_channel_setting_key(definition, "BASE_URL"),
+            value=item.baseUrl.strip().rstrip("/"),
+            category="ai_channel",
+            label=f"{definition.name} Base URL",
+            description="OpenAI 兼容接口地址",
+            updated_by=admin_id,
+        )
+    if item.textModel is not None:
+        upsert_app_setting(
+            key=api_channel_setting_key(definition, "TEXT_MODEL"),
+            value=item.textModel.strip(),
+            category="ai_channel",
+            label=f"{definition.name} 文本模型",
+            description="该渠道默认文本/视觉理解模型",
+            updated_by=admin_id,
+        )
+    if item.imageModel is not None:
+        upsert_app_setting(
+            key=api_channel_setting_key(definition, "IMAGE_MODEL"),
+            value=item.imageModel.strip(),
+            category="ai_channel",
+            label=f"{definition.name} 生图模型",
+            description="该渠道默认图片生成模型",
+            updated_by=admin_id,
+        )
+
+
+def apply_api_channel_to_stage(
+    stage: ApiRouteStageDefinition,
+    channel: ApiChannelDefinition,
+    channel_values: dict[str, Any],
+    admin_id: str,
+    requested_model: str = "",
+) -> None:
+    fallback_model = channel_values["imageModel"] if stage.model_type == "image" else channel_values["textModel"]
+    next_model = requested_model or fallback_model
+
+    if channel.is_common:
+        upsert_defined_setting(stage.api_key_key, "", admin_id)
+        upsert_defined_setting(stage.base_url_key, "", admin_id)
+        if stage.model_key == "OPENAI_IMAGE_MODEL":
+            if requested_model:
+                upsert_defined_setting(stage.model_key, requested_model, admin_id)
+        else:
+            upsert_defined_setting(
+                stage.model_key,
+                requested_model if requested_model and requested_model != fallback_model else "",
+                admin_id,
+            )
+        return
+
+    if not channel_values["apiKey"]:
+        raise HTTPException(status_code=400, detail=f"{channel_values['name']} 还没有配置 API Key")
+    if not channel_values["baseUrl"]:
+        raise HTTPException(status_code=400, detail=f"{channel_values['name']} 还没有配置 Base URL")
+    if not next_model:
+        raise HTTPException(status_code=400, detail=f"{channel_values['name']} 还没有配置模型")
+
+    upsert_defined_setting(stage.api_key_key, channel_values["apiKey"], admin_id)
+    upsert_defined_setting(stage.base_url_key, channel_values["baseUrl"], admin_id)
+    upsert_defined_setting(stage.model_key, next_model, admin_id)
+
+
+def upsert_defined_setting(key: str, value: str, admin_id: str) -> None:
+    definition = {definition.key: definition for definition in SETTING_DEFINITIONS}.get(key)
+    if not definition:
+        raise HTTPException(status_code=400, detail=f"未知配置项：{key}")
+    upsert_app_setting(
+        key=definition.key,
+        value=value,
+        category=definition.category,
+        label=definition.label,
+        description=definition.description,
+        is_secret=definition.is_secret,
+        updated_by=admin_id,
+    )
+
+
+def setting_runtime_value(saved_settings: dict[str, dict[str, Any]], key: str, default: str = "") -> str:
+    saved = saved_settings.get(key)
+    saved_value = str(saved.get("value", "")) if saved else ""
+    if saved_value:
+        return saved_value
+    env_value = get_env_config_value(key)
+    if env_value:
+        return env_value
+    return str(default or "")
+
+
+def api_channel_setting_key(definition: ApiChannelDefinition, field: str) -> str:
+    return f"AI_CHANNEL_{definition.id.upper()}_{field}"
+
+
+def normalize_api_identifier(value: str) -> str:
+    return str(value or "").strip().lower().replace("-", "_")
+
+
+def parse_enabled(value: str) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def get_env_config_value(key: str) -> str:

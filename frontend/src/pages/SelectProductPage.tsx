@@ -43,8 +43,6 @@ import {
   fetchProductStats,
   fetchProducts,
   mapBackendProduct,
-  prepareDianxiaomiProductAttributes,
-  fetchDianxiaomiProductAttributeStatus,
   runVisualGenerationTask,
   saveLinkListRecord,
   saveLinkListRecords,
@@ -4378,6 +4376,39 @@ export function SelectProductPage({
     void saveLinkListRecord(record).catch(warnLinkPersistenceFailure);
   }, [currentUser.id, warnLinkPersistenceFailure]);
 
+  const enrichRecordsWithProductCategory = useCallback(
+    (records: LinkListRecord[]) => {
+      const productById = new Map(products.map((product) => [product.id, product]));
+      let changed = false;
+      const enriched = records.map((record) => {
+        const product = productById.get(record.productId);
+        if (!product) return record;
+        const categoryPath = record.categoryPath || product.categoryPath || product.category;
+        const category = record.category || product.category || categoryPath;
+        const categoryLevel1 = record.categoryLevel1 || product.categoryLevel1;
+        const categoryLevel2 = record.categoryLevel2 || product.categoryLevel2;
+        if (
+          category === record.category &&
+          categoryPath === record.categoryPath &&
+          categoryLevel1 === record.categoryLevel1 &&
+          categoryLevel2 === record.categoryLevel2
+        ) {
+          return record;
+        }
+        changed = true;
+        return {
+          ...record,
+          category,
+          categoryPath,
+          categoryLevel1,
+          categoryLevel2,
+        };
+      });
+      return changed ? enriched : records;
+    },
+    [products],
+  );
+
   const exportTemplate = useCallback(async () => {
     if (linkListRecords.length === 0) {
       message.warning('请先在商品池中录入链接列表，再导出 Excel');
@@ -4387,34 +4418,26 @@ export function SelectProductPage({
     setExportingTemplate(true);
     try {
       let recordsForExport = linkListRecords;
+      let shouldPersistRecordsForExport = false;
       try {
         const syncResult = await syncPluginCreativeJobs(linkListRecords);
         recordsForExport = syncResult.records.length > 0 ? syncResult.records : linkListRecords;
         if (syncResult.records.length > 0) {
-          setLinkListRecords(syncResult.records);
-          writeLinkListRecords(syncResult.records, currentUser.id);
-          void saveLinkListRecords(syncResult.records).catch(warnLinkPersistenceFailure);
+          shouldPersistRecordsForExport = true;
         }
       } catch {
         message.warning('插件旧任务同步失败，已跳过同步并继续使用当前链接列表数据导出');
       }
 
-      let attributeSummary = await prepareDianxiaomiProductAttributes(recordsForExport);
-      if (attributeSummary.pending > 0) {
-        const closeLoading = message.loading('Product attributes are being generated before export...', 0);
-        try {
-          for (let index = 0; index < 60 && attributeSummary.pending > 0; index += 1) {
-            await waitForMs(2000);
-            attributeSummary = await fetchDianxiaomiProductAttributeStatus();
-          }
-        } finally {
-          closeLoading();
-        }
+      const enrichedRecordsForExport = enrichRecordsWithProductCategory(recordsForExport);
+      if (enrichedRecordsForExport !== recordsForExport) {
+        shouldPersistRecordsForExport = true;
       }
-      if (attributeSummary.pending > 0) {
-        message.warning('Product attribute queue is still running. The export will use completed attributes and leave unfinished ones blank.');
-      } else if (attributeSummary.failed > 0) {
-        message.warning('Some product attributes failed to generate. Those rows will be exported with blank attributes.');
+      recordsForExport = enrichedRecordsForExport;
+      if (shouldPersistRecordsForExport) {
+        setLinkListRecords(recordsForExport);
+        writeLinkListRecords(recordsForExport, currentUser.id);
+        void saveLinkListRecords(recordsForExport).catch(warnLinkPersistenceFailure);
       }
 
       const blob = await exportDianxiaomiTemuTemplate(recordsForExport);
@@ -4426,7 +4449,7 @@ export function SelectProductPage({
     } finally {
       setExportingTemplate(false);
     }
-  }, [currentUser.id, linkListRecords, warnLinkPersistenceFailure]);
+  }, [currentUser.id, enrichRecordsWithProductCategory, linkListRecords, warnLinkPersistenceFailure]);
 
   const openProductFromRoute = useCallback(async () => {
     if (isAdminUser) {

@@ -6,7 +6,7 @@ os.environ["ALIYUN_OSS_ENABLED"] = "0"
 os.environ["OPENAI_API_KEY"] = ""
 
 from app.modules.image_storage.aliyun_oss import ImageStorageError
-from app.modules.exports.dianxiaomi_temu import build_rows_for_record
+from app.modules.exports.dianxiaomi_temu import build_rows_for_record, build_template_rows
 
 
 class DianxiaomiExportTest(unittest.TestCase):
@@ -331,6 +331,33 @@ class DianxiaomiExportTest(unittest.TestCase):
         self.assertEqual(rows[0][6], "")
         self.assertEqual(rows[0][7], "")
 
+    def test_mixed_variant_attribute_names_are_normalized_to_model(self):
+        rows = build_rows_for_record(
+            {
+                "productId": "p1",
+                "productTitle": "Pet Bowl Set",
+                "mainImage": {"sourceUrl": "https://example.com/main.jpg"},
+                "sourceLinks": [{"productUrl": "https://detail.1688.com/offer/1.html"}],
+                "skuEntries": [
+                    {"id": "sku-1", "name": "灰色花边餐垫（硅胶）", "componentSkus": []},
+                    {"id": "sku-2", "name": "亮光纯色飞碟碗（蜜桃红色）", "componentSkus": []},
+                    {
+                        "id": "sku-3",
+                        "name": "灰色花边餐垫（硅胶）+亮光纯色飞碟碗（蜜桃红色）",
+                        "componentSkus": [
+                            {"rawSpecs": {"型号": "灰色花边餐垫（硅胶）"}},
+                            {"rawSpecs": {"颜色": "蜜桃红色"}},
+                        ],
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual([row[4] for row in rows], ["型号", "型号", "型号"])
+        self.assertEqual([row[6] for row in rows], ["", "", ""])
+        self.assertEqual([row[7] for row in rows], ["", "", ""])
+        self.assertTrue(all(row[5] for row in rows))
+
     def test_delivery_days_default_is_blank(self):
         rows = build_rows_for_record(
             {
@@ -383,6 +410,34 @@ class DianxiaomiExportTest(unittest.TestCase):
         self.assertEqual(rows[0][8], "https://img.example.com/sku.jpg")
         self.assertEqual(rows[0][18], "https://img.example.com/material.jpg\nhttps://img.example.com/main.jpg")
         self.assertEqual(rows[0][19], "https://img.example.com/material.jpg")
+
+    def test_template_rows_include_generated_product_attributes(self):
+        attribute_text = '[{"propName":"适用人种","refPid":3700,"pid":1752,"templatePid":1829634,"numberInputValue":"","valueUnit":"","vid":"63440","propValue":"适用各种人种"}]'
+        with patch(
+            "app.modules.exports.dianxiaomi_temu.get_product_attribute_for_export_record",
+            return_value={"category_id": "31075", "product_attribute_text": attribute_text},
+        ) as getter:
+            rows = build_template_rows(
+                {
+                    "id": "record-1",
+                    "productId": "p1",
+                    "productTitle": "Test Product",
+                    "mainImage": {"sourceUrl": "https://example.com/main.jpg"},
+                    "sourceLinks": [{"productUrl": "https://detail.1688.com/offer/1.html"}],
+                    "skuEntries": [
+                        {"id": "sku-1", "name": "Black", "componentSkus": []},
+                        {"id": "sku-2", "name": "Coffee", "componentSkus": []},
+                    ],
+                },
+                optimize_titles=False,
+                translate_variants=False,
+                user_id="user-1",
+            )
+
+        getter.assert_called_once()
+        self.assertEqual([row["category_id"] for row in rows], ["31075", "31075"])
+        self.assertEqual([row["product_attributes"] for row in rows], [attribute_text, attribute_text])
+        self.assertEqual([row["origin"] for row in rows], ["\u4e2d\u56fd-\u6d59\u6c5f\u7701", "\u4e2d\u56fd-\u6d59\u6c5f\u7701"])
 
 
 if __name__ == "__main__":

@@ -56,6 +56,71 @@ class AdminApiUsageTest(unittest.TestCase):
             finally:
                 database.DATABASE_PATH = original_path
 
+    def test_admin_api_channel_can_be_applied_to_stage_settings(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_path = database.DATABASE_PATH
+            database.DATABASE_PATH = Path(tmpdir) / "app.db"
+            try:
+                database.init_db()
+
+                from app.main import create_app
+
+                admin_client = TestClient(create_app())
+                admin_login = admin_client.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
+                self.assertEqual(admin_login.status_code, 200)
+
+                response = admin_client.get("/api/admin/api-channels")
+                self.assertEqual(response.status_code, 200)
+                self.assertTrue(response.json()["channels"])
+                self.assertTrue(response.json()["routes"])
+
+                update_response = admin_client.put(
+                    "/api/admin/api-channels",
+                    json={
+                        "items": [
+                            {
+                                "id": "custom_a",
+                                "name": "备用渠道 A",
+                                "enabled": True,
+                                "apiKey": "sk-custom-a",
+                                "baseUrl": "https://backup.example.com/v1",
+                                "textModel": "backup-chat",
+                                "imageModel": "backup-image",
+                            }
+                        ]
+                    },
+                )
+                self.assertEqual(update_response.status_code, 200)
+
+                apply_response = admin_client.post(
+                    "/api/admin/api-channels/apply",
+                    json={"stage": "title_split", "channelId": "custom_a", "model": "backup-chat-fast"},
+                )
+                self.assertEqual(apply_response.status_code, 200)
+
+                self.assertEqual(database.get_app_setting_value("OPENAI_TITLE_SPLIT_API_KEY"), "sk-custom-a")
+                self.assertEqual(
+                    database.get_app_setting_value("OPENAI_TITLE_SPLIT_BASE_URL"),
+                    "https://backup.example.com/v1",
+                )
+                self.assertEqual(database.get_app_setting_value("OPENAI_TITLE_SPLIT_MODEL"), "backup-chat-fast")
+
+                routes_by_stage = {item["stage"]: item for item in apply_response.json()["routes"]}
+                self.assertEqual(routes_by_stage["title_split"]["channelId"], "custom_a")
+                self.assertEqual(routes_by_stage["title_split"]["model"], "backup-chat-fast")
+
+                apply_all_response = admin_client.post(
+                    "/api/admin/api-channels/apply-all",
+                    json={"channelId": "custom_a", "textModel": "relay-text", "imageModel": "relay-image"},
+                )
+                self.assertEqual(apply_all_response.status_code, 200)
+                self.assertEqual(database.get_app_setting_value("OPENAI_TITLE_MODEL"), "relay-text")
+                self.assertEqual(database.get_app_setting_value("OPENAI_RECOMMENDATION_MODEL"), "relay-text")
+                self.assertEqual(database.get_app_setting_value("OPENAI_IMAGE_MODEL"), "relay-image")
+                self.assertEqual(database.get_app_setting_value("OPENAI_IMAGE_BASE_URL"), "https://backup.example.com/v1")
+            finally:
+                database.DATABASE_PATH = original_path
+
 
 if __name__ == "__main__":
     unittest.main()

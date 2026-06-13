@@ -34,10 +34,6 @@ def export_dianxiaomi_temu(
 ):
     user_id = str(current_user["id"])
     try:
-        # Export is the last mile. Browser export already prepares and polls the
-        # async attribute queue; this only prevents direct API calls from missing
-        # queue records while keeping the Excel download responsive.
-        prepare_product_attribute_jobs(payload.records, user_id=user_id, process_now=False)
         export_path = export_dianxiaomi_temu_template(
             payload.records,
             export_mode=payload.export_mode,
@@ -71,3 +67,11 @@ def dianxiaomi_product_attribute_status(
     current_user: dict[str, Any] = Depends(require_current_user),
 ):
     return get_product_attribute_queue_summary(user_id=str(current_user["id"]))
+
+
+@router.post("/dianxiaomi/product-attributes/status")
+def dianxiaomi_product_attribute_status_for_records(
+    payload: ProductAttributePrepareRequest,
+    current_user: dict[str, Any] = Depends(require_current_user),
+):
+    return get_product_attribute_queue_summary(user_id=str(current_user["id"]), records=payload.records)
