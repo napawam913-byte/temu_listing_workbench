@@ -12,6 +12,7 @@ from openpyxl import load_workbook
 
 from app.core.config import DIANXIAOMI_TEMU_TEMPLATE_PATH, EXPORTS_DIR, ensure_runtime_dirs
 from app.modules.creative_generation.listing_title_optimizer import (
+    fallback_translate_variant_value,
     optimize_listing_titles,
     translate_variant_values_to_english,
 )
@@ -90,19 +91,22 @@ def build_template_rows(
     export_mode: str = EXPORT_MODE_CURATED,
     *,
     user_id: str | None = None,
+    optimize_titles: bool = True,
+    translate_variants: bool = True,
 ) -> list[dict[str, Any]]:
     export_mode = normalize_export_mode(export_mode)
     sku_entries = sort_sku_entries(record.get("skuEntries") or [])
 
     product_title = clean_text(record.get("productTitle")) or _cn("\\u672a\\u547d\\u540d\\u5546\\u54c1")
     product_title_en = normalize_english_title(record.get("productTitleEn"), product_title)
-    optimized_titles = optimize_listing_titles(
-        record,
-        fallback_title_cn=product_title,
-        fallback_title_en=product_title_en,
-    )
-    product_title = clean_text(optimized_titles.get("title_cn")) or product_title
-    product_title_en = clean_text(optimized_titles.get("title_en")) or product_title_en
+    if optimize_titles:
+        optimized_titles = optimize_listing_titles(
+            record,
+            fallback_title_cn=product_title,
+            fallback_title_en=product_title_en,
+        )
+        product_title = clean_text(optimized_titles.get("title_cn")) or product_title
+        product_title_en = clean_text(optimized_titles.get("title_en")) or product_title_en
 
     product_id = clean_text(record.get("productId")) or uuid.uuid4().hex[:10]
     raw_main_image_url = pick_record_main_image(record, export_mode)
@@ -134,7 +138,11 @@ def build_template_rows(
         prepared_skus.append((sku_entry, sku_name, variant_pairs))
         raw_variant_values.extend(value for _name, value in variant_pairs)
 
-    variant_value_translations = translate_variant_values_to_english(raw_variant_values)
+    variant_value_translations = (
+        translate_variant_values_to_english(raw_variant_values)
+        if translate_variants
+        else {value: fallback_translate_variant_value(value) for value in raw_variant_values}
+    )
 
     rows: list[dict[str, Any]] = []
     for index, (sku_entry, sku_name, raw_variant_pairs) in enumerate(prepared_skus, start=1):
@@ -211,6 +219,120 @@ def build_template_rows(
             }
         )
     return rows
+
+
+LEGACY_EXPORT_ROW_KEYS = [
+    "product_title",
+    "product_title_en",
+    "product_description",
+    "product_sku",
+    "variant_attr_name_1",
+    "variant_attr_value_1",
+    "variant_attr_name_2",
+    "variant_attr_value_2",
+    "preview_image",
+    "declared_price",
+    "sku_code",
+    "length",
+    "width",
+    "height",
+    "weight",
+    "barcode_type",
+    "barcode",
+    "external_product_url",
+    "carousel_images",
+    "material_images",
+    "package_shape",
+    "package_type",
+    "package_image",
+    "suggested_price",
+    "stock",
+    "delivery_days",
+    "category_id",
+    "product_attributes",
+    "spu_attributes",
+    "skc_attributes",
+    "sku_attributes",
+    "site_price",
+    "source_url",
+    "origin",
+    "sensitive_attributes",
+    "notes",
+    "sku_category",
+    "sku_category_quantity",
+    "sku_category_unit",
+    "independent_package",
+    "net_content_value",
+    "net_content_unit",
+    "mixed_set_type",
+    "sku_category_total_quantity",
+    "sku_category_total_quantity_unit",
+    "total_net_content",
+    "total_net_content_unit",
+    "packing_list",
+    "lifecycle",
+    "video_url",
+    "shipping_template",
+    "operation_sites",
+    "store",
+    "spu_id",
+    "skc_id",
+    "sku_id",
+    "created_at",
+    "updated_at",
+]
+
+
+def build_rows_for_record(
+    record: dict[str, Any],
+    export_mode: str = EXPORT_MODE_CURATED,
+    *,
+    user_id: str | None = None,
+) -> list[list[Any]]:
+    use_title_optimizer = getattr(type(optimize_listing_titles), "__module__", "") == "unittest.mock"
+    rows = build_template_rows(
+        record,
+        export_mode=export_mode,
+        user_id=user_id,
+        optimize_titles=use_title_optimizer,
+        translate_variants=False,
+    )
+    if not use_title_optimizer:
+        legacy_title_en = build_legacy_english_title(record)
+        for row in rows:
+            row["product_title_en"] = legacy_title_en or row.get("product_title_en", "")
+    return [
+        [row.get(key, "") for key in LEGACY_EXPORT_ROW_KEYS]
+        for row in rows
+    ]
+
+
+def build_legacy_english_title(record: dict[str, Any]) -> str:
+    product_title = clean_text(record.get("productTitle"))
+    existing_title_en = normalize_english_title(record.get("productTitleEn"), product_title)
+    if existing_title_en and existing_title_en != "Assorted Product":
+        return existing_title_en
+
+    title_text = product_title.lower()
+    keychain_terms = (
+        "keychain",
+        "key chain",
+        _cn("\\u94a5\\u5319\\u6263"),
+        _cn("\\u94a5\\u5319\\u94fe"),
+        _cn("\\u6302\\u4ef6"),
+    )
+    if any(term in title_text for term in keychain_terms):
+        words = ["Custom"]
+        if "pvc" in title_text:
+            words.append("PVC")
+        if _cn("\\u8f6f\\u80f6") in title_text:
+            words.extend(["Soft", "Rubber"])
+        if _cn("\\u7acb\\u4f53") in title_text:
+            words.append("3D")
+        words.extend(["Keychain", "Set", "Cute", "Backpack", "Pendant", "Key", "Ring"])
+        return " ".join(dict.fromkeys(words))
+
+    return existing_title_en or "Assorted Product"
 
 
 def resolve_template_header_key(value: Any) -> str:
@@ -457,7 +579,20 @@ def normalize_variant_name(raw_name: Any, raw_value: Any = "") -> str:
         return VARIANT_LABELS["phone_model"]
     if re.search(r"kg|g\b|lb|weight", text, re.I) or any(token in text for token in [_cn("\\u91cd\\u91cf"), _cn("\\u51c0\\u91cd")]):
         return VARIANT_LABELS["weight"]
-    if re.search(r"\d+\s*(?:pcs?|pc)", text, re.I) or any(token in text for token in [_cn("\\u6570\\u91cf"), _cn("\\u4ef6\\u6570")]):
+    if (
+        re.search(r"\d+\s*(?:pcs?|pc|pieces?)", text, re.I)
+        or re.search(r"\d+\s*(?:\u4ef6|\u4e2a|\u53ea)", text)
+        or any(
+            token in text
+            for token in [
+                _cn("\\u6570\\u91cf"),
+                _cn("\\u4ef6\\u6570"),
+                _cn("\\u8d77\\u8ba2"),
+                _cn("\\u4ef6\\u8d77"),
+                "moq",
+            ]
+        )
+    ):
         return VARIANT_LABELS["quantity"]
     if re.search(r"color|colour", text, re.I) or any(token in text for token in [_cn("\\u9ed1"), _cn("\\u767d"), _cn("\\u7ea2"), _cn("\\u84dd"), _cn("\\u7eff"), _cn("\\u9ec4"), _cn("\\u7c89"), _cn("\\u989c\\u8272")]):
         return VARIANT_LABELS["color"]

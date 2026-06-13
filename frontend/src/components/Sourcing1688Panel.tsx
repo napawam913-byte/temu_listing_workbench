@@ -90,6 +90,18 @@ function buildKeyword(product: Product) {
     .join(' ');
 }
 
+function build1688KeywordSearchUrl(keyword: string) {
+  const search = new URLSearchParams({ keyword });
+  return `${API_BASE_URL}/api/sourcing/1688/search?${search.toString()}`;
+}
+
+function build1688TitleSearchUrl(product: Product) {
+  const title = product.title.trim() || product.titleEn?.trim() || product.sourceProductId || product.id;
+  const search = new URLSearchParams({ title });
+  if (product.categoryPath || product.category) search.set('category', product.categoryPath || product.category);
+  return `${API_BASE_URL}/api/sourcing/1688/title-search?${search.toString()}`;
+}
+
 function getSmartRecommendProductKey(product: Product) {
   return [
     product.sourceType || 'product',
@@ -472,9 +484,7 @@ function Smart1688KeywordRecommendations({ product }: { product: Product }) {
           <div className="smart-keyword-grid">
             {keywords.map((item) => {
               const checked = selectedKeywords.includes(item.keyword);
-              const searchUrl =
-                item.searchUrl ||
-                `https://s.1688.com/selloffer/offer_search.htm?keywords=${encodeURIComponent(item.keyword)}`;
+              const searchUrl = item.searchUrl || build1688KeywordSearchUrl(item.keyword);
               return (
                 <label className={`smart-keyword-card ${checked ? 'smart-keyword-card-active' : ''}`} key={item.keyword}>
                   <Checkbox checked={checked} onChange={(event) => toggleKeyword(item.keyword, event.target.checked)} />
@@ -1346,8 +1356,7 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
   };
 
   const open1688 = () => {
-    const search = new URLSearchParams({ keyword });
-    window.open(`${API_BASE_URL}/api/sourcing/1688/search?${search.toString()}`, '_blank', 'noopener,noreferrer');
+    window.open(build1688TitleSearchUrl(product), '_blank', 'noopener,noreferrer');
   };
 
   const selectedCandidateMainImageUrl = selectedCandidate ? getCandidateMainImageUrl(selectedCandidate) : undefined;

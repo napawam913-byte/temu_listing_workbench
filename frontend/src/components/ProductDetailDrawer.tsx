@@ -1,5 +1,6 @@
-import { Button, Descriptions, Drawer, Image, Space, Tag, Typography } from 'antd';
+import { Button, Descriptions, Drawer, Image, Space, Tag, Tooltip, Typography } from 'antd';
 import { useEffect, useState } from 'react';
+import { API_BASE_URL } from '../api/backendApi';
 import { mockCandidates } from '../mock/products';
 import type { LinkListRecord } from '../types/linkList';
 import type { Product, SourcingCandidate } from '../types/product';
@@ -64,6 +65,14 @@ function DrawerProductImage({ product }: { product: Product }) {
   );
 }
 
+function openProductTitle1688Search(product: Product) {
+  const title = product.title.trim() || product.titleEn?.trim() || product.sourceProductId || product.id;
+  const search = new URLSearchParams({ title });
+  if (product.categoryPath || product.category) search.set('category', product.categoryPath || product.category);
+  const searchUrl = `${API_BASE_URL}/api/sourcing/1688/title-search?${search.toString()}`;
+  window.open(searchUrl, '_blank', 'noopener,noreferrer');
+}
+
 export function ProductDetailDrawer({
   open,
   product,
@@ -100,7 +109,17 @@ export function ProductDetailDrawer({
       <div className="drawer-layout">
         <aside className="drawer-product-side">
           <DrawerProductImage product={product} />
-          <Title level={4}>{product.title}</Title>
+          <Tooltip placement="topLeft" title="点击去 1688 搜索">
+            <Title className="drawer-product-search-title" level={4}>
+              <button
+                aria-label={`点击去 1688 搜索：${product.title}`}
+                type="button"
+                onClick={() => openProductTitle1688Search(product)}
+              >
+                {product.title}
+              </button>
+            </Title>
+          </Tooltip>
           <Text type="secondary">
             原始行：{product.sourceRow} · {product.category}
           </Text>

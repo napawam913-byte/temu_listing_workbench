@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import hashlib
 import hmac
+import os
+import re
 import sqlite3
 import secrets
 import uuid
@@ -14,10 +16,29 @@ from typing import Any, Iterator
 from app.modules.creative_generation.sensitive_terms_catalog import DEFAULT_SENSITIVE_TERMS
 from app.modules.recommendation.keyword_index import ensure_recommendation_schema, replace_product_keyword_index
 
+from . import config as app_config
 from .config import DATABASE_PATH, UPLOADS_DIR, WORKBENCH_DEFAULT_PASSWORD, WORKBENCH_DEFAULT_USERNAME, ensure_runtime_dirs
 
 
 DEFAULT_USER_ID = "default-user"
+CANONICAL_CATEGORY_PROVIDER = "dxm_temu"
+CATEGORY_AUTO_THRESHOLD = 0.82
+CATEGORY_REVIEW_THRESHOLD = 0.65
+MAPPING_STOP_TERMS = {
+    "and",
+    "or",
+    "the",
+    "with",
+    "for",
+    "other",
+    "others",
+    "\u5176\u4ed6",
+    "\u7528\u54c1",
+    "\u4ea7\u54c1",
+    "\u5546\u54c1",
+    "\u914d\u4ef6",
+    "\u7c7b",
+}
 
 
 def utc_now_text() -> str:
@@ -262,6 +283,7 @@ def init_db() -> None:
                 ON sensitive_terms(category);
             """
         )
+        ensure_api_usage_schema(conn)
         ensure_column(conn, "products", "source_type", "source_type TEXT NOT NULL DEFAULT 'yunqi'")
         ensure_column(conn, "products", "in_product_pool", "in_product_pool INTEGER NOT NULL DEFAULT 1")
         ensure_link_list_schema(conn)
@@ -269,6 +291,8 @@ def init_db() -> None:
         seed_default_user(conn)
         ensure_product_identity_index(conn)
         ensure_yunqi_category_schema(conn)
+        ensure_category_mapping_schema(conn)
+        sync_canonical_categories_from_dxm(conn)
         seed_product_pool_from_legacy_flag(conn)
         seed_product_pool_memberships_from_legacy(conn)
         ensure_recommendation_schema(conn)
@@ -279,6 +303,333 @@ def ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, d
     columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
     if column_name not in columns:
         conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {ddl}")
+
+
+def ensure_api_usage_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS api_usage_logs (
+            id TEXT PRIMARY KEY,
+            user_id TEXT,
+            provider TEXT NOT NULL DEFAULT '',
+            api_type TEXT NOT NULL DEFAULT '',
+            stage TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            call_count INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'success',
+            source TEXT NOT NULL DEFAULT 'runtime-log',
+            related_id TEXT,
+            error_message TEXT,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_api_usage_logs_model
+            ON api_usage_logs(provider, api_type, stage, model);
+        CREATE INDEX IF NOT EXISTS idx_api_usage_logs_created
+            ON api_usage_logs(created_at);
+        """
+    )
+
+
+def record_api_usage(
+    *,
+    provider: str,
+    api_type: str,
+    stage: str,
+    model: str,
+    user_id: str | None = None,
+    call_count: int = 1,
+    status: str = "success",
+    source: str = "runtime-log",
+    related_id: str | None = None,
+    error_message: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    now = utc_now_text()
+    usage_id = uuid.uuid4().hex
+    clean_status = str(status or "success").strip().lower()
+    if clean_status not in {"success", "failed"}:
+        clean_status = "success"
+    with get_connection() as conn:
+        ensure_api_usage_schema(conn)
+        conn.execute(
+            """
+            INSERT INTO api_usage_logs (
+                id, user_id, provider, api_type, stage, model, call_count, status, source,
+                related_id, error_message, metadata_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                usage_id,
+                clean_text(user_id),
+                clean_text(provider),
+                clean_text(api_type),
+                clean_text(stage),
+                clean_text(model) or "unknown",
+                max(1, int(call_count or 1)),
+                clean_status,
+                clean_text(source) or "runtime-log",
+                clean_text(related_id),
+                clean_text(error_message)[:2000] or None,
+                json.dumps(metadata or {}, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+        row = conn.execute("SELECT * FROM api_usage_logs WHERE id = ?", (usage_id,)).fetchone()
+    return api_usage_log_row_to_api(row)
+
+
+def get_api_usage_summary() -> dict[str, Any]:
+    with get_connection() as conn:
+        ensure_api_usage_schema(conn)
+        exact_rows = conn.execute(
+            """
+            SELECT
+                provider,
+                api_type,
+                stage,
+                model,
+                source,
+                SUM(call_count) AS call_count,
+                SUM(CASE WHEN status = 'success' THEN call_count ELSE 0 END) AS success_count,
+                SUM(CASE WHEN status = 'failed' THEN call_count ELSE 0 END) AS failed_count,
+                MAX(updated_at) AS last_called_at
+            FROM api_usage_logs
+            GROUP BY provider, api_type, stage, model, source
+            """
+        ).fetchall()
+        items = [api_usage_summary_row_to_api(row, is_inferred=False) for row in exact_rows]
+        items.extend(infer_api_usage_summary(conn))
+
+    merged = merge_api_usage_items(items)
+    total_calls = sum(int(item["callCount"] or 0) for item in merged)
+    exact_calls = sum(int(item["callCount"] or 0) for item in merged if not item["isInferred"])
+    inferred_calls = total_calls - exact_calls
+    return {
+        "items": merged,
+        "totalCalls": total_calls,
+        "exactCalls": exact_calls,
+        "inferredCalls": inferred_calls,
+    }
+
+
+def infer_api_usage_summary(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    if sqlite_table_exists(conn, "product_ai_analysis_cache"):
+        rows = conn.execute(
+            """
+            SELECT model, COUNT(*) AS call_count, MAX(updated_at) AS last_called_at
+            FROM product_ai_analysis_cache
+            WHERE model != '' AND model != 'rule-fallback'
+            GROUP BY model
+            """
+        ).fetchall()
+        for row in rows:
+            items.append(
+                make_api_usage_summary_item(
+                    provider="openai-compatible",
+                    api_type="chat",
+                    stage="recommendation",
+                    model=row["model"],
+                    call_count=int(row["call_count"] or 0),
+                    success_count=int(row["call_count"] or 0),
+                    failed_count=0,
+                    last_called_at=row["last_called_at"],
+                    source="inferred-cache",
+                    is_inferred=True,
+                    notes="from product_ai_analysis_cache rows",
+                )
+            )
+
+    if sqlite_table_exists(conn, "visual_generation_tasks"):
+        visual_counts = infer_visual_task_api_usage(conn)
+        items.extend(visual_counts)
+    return items
+
+
+def infer_visual_task_api_usage(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    settings = read_setting_values(conn)
+    analysis_model = runtime_setting_value(settings, "OPENAI_VISUAL_ANALYSIS_MODEL", "OPENAI_TEXT_MODEL", "gpt-5.5")
+    prompt_model = runtime_setting_value(settings, "OPENAI_VISUAL_PROMPT_MODEL", "OPENAI_TEXT_MODEL", "gpt-5.5")
+    image_model = runtime_setting_value(settings, "OPENAI_IMAGE_MODEL", "", "gpt-image-2")
+    rows = conn.execute(
+        """
+        SELECT status, analysis_json, mother_image_path, mother_image_url, updated_at
+        FROM visual_generation_tasks
+        WHERE status != 'draft'
+        """
+    ).fetchall()
+    counts: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        last_called_at = row["updated_at"]
+        analysis = parse_json_text(row["analysis_json"], {})
+        if isinstance(analysis, dict) and analysis:
+            add_inferred_usage_count(counts, "visual-analysis", analysis_model, last_called_at)
+            add_inferred_usage_count(counts, "visual-prompt", prompt_model, last_called_at)
+        if row["mother_image_path"] or row["mother_image_url"] or row["status"] in {"split", "completed"}:
+            add_inferred_usage_count(counts, "visual-image", image_model, last_called_at, api_type="image")
+
+    return [
+        make_api_usage_summary_item(
+            provider="openai-compatible",
+            api_type=value["apiType"],
+            stage=stage,
+            model=model,
+            call_count=value["callCount"],
+            success_count=value["callCount"],
+            failed_count=0,
+            last_called_at=value["lastCalledAt"],
+            source="inferred-visual-task",
+            is_inferred=True,
+            notes="from visual_generation_tasks state",
+        )
+        for (stage, model), value in counts.items()
+    ]
+
+
+def add_inferred_usage_count(
+    counts: dict[tuple[str, str], dict[str, Any]],
+    stage: str,
+    model: str,
+    last_called_at: str | None,
+    *,
+    api_type: str = "chat",
+) -> None:
+    key = (stage, model or "unknown")
+    current = counts.setdefault(key, {"apiType": api_type, "callCount": 0, "lastCalledAt": None})
+    current["callCount"] += 1
+    if last_called_at and (not current["lastCalledAt"] or last_called_at > current["lastCalledAt"]):
+        current["lastCalledAt"] = last_called_at
+
+
+def merge_api_usage_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    for item in items:
+        key = (
+            item["provider"],
+            item["apiType"],
+            item["stage"],
+            item["model"],
+            item["source"],
+        )
+        current = merged.get(key)
+        if not current:
+            merged[key] = dict(item)
+            continue
+        current["callCount"] += item["callCount"]
+        current["successCount"] += item["successCount"]
+        current["failedCount"] += item["failedCount"]
+        last_called_at = item.get("lastCalledAt")
+        if last_called_at and (not current.get("lastCalledAt") or last_called_at > current["lastCalledAt"]):
+            current["lastCalledAt"] = last_called_at
+    return sorted(
+        merged.values(),
+        key=lambda item: (-int(item["callCount"] or 0), item["model"], item["stage"], item["source"]),
+    )
+
+
+def api_usage_log_row_to_api(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "userId": row["user_id"],
+        "provider": row["provider"],
+        "apiType": row["api_type"],
+        "stage": row["stage"],
+        "model": row["model"],
+        "callCount": int(row["call_count"] or 0),
+        "status": row["status"],
+        "source": row["source"],
+        "relatedId": row["related_id"],
+        "errorMessage": row["error_message"],
+        "metadata": parse_json_text(row["metadata_json"], {}),
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+def api_usage_summary_row_to_api(row: sqlite3.Row, *, is_inferred: bool) -> dict[str, Any]:
+    return make_api_usage_summary_item(
+        provider=row["provider"],
+        api_type=row["api_type"],
+        stage=row["stage"],
+        model=row["model"],
+        call_count=int(row["call_count"] or 0),
+        success_count=int(row["success_count"] or 0),
+        failed_count=int(row["failed_count"] or 0),
+        last_called_at=row["last_called_at"],
+        source=row["source"],
+        is_inferred=is_inferred,
+    )
+
+
+def make_api_usage_summary_item(
+    *,
+    provider: str,
+    api_type: str,
+    stage: str,
+    model: str,
+    call_count: int,
+    success_count: int,
+    failed_count: int,
+    last_called_at: str | None,
+    source: str,
+    is_inferred: bool,
+    notes: str = "",
+) -> dict[str, Any]:
+    return {
+        "id": "|".join([provider or "unknown", api_type or "unknown", stage or "unknown", model or "unknown", source or "unknown"]),
+        "provider": provider or "unknown",
+        "apiType": api_type or "unknown",
+        "stage": stage or "unknown",
+        "model": model or "unknown",
+        "callCount": int(call_count or 0),
+        "successCount": int(success_count or 0),
+        "failedCount": int(failed_count or 0),
+        "lastCalledAt": last_called_at,
+        "source": source or "runtime-log",
+        "isInferred": is_inferred,
+        "notes": notes,
+    }
+
+
+def sqlite_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone() is not None
+
+
+def read_setting_values(conn: sqlite3.Connection) -> dict[str, str]:
+    if not sqlite_table_exists(conn, "app_settings"):
+        return {}
+    rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
+    return {row["key"]: str(row["value"] or "") for row in rows}
+
+
+def runtime_setting_value(settings: dict[str, str], key: str, fallback_key: str, default: str) -> str:
+    value = settings.get(key) or os.getenv(key, "").strip()
+    if value:
+        return value
+    if fallback_key:
+        value = settings.get(fallback_key) or os.getenv(fallback_key, "").strip() or str(getattr(app_config, fallback_key, "") or "")
+        if value:
+            return value
+    return str(getattr(app_config, key, "") or default).strip() or default
+
+
+def clean_text(value: Any) -> str:
+    return " ".join(str(value or "").split()).strip()
+
+
+def parse_json_text(value: str | None, fallback: Any) -> Any:
+    try:
+        return json.loads(value or "")
+    except (TypeError, ValueError):
+        return fallback
 
 
 def ensure_link_list_schema(conn: sqlite3.Connection) -> None:
@@ -414,6 +765,298 @@ def ensure_yunqi_category_schema(conn: sqlite3.Connection) -> None:
     )
     ensure_column(conn, "yunqi_categories", "is_active", "is_active INTEGER NOT NULL DEFAULT 1")
     ensure_column(conn, "yunqi_categories", "source_snapshot_path", "source_snapshot_path TEXT")
+
+
+def ensure_category_mapping_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS canonical_categories (
+            id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL DEFAULT 'dxm_temu',
+            external_category_id TEXT NOT NULL DEFAULT '',
+            parent_id TEXT,
+            level INTEGER NOT NULL DEFAULT 1,
+            name TEXT NOT NULL,
+            path_text TEXT NOT NULL,
+            path_parts_json TEXT NOT NULL DEFAULT '[]',
+            embedding_text TEXT NOT NULL DEFAULT '',
+            embedding_json TEXT NOT NULL DEFAULT '{}',
+            attr_count INTEGER NOT NULL DEFAULT 0,
+            required_count INTEGER NOT NULL DEFAULT 0,
+            source_hash TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_canonical_categories_provider_path
+            ON canonical_categories(provider, path_text);
+        CREATE INDEX IF NOT EXISTS idx_canonical_categories_parent
+            ON canonical_categories(parent_id);
+        CREATE INDEX IF NOT EXISTS idx_canonical_categories_provider_status
+            ON canonical_categories(provider, status);
+        CREATE INDEX IF NOT EXISTS idx_canonical_categories_external_id
+            ON canonical_categories(provider, external_category_id);
+
+        CREATE TABLE IF NOT EXISTS product_category_matches (
+            id TEXT PRIMARY KEY,
+            product_id TEXT NOT NULL,
+            source_type TEXT NOT NULL DEFAULT '',
+            source_category_path TEXT NOT NULL DEFAULT '',
+            source_title TEXT NOT NULL DEFAULT '',
+            canonical_category_id TEXT,
+            canonical_category_path TEXT NOT NULL DEFAULT '',
+            match_score REAL NOT NULL DEFAULT 0,
+            match_method TEXT NOT NULL DEFAULT 'unmatched',
+            status TEXT NOT NULL DEFAULT 'unmatched',
+            candidates_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(product_id) REFERENCES products(id),
+            FOREIGN KEY(canonical_category_id) REFERENCES canonical_categories(id)
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_product_category_matches_product
+            ON product_category_matches(product_id);
+        CREATE INDEX IF NOT EXISTS idx_product_category_matches_category
+            ON product_category_matches(canonical_category_id, status);
+        CREATE INDEX IF NOT EXISTS idx_product_category_matches_status
+            ON product_category_matches(status);
+        """
+    )
+
+
+def sync_canonical_categories_from_dxm(conn: sqlite3.Connection, *, force: bool = False) -> int:
+    ensure_category_mapping_schema(conn)
+    if not force and canonical_category_count(conn) > 0:
+        return 0
+    if not sqlite_table_exists(conn, "dxm_temu_category_attr_snapshots"):
+        return 0
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                category_id, category_path_text, category_path_json, node_path_id,
+                category_depth, level1_id, level1_name, level2_id, level2_name,
+                level3_id, level3_name, level4_id, level4_name, level5_id,
+                level5_name, level6_id, level6_name, leaf_name, attr_count,
+                required_count, collection_status
+            FROM dxm_temu_category_attr_snapshots
+            WHERE category_path_text IS NOT NULL
+                AND category_path_text != ''
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return 0
+
+    now = utc_now_text()
+    records: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        parts = dxm_snapshot_path_parts(row)
+        if not parts:
+            continue
+        path_ids = dxm_snapshot_path_ids(row)
+        leaf_level = len(parts)
+        for index in range(leaf_level):
+            level = index + 1
+            prefix_parts = parts[:level]
+            path_text = normalize_category_path_text("/".join(prefix_parts))
+            if not path_text:
+                continue
+            category_id = canonical_category_id(CANONICAL_CATEGORY_PROVIDER, path_text)
+            parent_path = normalize_category_path_text("/".join(prefix_parts[:-1])) if level > 1 else ""
+            parent_id = canonical_category_id(CANONICAL_CATEGORY_PROVIDER, parent_path) if parent_path else None
+            external_id = path_ids[index] if index < len(path_ids) else ""
+            if level == leaf_level:
+                external_id = clean_text(row["category_id"]) or external_id
+            attr_count = int(row["attr_count"] or 0) if level == leaf_level else 0
+            required_count = int(row["required_count"] or 0) if level == leaf_level else 0
+            embedding_text = build_category_embedding_text(prefix_parts, row if level == leaf_level else None)
+            existing = records.get(category_id)
+            if existing:
+                existing["attr_count"] = max(int(existing["attr_count"] or 0), attr_count)
+                existing["required_count"] = max(int(existing["required_count"] or 0), required_count)
+                if external_id and not existing["external_category_id"]:
+                    existing["external_category_id"] = external_id
+                continue
+
+            records[category_id] = {
+                "id": category_id,
+                "provider": CANONICAL_CATEGORY_PROVIDER,
+                "external_category_id": external_id,
+                "parent_id": parent_id,
+                "level": level,
+                "name": clean_text(prefix_parts[-1]),
+                "path_text": path_text,
+                "path_parts_json": json.dumps(prefix_parts, ensure_ascii=False),
+                "embedding_text": embedding_text,
+                "embedding_json": json.dumps(build_text_vector(embedding_text), ensure_ascii=False, sort_keys=True),
+                "attr_count": attr_count,
+                "required_count": required_count,
+                "source_hash": hashlib.sha1(
+                    f"{CANONICAL_CATEGORY_PROVIDER}:{path_text}:{external_id}".encode("utf-8")
+                ).hexdigest(),
+                "status": "active",
+                "created_at": now,
+                "updated_at": now,
+            }
+
+    if not records:
+        return 0
+
+    conn.executemany(
+        """
+        INSERT INTO canonical_categories (
+            id, provider, external_category_id, parent_id, level, name, path_text,
+            path_parts_json, embedding_text, embedding_json, attr_count, required_count,
+            source_hash, status, created_at, updated_at
+        ) VALUES (
+            :id, :provider, :external_category_id, :parent_id, :level, :name, :path_text,
+            :path_parts_json, :embedding_text, :embedding_json, :attr_count, :required_count,
+            :source_hash, :status, :created_at, :updated_at
+        )
+        ON CONFLICT(id) DO UPDATE SET
+            external_category_id = CASE
+                WHEN excluded.external_category_id != '' THEN excluded.external_category_id
+                ELSE canonical_categories.external_category_id
+            END,
+            parent_id = excluded.parent_id,
+            level = excluded.level,
+            name = excluded.name,
+            path_text = excluded.path_text,
+            path_parts_json = excluded.path_parts_json,
+            embedding_text = excluded.embedding_text,
+            embedding_json = excluded.embedding_json,
+            attr_count = MAX(canonical_categories.attr_count, excluded.attr_count),
+            required_count = MAX(canonical_categories.required_count, excluded.required_count),
+            source_hash = excluded.source_hash,
+            status = 'active',
+            updated_at = excluded.updated_at
+        """,
+        list(records.values()),
+    )
+    return len(records)
+
+
+def canonical_category_count(conn: sqlite3.Connection) -> int:
+    if not sqlite_table_exists(conn, "canonical_categories"):
+        return 0
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM canonical_categories
+        WHERE provider = ? AND status = 'active'
+        """,
+        (CANONICAL_CATEGORY_PROVIDER,),
+    ).fetchone()
+    return int(row["count"] or 0) if row else 0
+
+
+def canonical_category_id(provider: str, path_text: str) -> str:
+    normalized = normalize_category_path_text(path_text)
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"canonical-category:{provider}:{normalized}").hex
+
+
+def dxm_snapshot_path_parts(row: sqlite3.Row) -> list[str]:
+    parts = parse_category_path_parts(row["category_path_json"], row["category_path_text"])
+    if not parts:
+        parts = [clean_text(row[f"level{level}_name"]) for level in range(1, 7) if clean_text(row[f"level{level}_name"])]
+    return [part for part in parts if part]
+
+
+def dxm_snapshot_path_ids(row: sqlite3.Row) -> list[str]:
+    node_path_id = clean_text(row["node_path_id"])
+    parts = [part for part in re.split(r"[/>\s,]+", node_path_id) if clean_text(part)]
+    if parts:
+        return parts
+    return [clean_text(row[f"level{level}_id"]) for level in range(1, 7) if clean_text(row[f"level{level}_id"])]
+
+
+def build_category_embedding_text(path_parts: list[str], row: sqlite3.Row | None = None) -> str:
+    values = list(path_parts)
+    if row is not None:
+        values.extend(
+            [
+                clean_text(row["leaf_name"]),
+                clean_text(row["category_id"]),
+                f"attr_count:{int(row['attr_count'] or 0)}",
+                f"required_count:{int(row['required_count'] or 0)}",
+            ]
+        )
+    return clean_text(" ".join(value for value in values if clean_text(value)))
+
+
+def normalize_category_path_text(value: Any) -> str:
+    return "/".join(category_path_parts_from_text(value))
+
+
+def category_path_parts_from_text(value: Any) -> list[str]:
+    return [part for part in re.split(r"[/>\u203a\u300b]+", clean_text(value)) if clean_text(part)]
+
+
+def build_text_vector(value: Any) -> dict[str, float]:
+    terms = extract_mapping_terms(value)
+    vector: dict[str, float] = {}
+    for term in terms:
+        vector[term] = vector.get(term, 0.0) + 1.0
+    for alias_group in CATEGORY_ALIAS_GROUPS:
+        if any(term in vector for term in alias_group):
+            for alias in alias_group:
+                vector[alias] = max(vector.get(alias, 0.0), 0.35)
+    return vector
+
+
+CATEGORY_ALIAS_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("garden", "gardening", "lawn", "yard", "patio", "\u82b1\u56ed", "\u56ed\u827a", "\u5ead\u9662", "\u8349\u576a"),
+    ("pet", "pets", "dog", "cat", "bird", "\u5ba0\u7269", "\u72d7", "\u732b", "\u9e1f"),
+    ("home", "household", "decor", "decoration", "\u5bb6\u5c45", "\u88c5\u9970", "\u6446\u4ef6"),
+    ("jewelry", "necklace", "bracelet", "ring", "\u9970\u54c1", "\u9996\u9970", "\u9879\u94fe", "\u624b\u94fe", "\u6212\u6307"),
+    ("kitchen", "cook", "cooking", "\u53a8\u623f", "\u70f9\u996a"),
+    ("baby", "kids", "children", "\u5a74\u513f", "\u513f\u7ae5", "\u5b69\u5b50"),
+    ("office", "school", "book", "media", "\u529e\u516c", "\u5b66\u6821", "\u4e66\u7c4d", "\u5a92\u4f53"),
+    ("health", "beauty", "\u5065\u5eb7", "\u7f8e\u5bb9"),
+)
+
+
+def extract_mapping_terms(value: Any) -> list[str]:
+    text = clean_text(value).lower()
+    terms: list[str] = []
+    for chunk in re.findall(r"[\u4e00-\u9fff]{2,}|[a-z0-9][a-z0-9&+.#-]{1,}", text):
+        term = normalize_mapping_term(chunk)
+        if not term:
+            continue
+        terms.append(term)
+        if re.fullmatch(r"[\u4e00-\u9fff]+", term) and len(term) > 4:
+            terms.extend(chinese_mapping_ngrams(term))
+    return unique_mapping_terms(terms)
+
+
+def chinese_mapping_ngrams(value: str) -> list[str]:
+    terms: list[str] = []
+    max_size = min(6, len(value))
+    for size in range(max_size, 1, -1):
+        for index in range(0, len(value) - size + 1):
+            term = normalize_mapping_term(value[index : index + size])
+            if term:
+                terms.append(term)
+    return terms[:50]
+
+
+def normalize_mapping_term(value: Any) -> str:
+    return re.sub(r"[^\u4e00-\u9fffA-Za-z0-9&+.#-]+", "", clean_text(value).lower()).strip()
+
+
+def unique_mapping_terms(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        term = normalize_mapping_term(value)
+        if not term or term in seen or len(term) > 40:
+            continue
+        seen.add(term)
+        result.append(term)
+    return result
 
 
 def seed_default_user(conn: sqlite3.Connection) -> None:
@@ -1104,6 +1747,7 @@ def replace_products(batch_id: str, products: list[dict[str, Any]], *, add_to_po
             ],
         )
         replace_product_keyword_index(conn, products, now=now)
+        refresh_product_category_matches(conn, products, now=now)
         if add_to_pool_user_id:
             copy_products_to_pool(conn, [product["id"] for product in products], user_id=add_to_pool_user_id, now=now)
 
@@ -1394,6 +2038,7 @@ def list_products(
     order_sql = build_product_order_sql(sort_by, sort_order)
 
     with get_connection() as conn:
+        ensure_category_mapping_ready(conn, backfill_products=False)
         total = conn.execute(f"SELECT COUNT(*) FROM {from_sql} {where_sql}", params).fetchone()[0]
         rows = conn.execute(
             f"""
@@ -1475,11 +2120,361 @@ def get_product_stats(scope: str = "pool", *, user_id: str = DEFAULT_USER_ID) ->
     }
 
 
+def ensure_category_mapping_ready(conn: sqlite3.Connection, *, backfill_products: bool = False) -> None:
+    ensure_category_mapping_schema(conn)
+    if canonical_category_count(conn) == 0:
+        sync_canonical_categories_from_dxm(conn)
+    if backfill_products:
+        refresh_product_category_matches(conn)
+
+
 def get_product_categories() -> list[dict[str, Any]]:
+    canonical_options = get_canonical_category_options()
+    if canonical_options:
+        return canonical_options
     yunqi_options = get_yunqi_category_options()
     if yunqi_options:
         return yunqi_options
     return get_product_categories_from_products()
+
+
+def get_canonical_category_options() -> list[dict[str, Any]]:
+    with get_connection() as conn:
+        ensure_category_mapping_ready(conn, backfill_products=False)
+        category_rows = conn.execute(
+            """
+            SELECT id, level, name, path_text, path_parts_json
+            FROM canonical_categories
+            WHERE provider = ? AND status = 'active'
+            ORDER BY level ASC, path_text ASC
+            """,
+            (CANONICAL_CATEGORY_PROVIDER,),
+        ).fetchall()
+        if not category_rows:
+            return []
+
+        matched_rows = conn.execute(
+            """
+            SELECT cc.path_text, COUNT(DISTINCT pcm.product_id) AS count
+            FROM product_category_matches pcm
+            JOIN canonical_categories cc ON cc.id = pcm.canonical_category_id
+            JOIN products ON products.id = pcm.product_id
+            WHERE cc.provider = ?
+                AND pcm.status IN ('auto', 'review')
+                AND products.status != 'deleted'
+            GROUP BY cc.path_text
+            """,
+            (CANONICAL_CATEGORY_PROVIDER,),
+        ).fetchall()
+        source_category_rows = []
+        if not matched_rows:
+            source_category_rows = conn.execute(
+                """
+                SELECT category_path, COUNT(*) AS count
+                FROM products
+                WHERE status != 'deleted'
+                    AND COALESCE(category_path, '') != ''
+                GROUP BY category_path
+                """
+            ).fetchall()
+
+    prefix_counts: dict[str, int] = {}
+    for row in matched_rows:
+        path_text = normalize_category_path_text(row["path_text"])
+        count = int(row["count"] or 0)
+        parts = category_path_parts_from_text(path_text)
+        for index in range(1, len(parts) + 1):
+            prefix = normalize_category_path_text("/".join(parts[:index]))
+            prefix_counts[prefix] = prefix_counts.get(prefix, 0) + count
+    if not matched_rows:
+        for row in source_category_rows:
+            path_text = normalize_category_path_text(row["category_path"])
+            count = int(row["count"] or 0)
+            parts = category_path_parts_from_text(path_text)
+            for index in range(1, len(parts) + 1):
+                prefix = normalize_category_path_text("/".join(parts[:index]))
+                prefix_counts[prefix] = prefix_counts.get(prefix, 0) + count
+
+    nodes_by_path: dict[str, dict[str, Any]] = {}
+    parent_path_by_path: dict[str, str] = {}
+    for row in category_rows:
+        path_text = normalize_category_path_text(row["path_text"])
+        parts = parse_category_path_parts(row["path_parts_json"], path_text)
+        if not parts:
+            continue
+        level = int(row["level"] or len(parts) or 1)
+        if level > 4 or len(parts) > 4:
+            continue
+        count = prefix_counts.get(path_text, 0)
+        label = clean_text(row["name"]) or parts[-1]
+        nodes_by_path[path_text] = {
+            "value": path_text,
+            "label": label,
+            "count": count,
+            "level": min(level, 4),
+            "children": [],
+        }
+        if len(parts) > 1:
+            parent_path_by_path[path_text] = normalize_category_path_text("/".join(parts[:-1]))
+
+    options: list[dict[str, Any]] = []
+    for path_text, node in nodes_by_path.items():
+        parent_path = parent_path_by_path.get(path_text)
+        parent = nodes_by_path.get(parent_path or "")
+        if parent:
+            parent.setdefault("children", []).append(node)
+        elif int(node.get("level") or 1) <= 1:
+            options.append(node)
+
+    def sort_nodes(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        sorted_items = sorted(items, key=lambda item: (-int(item["count"] or 0), str(item["label"])))
+        for item in sorted_items:
+            item["children"] = sort_nodes(item.get("children") or [])
+        return sorted_items
+
+    return sort_nodes(options)
+
+
+def refresh_product_category_matches(
+    conn: sqlite3.Connection,
+    products: list[dict[str, Any]] | None = None,
+    *,
+    now: str | None = None,
+) -> int:
+    ensure_category_mapping_schema(conn)
+    sync_canonical_categories_from_dxm(conn)
+    categories = load_matchable_canonical_categories(conn)
+    if not categories:
+        return 0
+
+    timestamp = now or utc_now_text()
+    if products is None:
+        product_rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT products.*
+                FROM products
+                LEFT JOIN product_category_matches pcm
+                    ON pcm.product_id = products.id
+                WHERE products.status != 'deleted'
+                    AND (
+                        pcm.product_id IS NULL
+                        OR pcm.updated_at IS NULL
+                        OR datetime(pcm.updated_at) < datetime(products.updated_at)
+                    )
+                ORDER BY datetime(products.updated_at) DESC
+                """
+            ).fetchall()
+        ]
+    else:
+        product_rows = [dict(product) for product in products if clean_text(product.get("id"))]
+
+    for product in product_rows:
+        if clean_text(product.get("status") or "active") == "deleted":
+            continue
+        match = build_product_category_match(product, categories, now=timestamp)
+        upsert_product_category_match(conn, match)
+    return len(product_rows)
+
+
+def load_matchable_canonical_categories(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT id, external_category_id, level, name, path_text, path_parts_json, embedding_text, embedding_json
+        FROM canonical_categories
+        WHERE provider = ? AND status = 'active'
+        ORDER BY level DESC, path_text ASC
+        """,
+        (CANONICAL_CATEGORY_PROVIDER,),
+    ).fetchall()
+    categories: list[dict[str, Any]] = []
+    for row in rows:
+        vector = parse_json_text(row["embedding_json"], {})
+        if not isinstance(vector, dict) or not vector:
+            vector = build_text_vector(row["embedding_text"] or row["path_text"])
+        clean_vector = {str(key): float(value) for key, value in vector.items() if str(key)}
+        parts = parse_category_path_parts(row["path_parts_json"], row["path_text"])
+        categories.append(
+            {
+                "id": row["id"],
+                "external_category_id": row["external_category_id"],
+                "level": int(row["level"] or len(parts) or 1),
+                "name": row["name"],
+                "path_text": normalize_category_path_text(row["path_text"]),
+                "path_parts": parts,
+                "path_terms": set(extract_mapping_terms(" ".join(parts))),
+                "vector": clean_vector,
+            }
+        )
+    return categories
+
+
+def build_product_category_match(
+    product: dict[str, Any],
+    categories: list[dict[str, Any]],
+    *,
+    now: str,
+) -> dict[str, Any]:
+    product_id = clean_text(product.get("id"))
+    source_category_path = product_source_category_path(product)
+    source_title = clean_text(product.get("title") or product.get("title_cn") or product.get("title_en"))
+    source_text = clean_text(
+        " ".join(
+            [
+                source_title,
+                clean_text(product.get("title_cn")),
+                clean_text(product.get("title_en")),
+                source_category_path,
+                clean_text(product.get("category_level1")),
+                clean_text(product.get("category_level2")),
+            ]
+        )
+    )
+    source_vector = build_text_vector(source_text)
+    source_path = normalize_category_path_text(source_category_path)
+    source_parts = category_path_parts_from_text(source_category_path)
+    source_part_terms = {normalize_mapping_term(part) for part in source_parts if normalize_mapping_term(part)}
+
+    candidates: list[dict[str, Any]] = []
+    for category in categories:
+        score, method = score_category_candidate(
+            source_path=source_path,
+            source_part_terms=source_part_terms,
+            source_vector=source_vector,
+            category=category,
+        )
+        if score <= 0:
+            continue
+        candidates.append(
+            {
+                "id": category["id"],
+                "path": category["path_text"],
+                "name": category["name"],
+                "level": category["level"],
+                "score": round(score, 4),
+                "method": method,
+            }
+        )
+
+    candidates.sort(key=lambda item: (float(item["score"]), int(item["level"] or 0)), reverse=True)
+    best = candidates[0] if candidates else None
+    best_score = float(best["score"]) if best else 0.0
+    status = "unmatched"
+    if best and best_score >= CATEGORY_AUTO_THRESHOLD:
+        status = "auto"
+    elif best and best_score >= CATEGORY_REVIEW_THRESHOLD:
+        status = "review"
+
+    use_best = best if status != "unmatched" else None
+    return {
+        "id": uuid.uuid5(uuid.NAMESPACE_URL, f"product-category-match:{product_id}").hex,
+        "product_id": product_id,
+        "source_type": clean_text(product.get("source_type")) or "yunqi",
+        "source_category_path": source_category_path,
+        "source_title": source_title,
+        "canonical_category_id": use_best["id"] if use_best else None,
+        "canonical_category_path": use_best["path"] if use_best else "",
+        "match_score": best_score,
+        "match_method": best["method"] if best else "unmatched",
+        "status": status,
+        "candidates_json": json.dumps(candidates[:10], ensure_ascii=False),
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def score_category_candidate(
+    *,
+    source_path: str,
+    source_part_terms: set[str],
+    source_vector: dict[str, float],
+    category: dict[str, Any],
+) -> tuple[float, str]:
+    category_path = normalize_category_path_text(category["path_text"])
+    category_terms = set(category.get("path_terms") or set())
+    if source_path and source_path == category_path:
+        return 1.0, "exact"
+
+    score = 0.0
+    method = "vector"
+    if source_path and (source_path in category_path or category_path in source_path):
+        score = 0.9
+        method = "rule"
+
+    matched_parts = source_part_terms & category_terms
+    if matched_parts:
+        part_score = min(0.88, 0.62 + 0.08 * len(matched_parts))
+        if part_score > score:
+            score = part_score
+            method = "rule"
+
+    vector_score = cosine_similarity(source_vector, category.get("vector") or {})
+    if vector_score > score:
+        score = vector_score
+        method = "vector"
+
+    if 0 < score < 1.0:
+        score = min(0.99, score + min(0.04, max(0, int(category.get("level") or 1) - 1) * 0.01))
+    return score, method
+
+
+def cosine_similarity(left: dict[str, float], right: dict[str, float]) -> float:
+    if not left or not right:
+        return 0.0
+    dot = sum(float(value) * float(right.get(key, 0.0)) for key, value in left.items())
+    if dot <= 0:
+        return 0.0
+    left_norm = sum(float(value) * float(value) for value in left.values()) ** 0.5
+    right_norm = sum(float(value) * float(value) for value in right.values()) ** 0.5
+    if not left_norm or not right_norm:
+        return 0.0
+    return dot / (left_norm * right_norm)
+
+
+def product_source_category_path(product: dict[str, Any]) -> str:
+    parts = category_path_parts_from_text(product.get("category_path"))
+    if not parts:
+        parts = [
+            clean_text(product.get("category_level1")),
+            clean_text(product.get("category_level2")),
+        ]
+    return normalize_category_path_text("/".join(part for part in parts if part))
+
+
+def upsert_product_category_match(conn: sqlite3.Connection, match: dict[str, Any]) -> None:
+    if not match.get("product_id"):
+        return
+    conn.execute(
+        """
+        INSERT INTO product_category_matches (
+            id, product_id, source_type, source_category_path, source_title,
+            canonical_category_id, canonical_category_path, match_score, match_method,
+            status, candidates_json, created_at, updated_at
+        ) VALUES (
+            :id, :product_id, :source_type, :source_category_path, :source_title,
+            :canonical_category_id, :canonical_category_path, :match_score, :match_method,
+            :status, :candidates_json, :created_at, :updated_at
+        )
+        ON CONFLICT(product_id) DO UPDATE SET
+            source_type = excluded.source_type,
+            source_category_path = excluded.source_category_path,
+            source_title = excluded.source_title,
+            canonical_category_id = excluded.canonical_category_id,
+            canonical_category_path = excluded.canonical_category_path,
+            match_score = excluded.match_score,
+            match_method = excluded.match_method,
+            status = excluded.status,
+            candidates_json = excluded.candidates_json,
+            updated_at = excluded.updated_at
+        """,
+        match,
+    )
+
+
+def is_all_category_filter(value: str | None) -> bool:
+    normalized = clean_text(value).lower()
+    return normalized in {"", "all", "__all__", "\u5168\u90e8", "\u5168\u90e8\u7c7b\u76ee"}
 
 
 def get_yunqi_category_options() -> list[dict[str, Any]]:
@@ -1661,14 +2656,44 @@ def build_product_where(
         )
         params.extend([like, like, like, like])
 
-    if category and category != "全部类目":
-        normalized_category = category.strip()
-        if "/" in normalized_category:
-            where.append("products.category_path = ?")
-            params.append(normalized_category)
-        else:
-            where.append("(products.category_level1 = ? OR products.category_level2 = ?)")
-            params.extend([normalized_category, normalized_category])
+    if category and not is_all_category_filter(category):
+        raw_category = category.strip()
+        normalized_category = normalize_category_path_text(raw_category)
+        where.append(
+            """
+            (
+                EXISTS (
+                    SELECT 1
+                    FROM product_category_matches pcm
+                    JOIN canonical_categories cc
+                        ON cc.id = pcm.canonical_category_id
+                    WHERE pcm.product_id = products.id
+                        AND pcm.status IN ('auto', 'review')
+                        AND cc.provider = ?
+                        AND (cc.path_text = ? OR cc.path_text LIKE ?)
+                )
+                OR products.category_path = ?
+                OR products.category_path = ?
+                OR products.category_level1 = ?
+                OR products.category_level1 = ?
+                OR products.category_level2 = ?
+                OR products.category_level2 = ?
+            )
+            """
+        )
+        params.extend(
+            [
+                CANONICAL_CATEGORY_PROVIDER,
+                normalized_category,
+                f"{normalized_category}/%",
+                raw_category,
+                normalized_category,
+                raw_category,
+                normalized_category,
+                raw_category,
+                normalized_category,
+            ]
+        )
 
     if period == "近7天":
         where.append("datetime(products.listing_time) >= datetime('now', '-7 days')")

@@ -163,6 +163,7 @@ def get_openai_settings(stage: str | None = None) -> OpenAISettings:
     common_image_model = get_runtime_setting("OPENAI_IMAGE_MODEL", OPENAI_IMAGE_MODEL).strip() or "gpt-image-2"
     stage_prefixes = {
         "title": "OPENAI_TITLE",
+        "title_split": "OPENAI_TITLE_SPLIT",
         "recommendation": "OPENAI_RECOMMENDATION",
         "product_attribute": "OPENAI_PRODUCT_ATTRIBUTE",
         "visual_analysis": "OPENAI_VISUAL_ANALYSIS",

@@ -20,6 +20,7 @@ from app.core.database import (
     set_active_sourcing_product,
 )
 from app.modules.sourcing_1688.search_url import build_1688_search_url
+from app.modules.sourcing_1688.title_keywords import split_title_for_1688_search
 from app.modules.sourcing_1688.image_search_api import (
     ImageSearchApiError,
     ImageSearchConfigError,
@@ -118,6 +119,29 @@ def add_1688_material_to_products(material_id: str, current_user: dict[str, Any]
 def open_1688_search(keyword: str = Query(..., min_length=1)):
     try:
         return RedirectResponse(build_1688_search_url(keyword), status_code=302)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/title-keywords")
+def split_1688_title_keywords(
+    title: str = Query(..., min_length=1),
+    category: str | None = None,
+):
+    try:
+        return split_title_for_1688_search(title, category or "")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/title-search")
+def open_1688_title_search(
+    title: str = Query(..., min_length=1),
+    category: str | None = None,
+):
+    try:
+        result = split_title_for_1688_search(title, category or "")
+        return RedirectResponse(build_1688_search_url(result["primary_keyword"]), status_code=302)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

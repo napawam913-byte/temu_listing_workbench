@@ -1,6 +1,7 @@
 import {
   Button,
   Card,
+  Empty,
   Form,
   Input,
   Modal,
@@ -14,15 +15,17 @@ import {
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import type { CSSProperties } from 'react';
 import {
   createAdminUser,
+  fetchAdminApiUsage,
   fetchAdminSettings,
   fetchAdminUsers,
   resetAdminUserPassword,
   updateAdminSettings,
   updateAdminUser,
 } from '../api/backendApi';
-import type { AdminSetting, AdminSettingsUpdateItem, AdminUser } from '../api/backendApi';
+import type { AdminApiUsageItem, AdminApiUsageSummary, AdminSetting, AdminSettingsUpdateItem, AdminUser } from '../api/backendApi';
 
 type UserCreateForm = {
   username: string;
@@ -37,6 +40,27 @@ type PasswordResetState = {
   password: string;
 };
 
+const EMPTY_API_USAGE: AdminApiUsageSummary = {
+  items: [],
+  totalCalls: 0,
+  exactCalls: 0,
+  inferredCalls: 0,
+};
+
+const API_USAGE_COLORS = [
+  { solid: '#2563eb', soft: '#dbeafe' },
+  { solid: '#f97316', soft: '#ffedd5' },
+  { solid: '#14b8a6', soft: '#ccfbf1' },
+  { solid: '#8b5cf6', soft: '#ede9fe' },
+  { solid: '#e11d48', soft: '#ffe4e6' },
+  { solid: '#0ea5e9', soft: '#e0f2fe' },
+  { solid: '#84cc16', soft: '#ecfccb' },
+];
+const API_USAGE_DONUT_SIZE = 196;
+const API_USAGE_DONUT_CENTER = API_USAGE_DONUT_SIZE / 2;
+const API_USAGE_DONUT_RADIUS = 74;
+const API_USAGE_DONUT_STROKE = 18;
+const API_USAGE_DONUT_CIRCUMFERENCE = 2 * Math.PI * API_USAGE_DONUT_RADIUS;
 const SETTING_CATEGORY_ORDER = ['ai', 'visual', '1688', 'oss'];
 const AI_STAGE_CONFIGS = [
   {
@@ -46,6 +70,14 @@ const AI_STAGE_CONFIGS = [
     modelKey: 'OPENAI_TITLE_MODEL',
     modelFallbackKey: 'OPENAI_TEXT_MODEL',
     description: '中文标题、英文标题、变种值英文翻译',
+  },
+  {
+    title: '标题拆分',
+    apiKeyKey: 'OPENAI_TITLE_SPLIT_API_KEY',
+    baseUrlKey: 'OPENAI_TITLE_SPLIT_BASE_URL',
+    modelKey: 'OPENAI_TITLE_SPLIT_MODEL',
+    modelFallbackKey: 'OPENAI_TEXT_MODEL',
+    description: '把商品标题拆成 1688 采购搜索关键词',
   },
   {
     title: '智能推荐',
@@ -123,13 +155,70 @@ function secretSettingDisplay(setting?: AdminSetting, fallbackSetting?: AdminSet
   return setting?.maskedValue || fallbackSetting?.maskedValue || '';
 }
 
+function apiStageLabel(stage: string) {
+  if (stage === 'visual-analysis') return '图片理解';
+  if (stage === 'visual-prompt') return '提示词规划';
+  if (stage === 'visual-image') return '图片生成';
+  if (stage === 'recommendation') return '智能推荐';
+  if (stage === 'title') return '标题生成';
+  if (stage === 'title-split') return '标题拆分';
+  if (stage === 'product-attribute') return '产品属性';
+  return stage || '未知阶段';
+}
+
+function apiTypeLabel(apiType: string) {
+  if (apiType === 'chat') return '文本/视觉理解';
+  if (apiType === 'image') return '生图';
+  return apiType || '未知类型';
+}
+
+function apiUsageSourceLabel(source: string, isInferred: boolean) {
+  if (source === 'runtime-log') return '日志';
+  if (source === 'inferred-cache') return '缓存推断';
+  if (source === 'inferred-visual-task') return '任务推断';
+  return isInferred ? '推断' : source || '日志';
+}
+
+function buildApiUsageDonutSegments(items: AdminApiUsageItem[], total: number) {
+  if (!total) return [];
+  let cursor = 0;
+  const gap = items.length > 1 ? 5 : 0;
+  return items.map((item, index) => {
+    const rawLength = (item.callCount / total) * API_USAGE_DONUT_CIRCUMFERENCE;
+    const dashLength =
+      items.length > 1 && rawLength <= gap * 1.2
+        ? Math.max(rawLength * 0.65, 1.4)
+        : Math.max(rawLength - gap, 1.4);
+    const dashOffset = -(cursor + (items.length > 1 ? gap / 2 : 0));
+    const color = API_USAGE_COLORS[index % API_USAGE_COLORS.length].solid;
+    const soft = API_USAGE_COLORS[index % API_USAGE_COLORS.length].soft;
+    cursor += rawLength;
+    return {
+      model: item.model,
+      callCount: item.callCount,
+      color,
+      soft,
+      dashLength,
+      dashOffset,
+      percent: apiUsagePercent(item.callCount, total),
+    };
+  });
+}
+
+function apiUsagePercent(count: number, total: number) {
+  if (!total) return 0;
+  return Math.round((count / total) * 1000) / 10;
+}
+
 export function AdminPage() {
   const [form] = Form.useForm<UserCreateForm>();
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [settings, setSettings] = useState<AdminSetting[]>([]);
+  const [apiUsage, setApiUsage] = useState<AdminApiUsageSummary>(EMPTY_API_USAGE);
   const [settingDrafts, setSettingDrafts] = useState<Record<string, string>>({});
   const [secretEditingKeys, setSecretEditingKeys] = useState<Record<string, boolean>>({});
   const [editingAiStageKey, setEditingAiStageKey] = useState<string | null>(null);
+  const [highlightedModel, setHighlightedModel] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
   const [creatingUser, setCreatingUser] = useState(false);
@@ -138,9 +227,14 @@ export function AdminPage() {
   const loadAdminData = useCallback(async () => {
     setLoading(true);
     try {
-      const [nextUsers, nextSettings] = await Promise.all([fetchAdminUsers(), fetchAdminSettings()]);
+      const [nextUsers, nextSettings, nextApiUsage] = await Promise.all([
+        fetchAdminUsers(),
+        fetchAdminSettings(),
+        fetchAdminApiUsage(),
+      ]);
       setUsers(nextUsers);
       setSettings(nextSettings);
+      setApiUsage(nextApiUsage);
       setSettingDrafts(
         Object.fromEntries(nextSettings.map((setting) => [setting.key, setting.isSecret ? '' : setting.value || ''])),
       );
@@ -237,6 +331,18 @@ export function AdminPage() {
     }
   };
 
+  const refreshApiUsage = async () => {
+    setLoading(true);
+    try {
+      setApiUsage(await fetchAdminApiUsage());
+      message.success('API 调用统计已刷新');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'API 调用统计读取失败');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const settingGroups = useMemo(() => {
     const groups = new Map<string, AdminSetting[]>();
     settings.forEach((setting) => {
@@ -250,6 +356,42 @@ export function AdminPage() {
   }, [settings]);
 
   const settingsByKey = useMemo(() => new Map(settings.map((setting) => [setting.key, setting])), [settings]);
+  const apiUsageByModel = useMemo(() => {
+    const modelMap = new Map<string, AdminApiUsageItem>();
+    apiUsage.items.forEach((item) => {
+      const current = modelMap.get(item.model);
+      if (!current) {
+        modelMap.set(item.model, { ...item });
+        return;
+      }
+      current.callCount += item.callCount;
+      current.successCount += item.successCount;
+      current.failedCount += item.failedCount;
+      if (item.lastCalledAt && (!current.lastCalledAt || item.lastCalledAt > current.lastCalledAt)) {
+        current.lastCalledAt = item.lastCalledAt;
+      }
+    });
+    return Array.from(modelMap.values()).sort((left, right) => right.callCount - left.callCount);
+  }, [apiUsage.items]);
+
+  const apiUsageDonutSegments = useMemo(
+    () => buildApiUsageDonutSegments(apiUsageByModel, apiUsage.totalCalls),
+    [apiUsageByModel, apiUsage.totalCalls],
+  );
+  const apiUsageColorByModel = useMemo(
+    () =>
+      new Map(
+        apiUsageByModel.map((item, index) => [
+          item.model,
+          API_USAGE_COLORS[index % API_USAGE_COLORS.length],
+        ]),
+    ),
+    [apiUsageByModel],
+  );
+  const highlightedApiUsageItem = useMemo(
+    () => (highlightedModel ? apiUsageByModel.find((item) => item.model === highlightedModel) || null : null),
+    [apiUsageByModel, highlightedModel],
+  );
 
   const editingAiStage = useMemo(
     () => AI_STAGE_CONFIGS.find((stage) => stage.modelKey === editingAiStageKey) || null,
@@ -322,6 +464,62 @@ export function AdminPage() {
     },
   ];
 
+  const apiUsageColumns: ColumnsType<AdminApiUsageItem> = [
+    {
+      title: '模型',
+      dataIndex: 'model',
+      render: (model: string, item) => (
+        <Space direction="vertical" size={0}>
+          <Typography.Text className="admin-api-usage-model-name" strong>
+            <i style={{ background: apiUsageColorByModel.get(model)?.solid || '#64748b' }} />
+            {model}
+          </Typography.Text>
+          <Typography.Text type="secondary">{item.provider}</Typography.Text>
+        </Space>
+      ),
+    },
+    {
+      title: '阶段',
+      dataIndex: 'stage',
+      width: 150,
+      render: (stage: string) => <Tag color="blue">{apiStageLabel(stage)}</Tag>,
+    },
+    {
+      title: '类型',
+      dataIndex: 'apiType',
+      width: 140,
+      render: (apiType: string) => apiTypeLabel(apiType),
+    },
+    {
+      title: '调用次数',
+      dataIndex: 'callCount',
+      width: 110,
+      sorter: (left, right) => left.callCount - right.callCount,
+      defaultSortOrder: 'descend',
+      render: (count: number) => <Typography.Text strong>{count}</Typography.Text>,
+    },
+    {
+      title: '成功/失败',
+      key: 'statusCount',
+      width: 120,
+      render: (_, item) => `${item.successCount || 0}/${item.failedCount || 0}`,
+    },
+    {
+      title: '来源',
+      dataIndex: 'source',
+      width: 120,
+      render: (source: string, item) => (
+        <Tag color={item.isInferred ? 'gold' : 'green'}>{apiUsageSourceLabel(source, item.isInferred)}</Tag>
+      ),
+    },
+    {
+      title: '最近调用',
+      dataIndex: 'lastCalledAt',
+      width: 180,
+      render: (value?: string | null) => value || '暂无',
+    },
+  ];
+
   const editingStageApiKeySetting = editingAiStage ? settingsByKey.get(editingAiStage.apiKeyKey) : undefined;
   const editingStageBaseUrlSetting = editingAiStage ? settingsByKey.get(editingAiStage.baseUrlKey) : undefined;
   const editingStageModelSetting = editingAiStage ? settingsByKey.get(editingAiStage.modelKey) : undefined;
@@ -389,6 +587,147 @@ export function AdminPage() {
                     columns={userColumns}
                     dataSource={users}
                     pagination={false}
+                    size="middle"
+                  />
+                </Card>
+              </div>
+            ),
+          },
+          {
+            key: 'api-usage',
+            label: 'API 调用统计',
+            children: (
+              <div className="admin-api-usage">
+                <Card
+                  className="admin-api-usage-card"
+                  title="模型调用总览"
+                  extra={
+                    <Button loading={loading} onClick={refreshApiUsage}>
+                      刷新统计
+                    </Button>
+                  }
+                  loading={loading}
+                >
+                  <div className="admin-api-usage-summary">
+                    <div className="admin-api-usage-chart-panel">
+                      <div
+                        className="admin-api-usage-donut"
+                        aria-label={`API 调用总数 ${apiUsage.totalCalls}`}
+                      >
+                        <svg
+                          aria-hidden="true"
+                          className="admin-api-usage-donut-svg"
+                          viewBox={`0 0 ${API_USAGE_DONUT_SIZE} ${API_USAGE_DONUT_SIZE}`}
+                        >
+                          <circle
+                            className="admin-api-usage-donut-track"
+                            cx={API_USAGE_DONUT_CENTER}
+                            cy={API_USAGE_DONUT_CENTER}
+                            r={API_USAGE_DONUT_RADIUS}
+                            strokeWidth={API_USAGE_DONUT_STROKE}
+                          />
+                          {apiUsageDonutSegments.map((segment, index) => {
+                            const active = highlightedModel === segment.model;
+                            const muted = Boolean(highlightedModel && !active);
+                            return (
+                              <circle
+                                className={`admin-api-usage-donut-segment${active ? ' admin-api-usage-donut-segment-active' : ''}${muted ? ' admin-api-usage-donut-segment-muted' : ''}`}
+                                cx={API_USAGE_DONUT_CENTER}
+                                cy={API_USAGE_DONUT_CENTER}
+                                key={segment.model}
+                                onClick={() => setHighlightedModel(segment.model)}
+                                onMouseEnter={() => setHighlightedModel(segment.model)}
+                                onMouseLeave={() => setHighlightedModel(null)}
+                                r={API_USAGE_DONUT_RADIUS}
+                                stroke={segment.color}
+                                strokeWidth={API_USAGE_DONUT_STROKE}
+                                style={
+                                  {
+                                    '--api-donut-circumference': `${API_USAGE_DONUT_CIRCUMFERENCE}px`,
+                                    '--api-donut-delay': `${index * 70}ms`,
+                                    '--api-donut-length': `${segment.dashLength}px`,
+                                    '--api-donut-offset': `${segment.dashOffset}px`,
+                                  } as CSSProperties & Record<string, string>
+                                }
+                              />
+                            );
+                          })}
+                        </svg>
+                        <div className="admin-api-usage-donut-center">
+                          <span>{highlightedApiUsageItem ? highlightedApiUsageItem.callCount : apiUsage.totalCalls}</span>
+                          <small>
+                            {highlightedApiUsageItem
+                              ? `${apiUsagePercent(highlightedApiUsageItem.callCount, apiUsage.totalCalls)}% ${highlightedApiUsageItem.model}`
+                              : '总调用'}
+                          </small>
+                        </div>
+                      </div>
+                      <div className="admin-api-usage-metrics">
+                        <div>
+                          <span>精确日志</span>
+                          <strong>{apiUsage.exactCalls}</strong>
+                        </div>
+                        <div>
+                          <span>历史推断</span>
+                          <strong>{apiUsage.inferredCalls}</strong>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="admin-api-usage-legend">
+                      {apiUsageByModel.length ? (
+                        apiUsageByModel.map((item, index) => {
+                          const color = API_USAGE_COLORS[index % API_USAGE_COLORS.length];
+                          const percent = apiUsagePercent(item.callCount, apiUsage.totalCalls);
+                          const active = highlightedModel === item.model;
+                          return (
+                            <button
+                              aria-pressed={active}
+                              className={`admin-api-usage-legend-item${active ? ' admin-api-usage-legend-item-active' : ''}`}
+                              key={item.model}
+                              onBlur={() => setHighlightedModel(null)}
+                              onClick={() => setHighlightedModel(item.model)}
+                              onFocus={() => setHighlightedModel(item.model)}
+                              onMouseEnter={() => setHighlightedModel(item.model)}
+                              onMouseLeave={() => setHighlightedModel(null)}
+                              style={
+                                {
+                                  '--api-model-color': color.solid,
+                                  '--api-model-soft': color.soft,
+                                  '--api-model-percent': `${percent}%`,
+                                } as CSSProperties & Record<string, string>
+                              }
+                              type="button"
+                            >
+                              <i />
+                              <span>
+                                <b>{item.model}</b>
+                                <small>{percent}%</small>
+                              </span>
+                              <strong>{item.callCount}</strong>
+                            </button>
+                          );
+                        })
+                      ) : (
+                        <Empty description="暂无 API 调用数据" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+                      )}
+                    </div>
+                  </div>
+                </Card>
+
+                <Card title="模型调用明细" className="admin-table-card" loading={loading}>
+                  <Table<AdminApiUsageItem>
+                    rowKey="id"
+                    columns={apiUsageColumns}
+                    dataSource={apiUsage.items}
+                    locale={{ emptyText: '暂无 API 调用数据' }}
+                    onRow={(record) => ({
+                      onMouseEnter: () => setHighlightedModel(record.model),
+                      onMouseLeave: () => setHighlightedModel(null),
+                    })}
+                    pagination={{ pageSize: 10, showSizeChanger: false }}
+                    rowClassName={(record) =>
+                      highlightedModel === record.model ? 'admin-api-usage-row-highlighted' : ''
+                    }
                     size="middle"
                   />
                 </Card>

@@ -75,13 +75,22 @@ function ProductTitleBlock({
   const visibleTitle = product.titleEn || product.title;
   const shouldShowFulfillmentTag = product.sourceType !== '1688';
 
+  const handleTitleClick = () => {
+    onView(product);
+  };
+
   return (
     <div className="product-title-stack">
       <Tooltip
         placement="topLeft"
         title={<div className="product-title-tooltip">{product.title}</div>}
       >
-        <button className="product-title-link" type="button" onClick={() => onView(product)}>
+        <button
+          aria-label={product.title}
+          className="product-title-link"
+          type="button"
+          onClick={handleTitleClick}
+        >
           {visibleTitle}
         </button>
       </Tooltip>

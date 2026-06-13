@@ -10,6 +10,7 @@ from app.modules.visual_generation.clients import VisualGenerationError
 from app.modules.visual_generation.service import (
     VisualTaskError,
     create_visual_task,
+    delete_visual_task,
     generate_visual_task,
     get_visual_task,
     list_visual_tasks,
@@ -115,6 +116,14 @@ def get_task(task_id: str, current_user: dict[str, Any] = Depends(require_curren
     except VisualTaskError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+
+@router.delete("/tasks/{task_id}")
+def delete_task(task_id: str, current_user: dict[str, Any] = Depends(require_current_user)):
+    try:
+        delete_visual_task(task_id=task_id, user_id=current_user["id"])
+    except VisualTaskError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"ok": True}
 
 @router.post("/tasks/{task_id}/plan")
 def plan_task(

@@ -32,10 +32,12 @@ import type { SortOrder } from 'antd/es/table/interface';
 import {
   addProductsToPool,
   createVisualGenerationTask,
+  deleteVisualGenerationTask,
   deleteProduct as deleteBackendProduct,
   deleteLinkListRecord,
   exportDianxiaomiTemuTemplate,
   fetchVisualGenerationTask,
+  fetchVisualGenerationTasks,
   fetchLinkListRecords,
   fetchProductCategories,
   fetchProductStats,
@@ -459,6 +461,260 @@ function CategoryCascaderFilter({
   );
 }
 
+const MAX_CATEGORY_DEPTH = 4;
+const CATEGORY_LEVEL_LABELS = ['一级类目', '二级类目', '三级类目', '四级类目'];
+
+type CategoryCascaderColumn = {
+  key: string;
+  level: number;
+  title: string;
+  items: ProductCategoryOption[];
+  parent?: ProductCategoryOption;
+};
+
+function filterCategoryTree(categories: ProductCategoryOption[], query: string, parentLabel = ''): ProductCategoryOption[] {
+  const normalizedQuery = query.trim().toLowerCase();
+  if (!normalizedQuery) return categories;
+
+  const results: ProductCategoryOption[] = [];
+  categories.forEach((category) => {
+    const pathLabel = [parentLabel, category.label, category.value].filter(Boolean).join(' ');
+    const categoryMatches = pathLabel.toLowerCase().includes(normalizedQuery);
+    const children = filterCategoryTree(category.children || [], normalizedQuery, pathLabel);
+    if (categoryMatches) {
+      results.push({ ...category, children: category.children || [] });
+      return;
+    }
+    if (children.length > 0) {
+      results.push({ ...category, children });
+    }
+  });
+
+  return results;
+}
+
+function findCategoryPath(
+  categories: ProductCategoryOption[],
+  value?: string,
+  trail: ProductCategoryOption[] = [],
+): ProductCategoryOption[] {
+  if (!value || value === ALL_CATEGORY_VALUE) return [];
+
+  for (const category of categories) {
+    const nextTrail = [...trail, category];
+    if (category.value === value) return nextTrail;
+    if (nextTrail.length < MAX_CATEGORY_DEPTH) {
+      const childTrail = findCategoryPath(category.children || [], value, nextTrail);
+      if (childTrail.length > 0) return childTrail;
+    }
+  }
+
+  return [];
+}
+
+function getCategoryDisplayLabelV2(categories: ProductCategoryOption[], value?: string) {
+  if (!value || value === ALL_CATEGORY_VALUE) return ALL_CATEGORY_VALUE;
+  const path = findCategoryPath(categories, value);
+  return path.length > 0 ? path.map((category) => category.label).join(' / ') : value;
+}
+
+function buildCategoryColumns(categories: ProductCategoryOption[], activePath: ProductCategoryOption[]): CategoryCascaderColumn[] {
+  const columns: CategoryCascaderColumn[] = [
+    {
+      key: 'level-1',
+      level: 1,
+      title: CATEGORY_LEVEL_LABELS[0],
+      items: categories,
+    },
+  ];
+
+  activePath.slice(0, MAX_CATEGORY_DEPTH - 1).forEach((category, index) => {
+    const children = category.children || [];
+    if (children.length === 0) return;
+    columns.push({
+      key: category.value,
+      level: index + 2,
+      title: category.label,
+      items: children,
+      parent: category,
+    });
+  });
+
+  return columns.slice(0, MAX_CATEGORY_DEPTH);
+}
+
+function CategoryCascaderFilterV2({
+  categories,
+  onChange,
+  value,
+}: {
+  categories: ProductCategoryOption[];
+  onChange?: (value?: string) => void;
+  value?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [searchText, setSearchText] = useState('');
+  const [activeCategoryValue, setActiveCategoryValue] = useState<string>();
+  const normalizedSearchText = searchText.trim();
+
+  const filteredCategories = useMemo(
+    () => filterCategoryTree(categories, normalizedSearchText),
+    [categories, normalizedSearchText],
+  );
+  const selectedPath = useMemo(() => findCategoryPath(filteredCategories, value), [filteredCategories, value]);
+  const activePath = useMemo(() => {
+    const hoveredPath = findCategoryPath(filteredCategories, activeCategoryValue);
+    return hoveredPath.length > 0 ? hoveredPath : selectedPath;
+  }, [activeCategoryValue, filteredCategories, selectedPath]);
+  const columns = useMemo(() => buildCategoryColumns(filteredCategories, activePath), [activePath, filteredCategories]);
+  const selectedDisplayLabel = getCategoryDisplayLabelV2(categories, value);
+
+  useEffect(() => {
+    if (activeCategoryValue && findCategoryPath(filteredCategories, activeCategoryValue).length === 0) {
+      setActiveCategoryValue(undefined);
+    }
+  }, [activeCategoryValue, filteredCategories]);
+
+  const selectCategory = (nextValue?: string) => {
+    const finalValue = nextValue || ALL_CATEGORY_VALUE;
+    onChange?.(finalValue);
+    setActiveCategoryValue(finalValue === ALL_CATEGORY_VALUE ? undefined : finalValue);
+    setOpen(false);
+  };
+
+  const handleOpenChange = (nextOpen: boolean) => {
+    setOpen(nextOpen);
+    if (!nextOpen) {
+      setSearchText('');
+      setActiveCategoryValue(undefined);
+    }
+  };
+
+  const panel = (
+    <div className="category-cascader-panel">
+      <div className="category-cascader-search">
+        <Input
+          allowClear
+          placeholder="搜索一级 / 二级 / 三级 / 四级类目"
+          size="small"
+          value={searchText}
+          onChange={(event) => setSearchText(event.target.value)}
+        />
+      </div>
+      <div
+        className="category-cascader-body"
+        style={{ gridTemplateColumns: `repeat(${Math.max(columns.length, 1)}, minmax(230px, 1fr))` }}
+      >
+        {columns.map((column) => {
+          const levelLabel = CATEGORY_LEVEL_LABELS[column.level - 1] || `${column.level}级类目`;
+          const columnTitle = `${column.parent ? column.title : levelLabel}（${column.items.length}）`;
+          return (
+            <div className="category-cascader-column" key={column.key}>
+              <div className="category-cascader-group-title">{columnTitle}</div>
+              {column.parent ? (
+                <button
+                  className={`category-cascader-row ${
+                    value === column.parent.value ? 'category-cascader-selected' : ''
+                  }`}
+                  title={`全部 ${column.parent.label}`}
+                  type="button"
+                  onClick={() => selectCategory(column.parent?.value)}
+                >
+                  <span className="category-check" />
+                  <span className="category-cascader-name">全部 {column.parent.label}</span>
+                  <span className="category-cascader-count">{column.parent.count}</span>
+                </button>
+              ) : (
+                <button
+                  className={`category-cascader-row ${
+                    !value || value === ALL_CATEGORY_VALUE ? 'category-cascader-selected' : ''
+                  }`}
+                  type="button"
+                  onClick={() => selectCategory(ALL_CATEGORY_VALUE)}
+                >
+                  <span className="category-check" />
+                  <span className="category-cascader-name">全部类目</span>
+                </button>
+              )}
+
+              {column.items.map((category) => {
+                const hasChildren = Boolean(category.children?.length) && (category.level || column.level) < MAX_CATEGORY_DEPTH;
+                const isActive = activePath.some((item) => item.value === category.value);
+                const isSelected = selectedPath.some((item) => item.value === category.value);
+                const pathTitle = findCategoryPath(filteredCategories, category.value)
+                  .map((item) => item.label)
+                  .join(' / ');
+                return (
+                  <button
+                    className={`category-cascader-row ${isActive ? 'category-cascader-active' : ''} ${
+                      isSelected ? 'category-cascader-selected' : ''
+                    }`}
+                    key={category.value}
+                    title={pathTitle || category.label}
+                    type="button"
+                    onClick={() => {
+                      if (hasChildren) {
+                        setActiveCategoryValue(category.value);
+                        return;
+                      }
+                      selectCategory(category.value);
+                    }}
+                  >
+                    <span className="category-check" />
+                    <span className="category-cascader-name">{category.label}</span>
+                    <span className="category-cascader-count">{category.count}</span>
+                    {hasChildren ? <span className="category-cascader-arrow">›</span> : <span />}
+                  </button>
+                );
+              })}
+              {column.items.length === 0 ? <div className="category-cascader-empty">暂无匹配类目</div> : null}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+
+  return (
+    <Popover
+      arrow={false}
+      content={panel}
+      open={open}
+      overlayClassName="category-cascader-popover"
+      placement="bottomLeft"
+      trigger="click"
+      onOpenChange={handleOpenChange}
+    >
+      <button className="category-cascader-trigger" type="button">
+        <span className={value && value !== ALL_CATEGORY_VALUE ? 'category-cascader-trigger-value' : 'category-cascader-placeholder'}>
+          {selectedDisplayLabel}
+        </span>
+        {value && value !== ALL_CATEGORY_VALUE ? (
+          <span
+            className="category-cascader-clear"
+            role="button"
+            tabIndex={0}
+            onClick={(event) => {
+              event.stopPropagation();
+              selectCategory(ALL_CATEGORY_VALUE);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                event.stopPropagation();
+                selectCategory(ALL_CATEGORY_VALUE);
+              }
+            }}
+          >
+            ×
+          </span>
+        ) : null}
+        <span className="category-cascader-trigger-arrow">▾</span>
+      </button>
+    </Popover>
+  );
+}
+
 function getAssetDisplayUrl(asset?: LinkListRecord['mainImage']) {
   return (
     asset?.editedCloudUrl ||
@@ -542,6 +798,22 @@ function getSelectedSkuImageRefDescriptors(record: LinkListRecord, selectedSkuId
 
 function getSelectedSkuImageRefs(record: LinkListRecord, selectedSkuIds?: string[]) {
   return getSelectedSkuImageRefDescriptors(record, selectedSkuIds).map((item) => item.url);
+}
+
+function getSelectedGalleryImageRefDescriptors(
+  selectedAssets: Array<{ asset: LinkListImageAsset; imageUrl: string }>,
+) {
+  const seenUrls = new Set<string>();
+  return selectedAssets
+    .map((item, index) => ({
+      url: String(item.imageUrl || '').trim(),
+      label: item.asset.alt || `Selected gallery image ${index + 1}`,
+    }))
+    .filter((item) => {
+      if (!item.url || seenUrls.has(item.url)) return false;
+      seenUrls.add(item.url);
+      return true;
+    });
 }
 
 function collectRecordImageAssets(record?: LinkListRecord): LinkListImageAsset[] {
@@ -1257,6 +1529,134 @@ function getVisualTaskResultUrl(module: VisualGenerationTask['modules'][number])
   return module.outputUrl || module.outputPath || undefined;
 }
 
+type VisualQueueMeta = {
+  queueItemId?: string;
+  taskId?: string;
+  mode?: VisualPublishMode;
+  selectedSkuIds?: string[];
+  selectedSlotIds?: string[];
+  referenceImageLabels?: string[];
+  createdAt?: string;
+};
+
+function getVisualTaskRecordForQueue(record: LinkListRecord, item: VisualQueueItem): LinkListRecord {
+  if (['main_multi', 'sku_adapt'].includes(item.mode) && item.selectedSkuIds?.length) {
+    const selectedSkuIds = new Set(item.selectedSkuIds);
+    const skuEntries = record.skuEntries.filter((entry) => selectedSkuIds.has(entry.id));
+    return {
+      ...record,
+      skuEntries,
+      componentSkuCount: skuEntries.reduce((total, entry) => total + Math.max(1, entry.componentSkus?.length || 1), 0),
+    };
+  }
+  return record;
+}
+
+function getVisualTaskRecordWithQueueMeta(record: LinkListRecord, item: VisualQueueItem): LinkListRecord {
+  const taskRecord = getVisualTaskRecordForQueue(record, item) as LinkListRecord & { visualQueueMeta?: VisualQueueMeta };
+  return {
+    ...taskRecord,
+    visualQueueMeta: {
+      queueItemId: item.id,
+      taskId: item.taskId,
+      mode: item.mode,
+      selectedSkuIds: item.selectedSkuIds || [],
+      selectedSlotIds: item.selectedSlotIds || [],
+      referenceImageLabels: item.referenceImageLabels || [],
+      createdAt: item.createdAt,
+    },
+  } as LinkListRecord;
+}
+
+function getVisualPublishModeFromApiMode(mode?: string): VisualPublishMode {
+  if (mode === 'sku-gallery') return 'sku_adapt';
+  if (mode === 'single-refine') return 'single_refine';
+  return 'main_multi';
+}
+
+function getVisualQueueStatusFromBackend(task: VisualGenerationTask, completedCount: number) {
+  if (task.status === 'failed') return { label: '\u6267\u884c\u5931\u8d25', color: 'red' };
+  if (task.status === 'completed' || task.status === 'split') {
+    return { label: completedCount > 0 ? '\u5df2\u56de\u5199' : '\u5df2\u5b8c\u6210', color: completedCount > 0 ? 'green' : 'gold' };
+  }
+  if (task.status === 'running' || task.status === 'planned') return { label: '\u540e\u53f0\u6267\u884c\u4e2d', color: 'processing' };
+  return { label: '\u5f85\u6267\u884c', color: 'blue' };
+}
+
+function createVisualQueueItemFromBackendTask(
+  task: VisualGenerationTask,
+  records: LinkListRecord[],
+): VisualQueueItem | undefined {
+  const embeddedRecord = task.record as (LinkListRecord & { visualQueueMeta?: VisualQueueMeta }) | undefined;
+  if (!embeddedRecord?.visualQueueMeta) return undefined;
+  const record =
+    records.find((item) => item.id === task.linkRecordId || item.id === embeddedRecord?.id) ||
+    (embeddedRecord?.id && embeddedRecord.productTitle ? embeddedRecord : undefined);
+  if (!record) return undefined;
+
+  const mode = embeddedRecord.visualQueueMeta.mode || getVisualPublishModeFromApiMode(task.mode);
+  const visualTasks = getRecordVisualTaskPackages(record);
+  const taskPackage =
+    mode === 'sku_adapt'
+      ? visualTasks.find((item) => item.id.includes('sku-gallery')) || visualTasks[0]
+      : visualTasks.find((item) => item.id.includes('product-gallery')) || visualTasks[0];
+  if (!taskPackage) return undefined;
+
+  const referenceImageRefs = task.referenceImageRefs?.length
+    ? task.referenceImageRefs
+    : task.sourceImageRef
+      ? [{ url: task.sourceImageRef, label: 'Reference image 1' }]
+      : [];
+  const selectedSkuIds = embeddedRecord.visualQueueMeta.selectedSkuIds || [];
+  const selectedSlotIds = embeddedRecord.visualQueueMeta.selectedSlotIds || [];
+  const referenceImageUrls = referenceImageRefs.map((item) => item.url).filter(Boolean);
+  const referenceImageLabels = referenceImageRefs.map((item, index) => item.label || `Reference image ${index + 1}`);
+  const requestedCount = Math.max(1, Math.min(9, task.requestedCount || task.modules.length || referenceImageUrls.length || 1));
+  const baseItem = createVisualQueueItem(record, taskPackage, {
+    mode,
+    count: requestedCount,
+    referenceImageUrl: task.sourceImageRef || referenceImageUrls[0],
+    referenceImageUrls,
+    referenceImageLabels,
+    selectedSkuIds,
+    selectedSlotIds,
+  });
+
+  const modulesByPanel = new Map(task.modules.map((module) => [module.panelIndex || 0, module]));
+  const completedCount = task.modules.filter((module) => getVisualTaskResultUrl(module)).length;
+  const statusMeta = getVisualQueueStatusFromBackend(task, completedCount);
+
+  return {
+    ...baseItem,
+    id: embeddedRecord.visualQueueMeta.queueItemId || `queue-${task.id}`,
+    backendTaskId: task.id,
+    backendStatus: task.status,
+    createdAt: task.createdAt || baseItem.createdAt,
+    completedCount,
+    statusLabel: statusMeta.label,
+    statusColor: statusMeta.color,
+    analysis: task.analysis,
+    promptText: task.promptText || undefined,
+    motherImageUrl: task.motherImageUrl || undefined,
+    motherImagePath: task.motherImagePath || undefined,
+    manifest: task.manifest,
+    errorMessage: task.errorMessage || undefined,
+    modules: baseItem.modules.map((module, index) => {
+      const backendModule = modulesByPanel.get(index + 1);
+      const resultUrl = backendModule ? getVisualTaskResultUrl(backendModule) : undefined;
+      return {
+        ...module,
+        id: backendModule?.id || module.id,
+        outputUrl: backendModule?.outputUrl || undefined,
+        outputPath: backendModule?.outputPath || undefined,
+        imageUrl: resultUrl || module.imageUrl,
+        statusLabel: resultUrl ? '\u5df2\u56de\u5199' : statusMeta.label,
+        statusColor: resultUrl ? 'green' : statusMeta.color,
+      };
+    }),
+  };
+}
+
 function isRemoteImageUrl(url?: string) {
   return Boolean(url && /^https?:\/\//i.test(url));
 }
@@ -1326,8 +1726,14 @@ function getVisualInputPromptText(item: VisualQueueItem) {
   ].join('\n');
 }
 
+function hasVisualDetail(value?: Record<string, unknown> | string | null) {
+  if (!value) return false;
+  if (typeof value === 'string') return value.trim().length > 0;
+  return Object.keys(value).length > 0;
+}
+
 function formatVisualDetail(value?: Record<string, unknown> | string) {
-  if (!value) return '等待规划完成后展示。';
+  if (!hasVisualDetail(value)) return '等待图片分析完成后展示。';
   if (typeof value === 'string') return value;
   return JSON.stringify(value, null, 2);
 }
@@ -1336,7 +1742,7 @@ function getVisualWorkflowStates(item: VisualQueueItem) {
   const completed = [
     true,
     true,
-    Boolean(item.analysis),
+    hasVisualDetail(item.analysis),
     Boolean(item.promptText),
     Boolean(item.motherImageUrl || item.motherImagePath),
     item.completedCount > 0,
@@ -1505,11 +1911,16 @@ function waitForMs(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-async function waitForVisualGenerationTask(taskId: string, maxAttempts = 180): Promise<VisualGenerationTask> {
+async function waitForVisualGenerationTask(
+  taskId: string,
+  maxAttempts = 180,
+  onProgress?: (task: VisualGenerationTask) => void,
+): Promise<VisualGenerationTask> {
   let lastTask: VisualGenerationTask | undefined;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const task = await fetchVisualGenerationTask(taskId);
     lastTask = task;
+    onProgress?.(task);
     if (task.status === 'completed' || task.status === 'split') return task;
     if (task.status === 'failed') {
       throw new Error(task.errorMessage || '生图任务执行失败');
@@ -1588,6 +1999,20 @@ function LinkListPanel({
     const selectedSet = new Set(imageManagerSelectedAssetIds);
     return imageManagerGalleryOptions.filter((option) => selectedSet.has(option.asset.id));
   }, [imageManagerGalleryOptions, imageManagerSelectedAssetIds]);
+  const imageManagerSelectedGalleryImageRefs = useMemo(
+    () => getSelectedGalleryImageRefDescriptors(imageManagerSelectedAssets),
+    [imageManagerSelectedAssets],
+  );
+  const imageManagerSelectedSkuImageRefs = useMemo(
+    () =>
+      imageManagerRecord && imageManagerSelectedSkuIds.length > 0
+        ? getSelectedSkuImageRefDescriptors(imageManagerRecord, imageManagerSelectedSkuIds)
+        : [],
+    [imageManagerRecord, imageManagerSelectedSkuIds],
+  );
+  const canEnqueueMainGalleryFromImageManager =
+    Boolean(imageManagerProductTask) &&
+    (imageManagerSelectedGalleryImageRefs.length > 0 || imageManagerSelectedSkuImageRefs.length > 0);
   const activeVisualQueueItem = useMemo(
     () => visualQueueItems.find((item) => item.id === activeVisualQueueItemId) || visualQueueItems[0],
     [activeVisualQueueItemId, visualQueueItems],
@@ -1737,6 +2162,31 @@ function LinkListPanel({
     }
   }, [activeVisualQueueItemId, visualQueueItems]);
 
+  const refreshVisualQueueTasks = useCallback(async () => {
+    if (records.length === 0) return;
+    const tasks = await fetchVisualGenerationTasks();
+    const restoredItems = tasks
+      .map((task) => createVisualQueueItemFromBackendTask(task, records))
+      .filter((item): item is VisualQueueItem => Boolean(item));
+
+    setVisualQueueItems((current) => {
+      const restoredIds = new Set(restoredItems.map((item) => item.id));
+      const restoredBackendIds = new Set(restoredItems.map((item) => item.backendTaskId).filter((id): id is string => Boolean(id)));
+      const localOnlyItems = current.filter(
+        (item) => !restoredIds.has(item.id) && (!item.backendTaskId || !restoredBackendIds.has(item.backendTaskId)),
+      );
+      return [...restoredItems, ...localOnlyItems].sort(
+        (left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime(),
+      );
+    });
+  }, [records]);
+
+  useEffect(() => {
+    void refreshVisualQueueTasks().catch((error) => {
+      console.warn('Failed to restore visual queue tasks', error);
+    });
+  }, [refreshVisualQueueTasks]);
+
   const openImageManager = (record: LinkListRecord, slotId?: string) => {
     const firstSlotId = getRecordProductImageSlotItems(record)[0]?.slot.id;
     setImageManagerRecord(record);
@@ -1862,7 +2312,7 @@ function LinkListPanel({
     }
   };
 
-  const enqueueVisualTask = (
+  const enqueueVisualTask = async (
     record: LinkListRecord,
     task: ReturnType<typeof getRecordVisualTaskPackages>[number],
     options: {
@@ -1873,36 +2323,92 @@ function LinkListPanel({
       referenceImageLabels?: string[];
       selectedSkuIds?: string[];
       selectedSlotIds?: string[];
+      autoRun?: boolean;
+      openQueue?: boolean;
     },
   ) => {
     const referenceImageUrl = options.referenceImageUrl || getRecordMainImageUrl(record);
     if (!referenceImageUrl) {
-      message.warning('请先选择一张参考图');
+      message.warning('\u8bf7\u5148\u9009\u62e9\u4e00\u5f20\u53c2\u8003\u56fe');
       return;
     }
-    const item = createVisualQueueItem(record, task, {
+
+    const draftItem = createVisualQueueItem(record, task, {
       ...options,
       referenceImageUrl,
       referenceImageUrls: options.referenceImageUrls,
       referenceImageLabels: options.referenceImageLabels,
     });
-    setVisualQueueItems((current) => [item, ...current]);
-    setActiveVisualQueueItemId(item.id);
-    setExpandedVisualQueueItemIds((current) => [item.id, ...current.filter((id) => id !== item.id)]);
-    setVisualQueueOpen(true);
-    message.success('已加入统一任务队列');
+    const referenceImageRefs = getVisualReferenceImageRefs(draftItem);
+    const primaryReferenceImageUrl = referenceImageRefs[0]?.url || draftItem.referenceImageUrl;
+
+    try {
+      const created = await createVisualGenerationTask({
+        record: getVisualTaskRecordWithQueueMeta(record, draftItem),
+        linkRecordId: record.id,
+        productId: record.productId,
+        mode: getVisualTaskApiMode(draftItem.mode),
+        layout: getVisualTaskLayout(draftItem.requestedCount),
+        requestedCount: draftItem.requestedCount,
+        sourceImageRef: primaryReferenceImageUrl,
+        referenceImageRefs,
+      });
+      const item: VisualQueueItem = {
+        ...draftItem,
+        id: `queue-${created.id}`,
+        backendTaskId: created.id,
+        backendStatus: created.status,
+        createdAt: created.createdAt || draftItem.createdAt,
+      };
+      setVisualQueueItems((current) => [item, ...current.filter((candidate) => candidate.backendTaskId !== created.id)]);
+      setActiveVisualQueueItemId(item.id);
+      setExpandedVisualQueueItemIds((current) => [item.id, ...current.filter((id) => id !== item.id)]);
+      if (options.autoRun) {
+        message.success('\u5df2\u521b\u5efa\u751f\u56fe\u4efb\u52a1\uff0c\u6b63\u5728\u81ea\u52a8\u6267\u884c');
+        window.setTimeout(() => {
+          const recordMap = new Map(records.map((candidate) => [candidate.id, candidate]));
+          setVisualQueueExecuting(true);
+          void executeVisualQueueItem(item, recordMap)
+            .then(() => {
+              message.success('\u751f\u56fe\u4efb\u52a1\u5df2\u5b8c\u6210\uff0c\u7ed3\u679c\u5df2\u56de\u5199\u5230\u94fe\u63a5\u5217\u8868');
+            })
+            .catch((error) => {
+              const errorMessage = error instanceof Error ? error.message : '\u751f\u56fe\u4efb\u52a1\u6267\u884c\u5931\u8d25';
+              patchVisualQueueItem(item.id, () => ({
+                statusLabel: '\u6267\u884c\u5931\u8d25',
+                statusColor: 'red',
+                backendStatus: 'failed',
+                errorMessage,
+                modules: item.modules.map((module) => ({
+                  ...module,
+                  statusLabel: '\u5931\u8d25',
+                  statusColor: 'red',
+                })),
+              }));
+              message.error(errorMessage);
+            })
+            .finally(() => {
+              setVisualQueueExecuting(false);
+            });
+        }, 0);
+        return;
+      }
+      if (options.openQueue !== false) setVisualQueueOpen(true);
+      message.success('\u5df2\u52a0\u5165\u7edf\u4e00\u4efb\u52a1\u961f\u5217');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '\u4efb\u52a1\u961f\u5217\u521b\u5efa\u5931\u8d25');
+    }
   };
 
   const enqueueMainGalleryFromSelectedSkus = (requestedCount?: number) => {
     if (!imageManagerRecord || !imageManagerProductTask) return;
-    if (imageManagerSelectedSkuIds.length === 0) {
-      message.warning('请先选择要作为主图生成依据的 SKU');
-      return;
-    }
-    const referenceImageDescriptors = getSelectedSkuImageRefDescriptors(imageManagerRecord, imageManagerSelectedSkuIds);
+    const referenceImageDescriptors =
+      imageManagerSelectedGalleryImageRefs.length > 0
+        ? imageManagerSelectedGalleryImageRefs
+        : imageManagerSelectedSkuImageRefs;
     const referenceImageUrls = referenceImageDescriptors.map((item) => item.url);
     if (referenceImageUrls.length === 0) {
-      message.warning('选中的 SKU 没有可用图片，不能作为主图生成参数');
+      message.warning('请先在图库或 SKU 中选择要作为主图生成依据的图片');
       return;
     }
     enqueueVisualTask(imageManagerRecord, imageManagerProductTask, {
@@ -1912,6 +2418,8 @@ function LinkListPanel({
       referenceImageUrls,
       referenceImageLabels: referenceImageDescriptors.map((item) => item.label),
       selectedSkuIds: imageManagerSelectedSkuIds,
+      autoRun: true,
+      openQueue: false,
     });
   };
 
@@ -1940,17 +2448,47 @@ function LinkListPanel({
       referenceImageUrls,
       referenceImageLabels: referenceImageDescriptors.map((item) => item.label),
       selectedSkuIds,
+      autoRun: true,
+      openQueue: false,
     });
   };
 
-  const removeVisualQueueItem = (queueItemId: string) => {
-    setVisualQueueItems((current) => current.filter((item) => item.id !== queueItemId));
+  const removeVisualQueueItem = async (queueItemId: string) => {
+    const item = visualQueueItems.find((candidate) => candidate.id === queueItemId);
+    if (item?.backendTaskId) {
+      try {
+        await deleteVisualGenerationTask(item.backendTaskId);
+      } catch (error) {
+        message.error(error instanceof Error ? error.message : '\u5220\u9664\u540e\u7aef\u4efb\u52a1\u5931\u8d25');
+        return;
+      }
+    }
+    setVisualQueueItems((current) => current.filter((candidate) => candidate.id !== queueItemId));
     setExpandedVisualQueueItemIds((current) => current.filter((id) => id !== queueItemId));
     setVisualWorkflowStageByItemId((current) => {
       const next = { ...current };
       delete next[queueItemId];
       return next;
     });
+  };
+
+  const clearVisualQueue = async () => {
+    const backendTaskIds = visualQueueItems.map((item) => item.backendTaskId).filter((id): id is string => Boolean(id));
+    const results = await Promise.allSettled(backendTaskIds.map((taskId) => deleteVisualGenerationTask(taskId)));
+    const failedCount = results.filter((result) => result.status === 'rejected').length;
+    if (failedCount > 0) {
+      message.warning(`\u6709 ${failedCount} \u4e2a\u540e\u7aef\u4efb\u52a1\u5220\u9664\u5931\u8d25\uff0c\u5df2\u4fdd\u7559\u5728\u961f\u5217\u4e2d`);
+      const failedIds = new Set(
+        results
+          .map((result, index) => (result.status === 'rejected' ? backendTaskIds[index] : undefined))
+          .filter((id): id is string => Boolean(id)),
+      );
+      setVisualQueueItems((current) => current.filter((item) => item.backendTaskId && failedIds.has(item.backendTaskId)));
+      return;
+    }
+    setVisualQueueItems([]);
+    setExpandedVisualQueueItemIds([]);
+    setVisualWorkflowStageByItemId({});
   };
 
   const patchVisualQueueItem = (
@@ -1996,16 +2534,18 @@ function LinkListPanel({
     const referenceImageRefs = getVisualReferenceImageRefs(item);
     const primaryReferenceImageUrl = referenceImageRefs[0]?.url || item.referenceImageUrl;
 
-    const created = await createVisualGenerationTask({
-      record: taskRecord,
-      linkRecordId: record.id,
-      productId: record.productId,
-      mode: getVisualTaskApiMode(item.mode),
-      layout: getVisualTaskLayout(item.requestedCount),
-      requestedCount: item.requestedCount,
-      sourceImageRef: primaryReferenceImageUrl,
-      referenceImageRefs,
-    });
+    const created = item.backendTaskId
+      ? await fetchVisualGenerationTask(item.backendTaskId)
+      : await createVisualGenerationTask({
+          record: getVisualTaskRecordWithQueueMeta(record, item),
+          linkRecordId: record.id,
+          productId: record.productId,
+          mode: getVisualTaskApiMode(item.mode),
+          layout: getVisualTaskLayout(item.requestedCount),
+          requestedCount: item.requestedCount,
+          sourceImageRef: primaryReferenceImageUrl,
+          referenceImageRefs,
+        });
 
     patchVisualQueueItem(item.id, () => ({
       backendTaskId: created.id,
@@ -2033,7 +2573,20 @@ function LinkListPanel({
       modules: markModules('生成中', 'processing'),
     }));
 
-    const generated = await waitForVisualGenerationTask(created.id);
+    const generated = await waitForVisualGenerationTask(created.id, 180, (progressTask) => {
+      const hasAnalysis = hasVisualDetail(progressTask.analysis);
+      if (!hasAnalysis && !progressTask.promptText) return;
+      patchVisualQueueItem(item.id, (current) => ({
+        backendTaskId: created.id,
+        backendStatus: progressTask.status,
+        analysis: hasAnalysis ? progressTask.analysis : current.analysis,
+        promptText: progressTask.promptText || current.promptText,
+        motherImageUrl: progressTask.motherImageUrl || current.motherImageUrl,
+        motherImagePath: progressTask.motherImagePath || current.motherImagePath,
+        manifest: progressTask.manifest || current.manifest,
+        errorMessage: progressTask.errorMessage || current.errorMessage,
+      }));
+    });
     const itemWithBackendId = { ...item, backendTaskId: created.id };
     let nextRecord = applyVisualGenerationResult(record, itemWithBackendId, generated);
     try {
@@ -2308,7 +2861,7 @@ function LinkListPanel({
               </Text>
             </div>
             <Space>
-              <Button icon={<ClockCircleOutlined />} onClick={() => setVisualQueueOpen(true)}>
+              <Button icon={<ClockCircleOutlined />} onClick={() => { setVisualQueueOpen(true); void refreshVisualQueueTasks(); }}>
                 任务队列
                 {visualQueueItems.length > 0 ? ` ${visualQueueItems.length}` : ''}
               </Button>
@@ -2649,11 +3202,7 @@ function LinkListPanel({
           <Space>
             <Button
               disabled={visualQueueExecuting || visualQueueItems.length === 0}
-              onClick={() => {
-                setVisualQueueItems([]);
-                setExpandedVisualQueueItemIds([]);
-                setVisualWorkflowStageByItemId({});
-              }}
+              onClick={() => void clearVisualQueue()}
             >
               清空队列
             </Button>
@@ -2757,7 +3306,7 @@ function LinkListPanel({
                         onClick={(event) => {
                           event.preventDefault();
                           event.stopPropagation();
-                          removeVisualQueueItem(item.id);
+                          void removeVisualQueueItem(item.id);
                         }}
                       >
                         移除
@@ -2816,7 +3365,7 @@ function LinkListPanel({
                   <Button icon={<PictureOutlined />} type="primary" onClick={() => setImageEditorOpen(true)}>
                     编辑图片
                   </Button>
-                  <Button icon={<ClockCircleOutlined />} onClick={() => setVisualQueueOpen(true)}>
+                  <Button icon={<ClockCircleOutlined />} onClick={() => { setVisualQueueOpen(true); void refreshVisualQueueTasks(); }}>
                     任务队列{visualQueueItems.length > 0 ? ` ${visualQueueItems.length}` : ''}
                   </Button>
                 </Space>
@@ -3054,21 +3603,13 @@ function LinkListPanel({
                 </Button>
                 <Button
                   type="primary"
-                  disabled={
-                    !imageManagerProductTask ||
-                    imageManagerSelectedSkuIds.length === 0 ||
-                    getSelectedSkuImageRefDescriptors(imageManagerRecord, imageManagerSelectedSkuIds).length === 0
-                  }
+                  disabled={!canEnqueueMainGalleryFromImageManager}
                   onClick={() => enqueueMainGalleryFromSelectedSkus(FULL_MAIN_GALLERY_IMAGE_COUNT)}
                 >
                   主图全量生成 9张
                 </Button>
                 <Button
-                  disabled={
-                    !imageManagerProductTask ||
-                    imageManagerSelectedSkuIds.length === 0 ||
-                    getSelectedSkuImageRefDescriptors(imageManagerRecord, imageManagerSelectedSkuIds).length === 0
-                  }
+                  disabled={!canEnqueueMainGalleryFromImageManager}
                   onClick={() => enqueueMainGalleryFromSelectedSkus(COMPACT_MAIN_GALLERY_IMAGE_COUNT)}
                 >
                   主图全量生成 4张
@@ -3089,12 +3630,14 @@ function LinkListPanel({
                       referenceImageUrl: managerActiveSlotItem?.imageUrl || getRecordMainImageUrl(imageManagerRecord),
                       referenceImageLabels: [`当前槽位：${getImageSlotLabel(managerActiveSlot)}`],
                       selectedSlotIds: [managerActiveSlot.id],
+                      autoRun: true,
+                      openQueue: false,
                     });
                   }}
                 >
                   当前图精修
                 </Button>
-                <Button icon={<ClockCircleOutlined />} onClick={() => setVisualQueueOpen(true)}>
+                <Button icon={<ClockCircleOutlined />} onClick={() => { setVisualQueueOpen(true); void refreshVisualQueueTasks(); }}>
                   任务队列{visualQueueItems.length > 0 ? ` ${visualQueueItems.length}` : ''}
                 </Button>
               </Space>
@@ -3511,7 +4054,7 @@ function DataDeskPanel({
             <Input allowClear placeholder="搜索商品标题 / ID" />
           </Form.Item>
           <Form.Item label="类目" name="category">
-            <CategoryCascaderFilter categories={categories} />
+            <CategoryCascaderFilterV2 categories={categories} />
           </Form.Item>
           <Form.Item label="时间范围" name="period">
             <Select
@@ -4090,7 +4633,7 @@ export function SelectProductPage({
                 <Input allowClear placeholder="搜索商品标题 / ID" />
               </Form.Item>
               <Form.Item label="类目" name="category">
-                <CategoryCascaderFilter categories={categories} />
+                <CategoryCascaderFilterV2 categories={categories} />
               </Form.Item>
               <Form.Item label="时间范围" name="period">
                 <Select

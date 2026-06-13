@@ -20,3 +20,8 @@ storage/yunqi_exports/
 storage/yunqi_categories/yunqi_categories_20*.json
 storage/yunqi_categories/yunqi_categories_flat_20*.csv
 *.db
+*.db-shm
+*.db-wal
+.codex_checkpoints/
+storage/visual_generation/
+backend/data/

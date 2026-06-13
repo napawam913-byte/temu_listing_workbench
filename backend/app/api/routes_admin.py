@@ -11,6 +11,7 @@ from app.api.auth import require_admin_user
 from app.core import config as app_config
 from app.core.database import (
     create_managed_user,
+    get_api_usage_summary,
     get_app_settings_map,
     list_users,
     reset_managed_user_password,
@@ -38,6 +39,9 @@ SETTING_DEFINITIONS: tuple[SettingDefinition, ...] = (
     SettingDefinition("OPENAI_TITLE_API_KEY", "ai", "Title API Key", "标题生成专用 API Key，留空继承通用 OPENAI_API_KEY", is_secret=True),
     SettingDefinition("OPENAI_TITLE_BASE_URL", "ai", "Title Base URL", "标题生成专用接口地址，留空继承通用 OPENAI_BASE_URL"),
     SettingDefinition("OPENAI_TITLE_MODEL", "ai", "标题生成模型", "用于中文标题、英文标题、变种值英文翻译", "gpt-5.5"),
+    SettingDefinition("OPENAI_TITLE_SPLIT_API_KEY", "ai", "Title Split API Key", "标题拆分专用 API Key，留空继承通用 OPENAI_API_KEY", is_secret=True),
+    SettingDefinition("OPENAI_TITLE_SPLIT_BASE_URL", "ai", "Title Split Base URL", "标题拆分专用接口地址，留空继承通用 OPENAI_BASE_URL"),
+    SettingDefinition("OPENAI_TITLE_SPLIT_MODEL", "ai", "标题拆分模型", "用于把商品标题拆成 1688 采购搜索关键词", "gpt-5.5"),
     SettingDefinition("OPENAI_RECOMMENDATION_API_KEY", "ai", "Recommendation API Key", "智能推荐专用 API Key，留空继承通用 OPENAI_API_KEY", is_secret=True),
     SettingDefinition("OPENAI_RECOMMENDATION_BASE_URL", "ai", "Recommendation Base URL", "智能推荐专用接口地址，留空继承通用 OPENAI_BASE_URL"),
     SettingDefinition("OPENAI_RECOMMENDATION_MODEL", "ai", "智能推荐模型", "用于商品标题、类目、图片分析和推荐关键词", "gpt-5.5"),
@@ -161,6 +165,11 @@ def admin_reset_user_password(
 def admin_list_settings(_admin: dict[str, Any] = Depends(require_admin_user)):
     saved_settings = get_app_settings_map()
     return {"items": [serialize_setting(definition, saved_settings.get(definition.key)) for definition in SETTING_DEFINITIONS]}
+
+
+@router.get("/api-usage")
+def admin_api_usage_summary(_admin: dict[str, Any] = Depends(require_admin_user)):
+    return get_api_usage_summary()
 
 
 @router.put("/settings")

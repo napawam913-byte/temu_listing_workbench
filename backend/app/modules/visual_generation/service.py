@@ -220,6 +220,18 @@ def get_visual_task(*, task_id: str, user_id: str) -> dict[str, Any]:
     return task_row_to_api(row, modules=modules)
 
 
+def delete_visual_task(*, task_id: str, user_id: str) -> None:
+    with get_connection() as conn:
+        ensure_visual_generation_schema(conn)
+        row = conn.execute(
+            "SELECT id FROM visual_generation_tasks WHERE id = ? AND user_id = ?",
+            (task_id, user_id),
+        ).fetchone()
+        if row is None:
+            raise VisualTaskError("visual task not found")
+        conn.execute("DELETE FROM visual_generation_modules WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM visual_generation_tasks WHERE id = ? AND user_id = ?", (task_id, user_id))
+
 def request_product_analysis_with_payload_retry(
     *,
     api_url: str,
@@ -318,6 +330,7 @@ def plan_visual_task(
     source_path = reference_paths[0] if reference_paths else materialize_image_ref(source_ref, task_dir / "source_image")
 
     context = build_visual_prompt_context(task=task, record=record, reference_refs=reference_refs)
+    requested_count = int(task.get("requestedCount") or task.get("requested_count") or layout_panel_count(task["layout"]))
     update_task_status(task_id, user_id, TASK_STATUS_RUNNING)
     try:
         product_analysis = request_product_analysis_with_payload_retry(
@@ -336,6 +349,8 @@ def plan_visual_task(
                 product_analysis=product_analysis,
                 layout=task["layout"],
                 allow_short_labels=resolved_allow_short_labels,
+                requested_count=requested_count,
+                context=context,
             )
         except Exception as exc:
             if not is_request_too_large_error(exc):
@@ -348,6 +363,8 @@ def plan_visual_task(
                 product_analysis=compact_analysis if isinstance(compact_analysis, dict) else product_analysis,
                 layout=task["layout"],
                 allow_short_labels=resolved_allow_short_labels,
+                requested_count=requested_count,
+                context=context,
             )
         mother_prompt = build_mother_prompt_from_plan(plan, task["layout"], resolved_allow_short_labels)
         persist_plan(task_id, user_id, source_ref, plan, mother_prompt)

@@ -55,6 +55,28 @@ export type AdminSettingsUpdateItem = {
   clear?: boolean;
 };
 
+export type AdminApiUsageItem = {
+  id: string;
+  provider: string;
+  apiType: string;
+  stage: string;
+  model: string;
+  callCount: number;
+  successCount: number;
+  failedCount: number;
+  lastCalledAt?: string | null;
+  source: string;
+  isInferred: boolean;
+  notes?: string;
+};
+
+export type AdminApiUsageSummary = {
+  items: AdminApiUsageItem[];
+  totalCalls: number;
+  exactCalls: number;
+  inferredCalls: number;
+};
+
 export function clearLegacyAuthToken() {
   localStorage.removeItem(LEGACY_AUTH_TOKEN_STORAGE_KEY);
 }
@@ -130,7 +152,7 @@ export type ProductCategoryOption = {
   value: string;
   label: string;
   count: number;
-  level: 1 | 2;
+  level: 1 | 2 | 3 | 4;
   children?: ProductCategoryOption[];
 };
 
@@ -914,6 +936,15 @@ export async function fetchVisualGenerationTask(taskId: string): Promise<VisualG
   return body.item;
 }
 
+export async function deleteVisualGenerationTask(taskId: string): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/api/visual/tasks/${encodeURIComponent(taskId)}`, withSession({
+    method: 'DELETE',
+    headers: authHeaders(),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+}
 export async function planVisualGenerationTask(
   taskId: string,
   payload: VisualTaskPlanPayload = {},
@@ -1069,6 +1100,23 @@ export async function fetchAdminSettings(): Promise<AdminSetting[]> {
 
   const body = await response.json();
   return body.items || [];
+}
+
+export async function fetchAdminApiUsage(): Promise<AdminApiUsageSummary> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/api-usage`, withSession({
+    headers: authHeaders(),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return {
+    items: body.items || [],
+    totalCalls: body.totalCalls || 0,
+    exactCalls: body.exactCalls || 0,
+    inferredCalls: body.inferredCalls || 0,
+  };
 }
 
 export async function updateAdminSettings(items: AdminSettingsUpdateItem[]): Promise<AdminSetting[]> {
