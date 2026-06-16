@@ -1,6 +1,7 @@
 import {
   Button,
   Card,
+  Checkbox,
   Drawer,
   Empty,
   Form,
@@ -31,11 +32,13 @@ import type { Key } from 'react';
 import type { SortOrder } from 'antd/es/table/interface';
 import {
   addProductsToPool,
+  createDianxiaomiExportTask,
   createVisualGenerationTask,
   deleteVisualGenerationTask,
   deleteProduct as deleteBackendProduct,
   deleteLinkListRecord,
-  exportDianxiaomiTemuTemplate,
+  downloadDianxiaomiExportTask,
+  fetchDianxiaomiExportTask,
   fetchVisualGenerationTask,
   fetchVisualGenerationTasks,
   fetchVisualQueueSummary,
@@ -54,6 +57,7 @@ import {
 } from '../api/backendApi';
 import type {
   CurrentUser,
+  DianxiaomiExportTask,
   ProductCategoryOption,
   ProductStats,
   VisualGenerationTask,
@@ -69,6 +73,7 @@ import type { Product, ProductSourceType, SourcingCandidate } from '../types/pro
 
 const { Header, Content } = Layout;
 const { Text } = Typography;
+const EXPORT_TEMPLATE_MESSAGE_KEY = 'dianxiaomi-temu-template-export';
 const ALL_CATEGORY_VALUE = '全部类目';
 
 type Filters = {
@@ -752,6 +757,11 @@ function getSkuDisplayImageUrl(entry: LinkListRecord['skuEntries'][number]) {
   return getAssetDisplayUrl(entry.imageAsset) || entry.imageUrl;
 }
 
+function getRecordSourceTitle(record: LinkListRecord, sourceId?: string, fallback?: string) {
+  const source = sourceId ? record.sourceLinks.find((item) => item.id === sourceId) : undefined;
+  return String(source?.title || fallback || '').trim();
+}
+
 function getSelectedSkuImageRefDescriptors(record: LinkListRecord, selectedSkuIds?: string[]) {
   const selectedSet = new Set(selectedSkuIds || []);
   const entries =
@@ -778,11 +788,21 @@ function getSelectedSkuImageRefDescriptors(record: LinkListRecord, selectedSkuId
     if (entry.kind === 'combo' && components.length > 0) {
       const addedComponentRef = components.reduce((added, component) => {
         const componentName = String(component.name || component.specText || component.sourceTitle || skuName).trim();
+        const sourceTitle = getRecordSourceTitle(record, component.sourceId, component.sourceTitle);
+        const componentLabel = [sourceTitle, componentName].filter(Boolean).join(' / ');
+        const componentSubject = [
+          component.sourceId,
+          component.sourceSkuKey,
+          sourceTitle,
+          componentName,
+        ]
+          .filter(Boolean)
+          .join('|');
         return (
           addRef(
-            component.sourceImageUrl || component.imageUrl,
-            `Selected SKU component: ${componentName}`,
-            componentName,
+            component.imageUrl || component.sourceImageUrl,
+            `Selected SKU component: ${componentLabel || componentName}`,
+            componentSubject || componentName,
           ) || added
         );
       }, false);
@@ -794,7 +814,12 @@ function getSelectedSkuImageRefDescriptors(record: LinkListRecord, selectedSkuId
 
     const addedEntryRef = addRef(getSkuDisplayImageUrl(entry), skuLabel, skuName);
     if (!addedEntryRef) {
-      (entry.sourceSkuLinks || []).some((link) => addRef(link.imageUrl, skuLabel, skuName));
+      (entry.sourceSkuLinks || []).some((link) => {
+        const sourceTitle = getRecordSourceTitle(record, link.sourceId, link.sourceTitle);
+        const sourceLabel = [sourceTitle, skuName].filter(Boolean).join(' / ');
+        const sourceSubject = [link.sourceId, link.sourceSkuKey, sourceTitle, skuName].filter(Boolean).join('|');
+        return addRef(link.imageUrl, `Selected SKU: ${sourceLabel || skuName}`, sourceSubject || skuName);
+      });
     }
   });
 
@@ -805,20 +830,41 @@ function getSelectedSkuImageRefs(record: LinkListRecord, selectedSkuIds?: string
   return getSelectedSkuImageRefDescriptors(record, selectedSkuIds).map((item) => item.url);
 }
 
+function cleanReferenceTitle(value?: string, fallback?: string) {
+  const text = String(value || '').trim();
+  const cleaned = text
+    .replace(/\s*(主图|素材图|效果图|场景图|细节图|尺寸结构|对比图|组合包装|卖点图)\s*\d*$/u, '')
+    .trim();
+  return cleaned || String(fallback || '').trim();
+}
+
 function getSelectedGalleryImageRefDescriptors(
   selectedAssets: Array<{ asset: LinkListImageAsset; imageUrl: string }>,
+  record?: LinkListRecord,
 ) {
   const seenUrls = new Set<string>();
   return selectedAssets
     .map((item, index) => ({
       url: String(item.imageUrl || '').trim(),
-      label: item.asset.alt || `Selected gallery image ${index + 1}`,
+      label: `Product reference image ${index + 1}: ${cleanReferenceTitle(item.asset.alt, record?.productTitle)}`,
     }))
     .filter((item) => {
       if (!item.url || seenUrls.has(item.url)) return false;
       seenUrls.add(item.url);
       return true;
     });
+}
+
+function mergeImageRefDescriptors(...groups: Array<Array<{ url: string; label: string }>>) {
+  const seenUrls = new Set<string>();
+  const merged: Array<{ url: string; label: string }> = [];
+  groups.flat().forEach((item) => {
+    const url = String(item.url || '').trim();
+    if (!url || seenUrls.has(url)) return;
+    seenUrls.add(url);
+    merged.push({ url, label: String(item.label || `Reference image ${merged.length + 1}`).trim() });
+  });
+  return merged;
 }
 
 function collectRecordImageAssets(record?: LinkListRecord): LinkListImageAsset[] {
@@ -1698,7 +1744,7 @@ function getVisualReferenceImageRefs(item: VisualQueueItem) {
     .map((url, index) => ({
       url: String(url || '').trim(),
       label: String(labels[index] || `Reference image ${index + 1}`).trim(),
-      role: item.mode === 'main_multi' || item.mode === 'sku_adapt' ? 'selected-sku-image' : 'reference-image',
+      role: 'product-reference-image',
     }))
     .filter((ref) => {
       if (!ref.url || seen.has(ref.url)) return false;
@@ -1936,6 +1982,25 @@ async function waitForVisualGenerationTask(
   throw new Error(lastTask?.errorMessage || '生图任务仍在执行，请稍后打开任务队列查看');
 }
 
+async function waitForDianxiaomiExportTask(
+  taskId: string,
+  maxAttempts = 1200,
+  onProgress?: (task: DianxiaomiExportTask) => void,
+): Promise<DianxiaomiExportTask> {
+  let lastTask: DianxiaomiExportTask | undefined;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const task = await fetchDianxiaomiExportTask(taskId);
+    lastTask = task;
+    onProgress?.(task);
+    if (task.status === 'completed') return task;
+    if (task.status === 'failed') {
+      throw new Error(task.errorMessage || 'Excel 导出任务执行失败');
+    }
+    await waitForMs(3000);
+  }
+  throw new Error(lastTask?.errorMessage || 'Excel 导出任务仍在执行，请稍后重试下载');
+}
+
 function downloadBlob(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
@@ -1950,12 +2015,19 @@ function downloadBlob(blob: Blob, filename: string) {
 function LinkListPanel({
   records,
   onDelete,
+  onDeleteMany,
+  onExportRecords,
   onUpdate,
+  exporting,
 }: {
   records: LinkListRecord[];
   onDelete: (recordId: string) => void;
+  onDeleteMany?: (recordIds: string[]) => void;
+  onExportRecords?: (records: LinkListRecord[]) => Promise<void>;
   onUpdate: (record: LinkListRecord) => void;
+  exporting?: boolean;
 }) {
+  const [selectedRecordIds, setSelectedRecordIds] = useState<string[]>([]);
   const [previewRecord, setPreviewRecord] = useState<LinkListRecord>();
   const [previewActiveImageSlotId, setPreviewActiveImageSlotId] = useState<string>();
   const [previewActiveSkuEntryId, setPreviewActiveSkuEntryId] = useState<string>();
@@ -2007,8 +2079,8 @@ function LinkListPanel({
     return imageManagerGalleryOptions.filter((option) => selectedSet.has(option.asset.id));
   }, [imageManagerGalleryOptions, imageManagerSelectedAssetIds]);
   const imageManagerSelectedGalleryImageRefs = useMemo(
-    () => getSelectedGalleryImageRefDescriptors(imageManagerSelectedAssets),
-    [imageManagerSelectedAssets],
+    () => getSelectedGalleryImageRefDescriptors(imageManagerSelectedAssets, imageManagerRecord),
+    [imageManagerRecord, imageManagerSelectedAssets],
   );
   const imageManagerSelectedSkuImageRefs = useMemo(
     () =>
@@ -2053,6 +2125,10 @@ function LinkListPanel({
   const imageManagerProgress = imageManagerRecord ? getRecordProductImageProgress(imageManagerRecord) : undefined;
   const hasPendingCreativeJobs = records.some((record) =>
     (record.creativeJobs || []).some((job) => job.status === 'queued' || job.status === 'running'),
+  );
+  const selectedRecords = useMemo(
+    () => records.filter((record) => selectedRecordIds.includes(record.id)),
+    [records, selectedRecordIds],
   );
 
   const applySyncedRecords = useCallback(
@@ -2127,6 +2203,11 @@ function LinkListPanel({
     setPreviewActiveImageSlotId(galleryItems[0]?.slot.id);
     setPreviewActiveSkuEntryId(previewRecord.skuEntries[0]?.id);
   }, [previewRecord]);
+
+  useEffect(() => {
+    const availableIds = new Set(records.map((record) => record.id));
+    setSelectedRecordIds((current) => current.filter((id) => availableIds.has(id)));
+  }, [records]);
 
   useEffect(() => {
     if (!imageManagerRecord) {
@@ -2205,6 +2286,47 @@ function LinkListPanel({
       console.warn('Failed to refresh visual queue summary', error);
     });
   }, [visualQueueOpen, visualQueueItems.length, refreshVisualQueueSummary]);
+
+  const toggleLinkRecordSelection = (recordId: string, checked: boolean) => {
+    setSelectedRecordIds((current) =>
+      checked ? [...new Set([...current, recordId])] : current.filter((id) => id !== recordId),
+    );
+  };
+
+  const exportSelectedRecords = async () => {
+    if (selectedRecords.length === 0) {
+      message.warning('请先选择要导出的商品链接');
+      return;
+    }
+    if (!onExportRecords) return;
+    const exportedIdSet = new Set(selectedRecords.map((record) => record.id));
+    setSelectedRecordIds((current) => current.filter((id) => !exportedIdSet.has(id)));
+    await onExportRecords(selectedRecords);
+  };
+
+  const deleteSelectedRecords = () => {
+    if (selectedRecords.length === 0) {
+      message.warning('请先选择要删除的商品链接');
+      return;
+    }
+    const deletingIds = selectedRecords.map((record) => record.id);
+    Modal.confirm({
+      title: `删除选中的 ${deletingIds.length} 条链接记录？`,
+      content: '删除后会从当前链接列表移除，不影响商品池原始商品。',
+      okText: '删除',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: () => {
+        const deletingIdSet = new Set(deletingIds);
+        setSelectedRecordIds((current) => current.filter((id) => !deletingIdSet.has(id)));
+        if (onDeleteMany) {
+          onDeleteMany(deletingIds);
+          return;
+        }
+        deletingIds.forEach(onDelete);
+      },
+    });
+  };
 
   const openImageManager = (record: LinkListRecord, slotId?: string) => {
     const firstSlotId = getRecordProductImageSlotItems(record)[0]?.slot.id;
@@ -2421,10 +2543,10 @@ function LinkListPanel({
 
   const enqueueMainGalleryFromSelectedSkus = (requestedCount?: number) => {
     if (!imageManagerRecord || !imageManagerProductTask) return;
-    const referenceImageDescriptors =
-      imageManagerSelectedGalleryImageRefs.length > 0
-        ? imageManagerSelectedGalleryImageRefs
-        : imageManagerSelectedSkuImageRefs;
+    const referenceImageDescriptors = mergeImageRefDescriptors(
+      imageManagerSelectedGalleryImageRefs,
+      imageManagerSelectedSkuImageRefs,
+    );
     const referenceImageUrls = referenceImageDescriptors.map((item) => item.url);
     if (referenceImageUrls.length === 0) {
       message.warning('请先在图库或 SKU 中选择要作为主图生成依据的图片');
@@ -2574,7 +2696,7 @@ function LinkListPanel({
       modules: markModules('等待回写', 'processing'),
     }));
 
-    await runVisualGenerationTask(created.id, {
+    const runResult = await runVisualGenerationTask(created.id, {
       sourceImageRef: primaryReferenceImageUrl,
       referenceImageRefs,
       allowShortLabels: true,
@@ -2583,16 +2705,20 @@ function LinkListPanel({
       useReferenceImage: true,
       applyToLinkRecord: true,
     });
+    const waitingForConcurrency = Boolean(runResult.waitingForConcurrency);
+    if (waitingForConcurrency) {
+      message.info(runResult.message || '\u5df2\u8d85\u8fc7\u6210\u5458\u5e76\u53d1\u4e0a\u9650\uff0c\u4efb\u52a1\u5df2\u8fdb\u5165\u7b49\u5f85\u961f\u5217');
+    }
 
     patchVisualQueueItem(item.id, () => ({
       backendTaskId: created.id,
-      backendStatus: 'running',
-      statusLabel: '生成中',
-      statusColor: 'processing',
-      modules: markModules('生成中', 'processing'),
+      backendStatus: runResult.item.status || (waitingForConcurrency ? 'queued' : 'running'),
+      statusLabel: waitingForConcurrency ? '\u6392\u961f\u7b49\u5f85' : '\u751f\u6210\u4e2d',
+      statusColor: waitingForConcurrency ? 'blue' : 'processing',
+      modules: markModules(waitingForConcurrency ? '\u7b49\u5f85\u7a7a\u4f4d' : '\u751f\u6210\u4e2d', waitingForConcurrency ? 'blue' : 'processing'),
     }));
 
-    const generated = await waitForVisualGenerationTask(created.id, 180, (progressTask) => {
+    const generated = await waitForVisualGenerationTask(created.id, waitingForConcurrency ? 7200 : 180, (progressTask) => {
       const hasAnalysis = hasVisualDetail(progressTask.analysis);
       if (!hasAnalysis && !progressTask.promptText) return;
       patchVisualQueueItem(item.id, (current) => ({
@@ -2880,6 +3006,24 @@ function LinkListPanel({
               </Text>
             </div>
             <Space>
+              <Text type="secondary">已选 {selectedRecords.length}</Text>
+              <Button disabled={records.length === 0} onClick={() => setSelectedRecordIds(records.map((record) => record.id))}>
+                全选
+              </Button>
+              <Button disabled={selectedRecordIds.length === 0} onClick={() => setSelectedRecordIds([])}>
+                清空
+              </Button>
+              <Button danger disabled={selectedRecords.length === 0} onClick={deleteSelectedRecords}>
+                删除选中
+              </Button>
+              <Button
+                disabled={selectedRecords.length === 0 || !onExportRecords}
+                loading={exporting}
+                type="primary"
+                onClick={() => void exportSelectedRecords()}
+              >
+                导出选中
+              </Button>
               <Button icon={<ClockCircleOutlined />} onClick={() => { setVisualQueueOpen(true); void refreshVisualQueueTasks(); }}>
                 任务队列
                 {visualQueueItems.length > 0 ? ` ${visualQueueItems.length}` : ''}
@@ -2894,9 +3038,10 @@ function LinkListPanel({
               const jobSummary = getCreativeJobSummary(record);
               const productImageCount = getRecordProductImageGenerationCount(record);
               const productImageProgress = getRecordProductImageProgress(record);
+              const selected = selectedRecordIds.includes(record.id);
               return (
             <Card
-              className="link-record-card"
+              className={`link-record-card ${selected ? 'link-record-card-selected' : ''}`}
               hoverable
               key={record.id}
               tabIndex={0}
@@ -2908,6 +3053,13 @@ function LinkListPanel({
               }}
             >
               <div className="link-record-row">
+                <div className="link-record-select" onClick={(event) => event.stopPropagation()}>
+                  <Checkbox
+                    checked={selected}
+                    aria-label={`选择导出 ${record.productTitle}`}
+                    onChange={(event) => toggleLinkRecordSelection(record.id, event.target.checked)}
+                  />
+                </div>
                 <div className="link-record-image">
                   {getRecordMainImageUrl(record) ? (
                     <Image
@@ -2994,6 +3146,7 @@ function LinkListPanel({
                     type="text"
                     onClick={(event) => {
                       event.stopPropagation();
+                      setSelectedRecordIds((current) => current.filter((id) => id !== record.id));
                       onDelete(record.id);
                     }}
                   >
@@ -3252,20 +3405,26 @@ function LinkListPanel({
             {visualQueueSummary ? (
               <>
                 <div>
-                  <span>Backend queued</span>
-                  <strong>{visualQueueSummary.counts.queued || 0}</strong>
+                  <span>{'\u540e\u7aef\u6392\u961f'}</span>
+                  <strong>{visualQueueSummary.queuedCount ?? (visualQueueSummary.counts.queued || 0)}</strong>
                 </div>
                 <div>
-                  <span>Backend running</span>
-                  <strong>{visualQueueSummary.counts.running || 0}</strong>
+                  <span>{'\u8fd0\u884c/\u6210\u5458\u4e0a\u9650'}</span>
+                  <strong>
+                    {visualQueueSummary.runningCount ?? (visualQueueSummary.counts.running || 0)}/
+                    {visualQueueSummary.userConcurrencyLimit || '\u4e0d\u9650'}
+                  </strong>
                 </div>
                 <div>
                   <span>Retry waiting</span>
                   <strong>{visualQueueSummary.counts.retry_waiting || 0}</strong>
                 </div>
                 <div>
-                  <span>User limit</span>
-                  <strong>{visualQueueSummary.userConcurrencyLimit || 'unlimited'}</strong>
+                  <span>{'\u56e2\u961f\u8fd0\u884c/\u4e0a\u9650'}</span>
+                  <strong>
+                    {visualQueueSummary.teamRunningCount ?? (visualQueueSummary.teamActiveCount || 0)}/
+                    {visualQueueSummary.teamConcurrencyLimit || '\u4e0d\u9650'}
+                  </strong>
                 </div>
                 <div>
                   <span>Redis length</span>
@@ -4232,7 +4391,6 @@ export function SelectProductPage({
   const [gmvSortOrder, setGmvSortOrder] = useState<SortOrder>();
   const [categories, setCategories] = useState<ProductCategoryOption[]>([]);
   const [importOpen, setImportOpen] = useState(false);
-  const [exportOpen, setExportOpen] = useState(false);
   const [exportingTemplate, setExportingTemplate] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerMode, setDrawerMode] = useState<'sourcing' | 'sales'>('sourcing');
@@ -4410,15 +4568,28 @@ export function SelectProductPage({
     [closeProduct, currentUser.id, warnLinkPersistenceFailure],
   );
 
-  const deleteLinkEntry = useCallback((recordId: string) => {
+  const deleteLinkEntries = useCallback((recordIds: string[]) => {
+    const uniqueIds = Array.from(new Set(recordIds)).filter(Boolean);
+    if (uniqueIds.length === 0) return;
+
+    const deletingIdSet = new Set(uniqueIds);
     setLinkListRecords((current) => {
-      const next = current.filter((record) => record.id !== recordId);
+      const next = current.filter((record) => !deletingIdSet.has(record.id));
       writeLinkListRecords(next, currentUser.id);
       return next;
     });
-    void deleteLinkListRecord(recordId).catch(warnLinkPersistenceFailure);
-    message.success('已删除链接记录');
-  }, [warnLinkPersistenceFailure]);
+    void Promise.allSettled(uniqueIds.map((recordId) => deleteLinkListRecord(recordId))).then((results) => {
+      const failedCount = results.filter((result) => result.status === 'rejected').length;
+      if (failedCount > 0) {
+        warnLinkPersistenceFailure(new Error(`${failedCount} 条链接记录后端删除失败`));
+      }
+    });
+    message.success(uniqueIds.length === 1 ? '已删除链接记录' : `已删除 ${uniqueIds.length} 条链接记录`);
+  }, [currentUser.id, warnLinkPersistenceFailure]);
+
+  const deleteLinkEntry = useCallback((recordId: string) => {
+    deleteLinkEntries([recordId]);
+  }, [deleteLinkEntries]);
 
   const updateLinkEntry = useCallback((record: LinkListRecord) => {
     setLinkListRecords((current) => {
@@ -4462,19 +4633,31 @@ export function SelectProductPage({
     [products],
   );
 
-  const exportTemplate = useCallback(async () => {
-    if (linkListRecords.length === 0) {
+  const exportTemplate = useCallback(async (targetRecords?: LinkListRecord[]) => {
+    const requestedRecords = targetRecords && targetRecords.length > 0 ? targetRecords : linkListRecords;
+    if (requestedRecords.length === 0) {
       message.warning('请先在商品池中录入链接列表，再导出 Excel');
       return;
     }
 
+    if (exportingTemplate) {
+      message.info('Excel 正在后台生成，可以继续选品');
+      return;
+    }
+
     setExportingTemplate(true);
+    message.open({
+      key: EXPORT_TEMPLATE_MESSAGE_KEY,
+      type: 'loading',
+      content: 'Excel 正在后台生成，可以继续选品',
+      duration: 0,
+    });
     try {
-      let recordsForExport = linkListRecords;
+      let recordsForExport = requestedRecords;
       let shouldPersistRecordsForExport = false;
       try {
-        const syncResult = await syncPluginCreativeJobs(linkListRecords);
-        recordsForExport = syncResult.records.length > 0 ? syncResult.records : linkListRecords;
+        const syncResult = await syncPluginCreativeJobs(requestedRecords);
+        recordsForExport = syncResult.records.length > 0 ? syncResult.records : requestedRecords;
         if (syncResult.records.length > 0) {
           shouldPersistRecordsForExport = true;
         }
@@ -4488,21 +4671,49 @@ export function SelectProductPage({
       }
       recordsForExport = enrichedRecordsForExport;
       if (shouldPersistRecordsForExport) {
-        setLinkListRecords(recordsForExport);
-        writeLinkListRecords(recordsForExport, currentUser.id);
-        void saveLinkListRecords(recordsForExport).catch(warnLinkPersistenceFailure);
+        const updatedById = new Map(recordsForExport.map((record) => [record.id, record]));
+        const nextLinkListRecords = linkListRecords.map((record) => updatedById.get(record.id) || record);
+        setLinkListRecords(nextLinkListRecords);
+        writeLinkListRecords(nextLinkListRecords, currentUser.id);
+        void saveLinkListRecords(nextLinkListRecords).catch(warnLinkPersistenceFailure);
       }
 
-      const blob = await exportDianxiaomiTemuTemplate(recordsForExport);
-      downloadBlob(blob, `店小秘_TEMU半托管_${new Date().toISOString().slice(0, 10)}.xlsx`);
-      setExportOpen(false);
-      message.success('Excel 已生成，请手动导入店小秘');
+      const task = await createDianxiaomiExportTask(recordsForExport);
+      message.open({
+        key: EXPORT_TEMPLATE_MESSAGE_KEY,
+        type: 'loading',
+        content: `导出任务已入队：${task.recordCount} 个商品链接`,
+        duration: 0,
+      });
+
+      const completedTask = await waitForDianxiaomiExportTask(task.id, 1200, (progressTask) => {
+        if (progressTask.status !== 'queued' && progressTask.status !== 'running') return;
+        message.open({
+          key: EXPORT_TEMPLATE_MESSAGE_KEY,
+          type: 'loading',
+          content: `导出任务${progressTask.status === 'queued' ? '排队中' : '执行中'}：${progressTask.recordCount} 个商品链接`,
+          duration: 0,
+        });
+      });
+      const blob = await downloadDianxiaomiExportTask(completedTask.id);
+      downloadBlob(blob, completedTask.filename || `店小秘_TEMU半托管_${new Date().toISOString().slice(0, 10)}.xlsx`);
+      message.open({
+        key: EXPORT_TEMPLATE_MESSAGE_KEY,
+        type: 'success',
+        content: 'Excel 已生成并开始下载，请手动导入店小秘',
+        duration: 4,
+      });
     } catch (error) {
-      message.error(error instanceof Error ? error.message : 'Excel 导出失败');
+      message.open({
+        key: EXPORT_TEMPLATE_MESSAGE_KEY,
+        type: 'error',
+        content: error instanceof Error ? error.message : 'Excel 导出失败',
+        duration: 5,
+      });
     } finally {
       setExportingTemplate(false);
     }
-  }, [currentUser.id, enrichRecordsWithProductCategory, linkListRecords, warnLinkPersistenceFailure]);
+  }, [currentUser.id, enrichRecordsWithProductCategory, exportingTemplate, linkListRecords, warnLinkPersistenceFailure]);
 
   const openProductFromRoute = useCallback(async () => {
     if (isAdminUser) {
@@ -4645,9 +4856,6 @@ export function SelectProductPage({
                 <Button className="header-button" type="primary" onClick={() => setImportOpen(true)}>
                   数据导入
                 </Button>
-                <Button className="header-button" onClick={() => setExportOpen(true)}>
-                  清单导出
-                </Button>
               </>
             ) : null}
             <Button className="header-button" onClick={onLogout}>
@@ -4665,7 +4873,10 @@ export function SelectProductPage({
             <LinkListPanel
               records={linkListRecords}
               onDelete={deleteLinkEntry}
+              onDeleteMany={deleteLinkEntries}
+              onExportRecords={exportTemplate}
               onUpdate={updateLinkEntry}
+              exporting={exportingTemplate}
             />
           ) : activeWorkbenchTab === 'admin' ? (
             <AdminPage />
@@ -4831,36 +5042,6 @@ export function SelectProductPage({
         onRecordLinkEntry={recordLinkEntry}
       />
 
-      <Modal
-        title="店小秘 TEMU 半托管 Excel 导出"
-        open={exportOpen}
-        confirmLoading={exportingTemplate}
-        onCancel={() => setExportOpen(false)}
-        onOk={exportTemplate}
-        okText="导出 Excel"
-        cancelText="取消"
-      >
-        <Space direction="vertical" size={16} className="export-modal-content">
-          <Text type="secondary">
-            这里只生成店小秘 TEMU 半托管 Excel 文件；导出后请手动进入店小秘后台上传导入。
-          </Text>
-          <Card size="small" title="导出范围">
-            <Space direction="vertical">
-              <Text strong>链接列表商品：{linkListRecords.length} 个</Text>
-              <Text>销售 SKU：{linkListRecords.reduce((total, record) => total + record.skuEntries.length, 0)} 个</Text>
-              <Text>图片策略：优先使用改图后的云端图片；没有改图时使用采集到的原图。轮播图最多 10 张，产品描述同步写入轮播图 URL。</Text>
-            </Space>
-          </Card>
-          <Card size="small" title="默认字段">
-            <Space direction="vertical">
-              <Text>变种属性：按店小秘下拉枚举自动匹配（颜色/风格/材质/数量/型号等）</Text>
-              <Text>包装：不规则 / 硬包装</Text>
-              <Text>尺寸重量缺失时：10 × 10 × 5 cm，200 g</Text>
-              <Text>库存：0；发货时效：空</Text>
-            </Space>
-          </Card>
-        </Space>
-      </Modal>
     </Layout>
   );
 }

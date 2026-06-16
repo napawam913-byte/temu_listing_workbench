@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -8,23 +7,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from app.core.config import BACKEND_DIR, OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_TEXT_MODEL
+from app.core.config import BACKEND_DIR
 from app.core.database import (
     assert_user_api_usage_allowed,
-    get_app_setting_value,
-    get_enabled_admin_api_channel_credential,
-    get_enabled_user_api_credential,
     record_api_usage_safe,
 )
 from app.modules.creative_generation.safety import sanitize_marketplace_text
+from app.modules.visual_generation.clients import (
+    build_api_url,
+    extract_response_text,
+    get_ai_stage_settings,
+    parse_json_from_text,
+    request_json,
+    request_text_json,
+)
 
 
 PROMPT_PATH = BACKEND_DIR / "config" / "prompts" / "listing_optimization.md"
-TITLE_CACHE_SCHEMA = "listing-title-v1"
-VARIANT_VALUE_CACHE_SCHEMA = "variant-value-v1"
-_TITLE_CACHE: dict[str, dict[str, str]] = {}
-_VARIANT_VALUE_CACHE: dict[str, str] = {}
-
 VARIANT_VALUE_REPLACEMENTS = {
     "默认款": "Default Option",
     "默认": "Default",
@@ -70,6 +69,8 @@ VARIANT_VALUE_REPLACEMENTS = {
     "钥匙配饰分类": "Keychain Accessory Category",
     "SKU列表": "SKU List",
 }
+MAX_VARIANT_REFERENCE_IMAGES = 8
+MAX_VARIANT_VALUE_LENGTH = 48
 
 MOQ_MARKERS = (
     "起订",
@@ -99,16 +100,14 @@ def optimize_listing_titles(
     fallback_title_cn: str,
     fallback_title_en: str,
     user_id: str | None = None,
+    strict: bool = False,
 ) -> dict[str, str]:
     fallback = build_fallback_titles(fallback_title_cn, fallback_title_en)
     settings = get_title_optimizer_settings(user_id=user_id)
-    cache_key = build_title_cache_key(record, fallback)
-    cached = _TITLE_CACHE.get(cache_key)
-    if cached:
-        return cached
 
     if not settings.api_key:
-        _TITLE_CACHE[cache_key] = fallback
+        if strict:
+            raise ValueError("Title generation is not configured")
         return fallback
 
     assert_user_api_usage_allowed(user_id)
@@ -118,13 +117,20 @@ def optimize_listing_titles(
         result = normalize_generated_titles(generated, fallback)
     except Exception as exc:
         record_title_optimizer_usage(settings, user_id=user_id, stage="title", status="failed", error_message=str(exc))
+        if strict:
+            raise ValueError(f"Title generation failed: {exc}") from exc
         result = fallback
 
-    _TITLE_CACHE[cache_key] = result
     return result
 
 
-def translate_variant_values_to_english(values: list[str], *, user_id: str | None = None) -> dict[str, str]:
+def translate_variant_values_to_english(
+    values: list[str],
+    *,
+    user_id: str | None = None,
+    strict: bool = False,
+    context: dict[str, Any] | None = None,
+) -> dict[str, str]:
     unique_values = []
     for value in values:
         text = clean_text(value)
@@ -133,24 +139,23 @@ def translate_variant_values_to_english(values: list[str], *, user_id: str | Non
 
     result: dict[str, str] = {}
     missing: list[str] = []
+    use_context_ai = bool(context)
     for value in unique_values:
-        cached = _VARIANT_VALUE_CACHE.get(value)
-        if cached:
-            result[value] = cached
-            continue
-        if not contains_cjk(value):
+        if not use_context_ai and not contains_cjk(value):
             translated = normalize_ascii_variant_value(value)
-            _VARIANT_VALUE_CACHE[value] = translated
             result[value] = translated
             continue
         missing.append(value)
 
     settings = get_title_optimizer_settings(user_id=user_id)
     ai_translations: dict[str, str] = {}
-    if missing and settings.api_key:
+    if missing and not settings.api_key:
+        if strict:
+            raise ValueError("Variant translation API is not configured")
+    elif missing and settings.api_key:
         assert_user_api_usage_allowed(user_id)
         try:
-            ai_translations = generate_variant_values_with_ai(missing, settings)
+            ai_translations = generate_variant_values_with_ai(missing, settings, context=context)
             record_title_optimizer_usage(settings, user_id=user_id, stage="variant_translation", status="success")
         except Exception as exc:
             record_title_optimizer_usage(
@@ -160,62 +165,62 @@ def translate_variant_values_to_english(values: list[str], *, user_id: str | Non
                 status="failed",
                 error_message=str(exc),
             )
+            if strict:
+                raise ValueError(f"Variant translation failed: {exc}") from exc
             ai_translations = {}
 
     for value in missing:
         fallback = fallback_translate_variant_value(value)
         translated = normalize_variant_value_translation(ai_translations.get(value), fallback)
-        _VARIANT_VALUE_CACHE[value] = translated
+        if strict and value not in ai_translations:
+            raise ValueError(f"Variant translation API did not return a translation for: {value}")
         result[value] = translated
 
     return result
 
 
-def generate_variant_values_with_ai(values: list[str], settings: TitleOptimizerSettings) -> dict[str, str]:
-    from openai import OpenAI
-
-    kwargs: dict[str, str] = {"api_key": settings.api_key}
-    if settings.base_url:
-        kwargs["base_url"] = settings.base_url
-    client = OpenAI(**kwargs)
-
-    response = client.responses.create(
-        model=settings.text_model,
-        input=[
-            {
-                "role": "system",
-                "content": (
-                    "You translate Temu SKU variant option values for a Dianxiaomi import template. "
-                    "Return strict JSON only. Keep values concise, English-only, and faithful. "
-                    "Preserve letters, numbers, model codes, quantities, and plus signs. "
-                    "Do not invent brands, platform names, claims, discounts, certifications, or marketing hype."
-                ),
+def generate_variant_values_with_ai(
+    values: list[str],
+    settings: TitleOptimizerSettings,
+    *,
+    context: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    instruction = json.dumps(
+        {
+            "role": (
+                "You generate clean Temu SKU option values for a Dianxiaomi import template. "
+                "Use the product title, SKU/source context, and reference images when provided. "
+                "Return strict JSON only. Keep values concise, English-only, and faithful. "
+                "Preserve real product quantities, model codes, colors, materials, and plus signs. "
+                "A SKU value is a short option label, not a product title. "
+                "Do not include promotions, shop metrics, ratings, sales counts, holiday/gift marketing, "
+                "platform names, unsupported claims, discounts, certifications, or hype."
+            ),
+            "task": "Generate clean English SKU option values from the source values.",
+            "requirements": [
+                "Output must contain no Chinese characters.",
+                "Keep each SKU value very short: usually 1-5 words and at most 48 characters.",
+                "Never output full product titles, full selling points, use scenes, or sentence-like descriptions.",
+                "Prefer direct labels such as Mix, 12pcs, Red, D12 Dice, Wood Dice, Pet Bowl+Feeding Mat.",
+                "Translate or rewrite each source independently.",
+                "Use images and titles to keep only concrete product/variant information.",
+                "If the target variant field is color, output only the color/mix option, not quantity.",
+                "If the target variant field is quantity, output only the quantity/pack count.",
+                "If a source is a combo like A+B, preserve the plus structure using clean component product names.",
+                "Remove duplicated tokens such as Mix Quantity 12pcs+Mix when Mix already appears in the source.",
+                "If unsure, use a neutral value like Custom Option or Default Option.",
+            ],
+            "product_context": context or {},
+            "source_values": values,
+            "required_json": {
+                "values": [
+                    {"source": "original value", "value_en": "clean English SKU value"}
+                ]
             },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "task": "Translate these SKU variant values into concise English option values.",
-                        "requirements": [
-                            "Output must contain no Chinese characters.",
-                            "Translate each source independently.",
-                            "If a source is a combo like A+B, preserve the plus structure.",
-                            "If a source contains a minimum order quantity, express it as MOQ.",
-                            "If unsure, use a neutral value like Custom Option or Default Option.",
-                        ],
-                        "source_values": values,
-                        "required_json": {
-                            "values": [
-                                {"source": "original value", "value_en": "English variant value"}
-                            ]
-                        },
-                    },
-                    ensure_ascii=False,
-                ),
-            },
-        ],
+        },
+        ensure_ascii=False,
     )
-    raw = json.loads(response.output_text)
+    raw = request_variant_values_json(settings, instruction, context=context)
     items = raw.get("values") or raw.get("items") or []
     translations: dict[str, str] = {}
     for item in items:
@@ -226,6 +231,47 @@ def generate_variant_values_with_ai(values: list[str], settings: TitleOptimizerS
         if source and value_en:
             translations[source] = value_en
     return translations
+
+
+def request_variant_values_json(
+    settings: TitleOptimizerSettings,
+    instruction: str,
+    *,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    api_url = build_api_url(settings.base_url, "/chat/completions")
+    image_refs = [
+        clean_text(item)
+        for item in ((context or {}).get("image_urls") or [])
+        if clean_text(item).lower().startswith(("http://", "https://", "data:image/"))
+    ][:MAX_VARIANT_REFERENCE_IMAGES]
+    if not image_refs:
+        return request_text_json(
+            api_url=api_url,
+            api_key=settings.api_key,
+            model=settings.text_model,
+            instruction=instruction,
+            temperature=0.05,
+        )
+
+    content: list[dict[str, Any]] = [{"type": "text", "text": instruction}]
+    content.extend({"type": "image_url", "image_url": {"url": image_url}} for image_url in image_refs)
+    payload = {
+        "model": settings.text_model,
+        "messages": [{"role": "user", "content": content}],
+        "temperature": 0.05,
+    }
+    try:
+        response_json = request_json(api_url, settings.api_key, payload)
+        return parse_json_from_text(extract_response_text(response_json))
+    except Exception:
+        return request_text_json(
+            api_url=api_url,
+            api_key=settings.api_key,
+            model=settings.text_model,
+            instruction=instruction,
+            temperature=0.05,
+        )
 
 
 def fallback_translate_variant_value(value: str) -> str:
@@ -276,7 +322,7 @@ def normalize_ascii_variant_value(value: Any, *, allow_empty: bool = False) -> s
     text = re.sub(r"[^A-Za-z0-9+\-/().\s]", " ", text)
     text = re.sub(r"\s+", " ", text).strip(" -_/,.")
     safe_text, _ = sanitize_marketplace_text(text)
-    safe_text = trim_title(remove_cjk(safe_text), 80)
+    safe_text = trim_title(remove_cjk(safe_text), MAX_VARIANT_VALUE_LENGTH)
     if safe_text:
         return safe_text
     return "" if allow_empty else "Custom Option"
@@ -293,36 +339,12 @@ def has_moq_marker(value: str) -> bool:
 
 
 def get_title_optimizer_settings(*, user_id: str | None = None) -> TitleOptimizerSettings:
-    user_credential = get_enabled_user_api_credential(user_id)
-    has_user_credential = bool(user_credential and user_credential.get("apiKey"))
-    admin_credential = None if has_user_credential else get_enabled_admin_api_channel_credential()
-    has_admin_credential = bool(admin_credential and admin_credential.get("apiKey"))
-    common_api_key = (
-        str(user_credential.get("apiKey") or "").strip()
-        if has_user_credential
-        else str(admin_credential.get("apiKey") or "").strip()
-        if has_admin_credential
-        else get_runtime_setting("OPENAI_API_KEY", OPENAI_API_KEY).strip()
-    )
-    common_base_url = (
-        str(user_credential.get("baseUrl") or "").strip().rstrip("/")
-        if has_user_credential
-        else str(admin_credential.get("baseUrl") or "").strip().rstrip("/")
-        if has_admin_credential
-        else get_runtime_setting("OPENAI_BASE_URL", OPENAI_BASE_URL).strip().rstrip("/")
-    )
-    common_text_model = get_runtime_setting("OPENAI_TEXT_MODEL", OPENAI_TEXT_MODEL).strip() or "gpt-5.5"
+    settings = get_ai_stage_settings("title", user_id=user_id)
     return TitleOptimizerSettings(
-        api_key=common_api_key if has_user_credential or has_admin_credential else get_runtime_setting("OPENAI_TITLE_API_KEY", "").strip() or common_api_key,
-        base_url=common_base_url if has_user_credential or has_admin_credential else get_runtime_setting("OPENAI_TITLE_BASE_URL", "").strip().rstrip("/") or common_base_url,
-        text_model=get_runtime_setting("OPENAI_TITLE_MODEL", "").strip() or common_text_model,
-        channel_id=(
-            str(user_credential.get("channelId") or "")
-            if has_user_credential
-            else str(admin_credential.get("channelId") or "")
-            if has_admin_credential
-            else ""
-        ),
+        api_key=clean_text(settings.get("api_key")),
+        base_url=clean_text(settings.get("base_url")).rstrip("/"),
+        text_model=clean_text(settings.get("model")) or "gpt-5.5",
+        channel_id=clean_text(settings.get("channel_id")),
     )
 
 
@@ -345,68 +367,47 @@ def record_title_optimizer_usage(
         error_message=error_message,
     )
 
-
-def get_runtime_setting(key: str, default: str = "") -> str:
-    saved_value = get_app_setting_value(key, "")
-    if saved_value != "":
-        return saved_value
-    return os.getenv(key, default).strip()
-
-
 def generate_titles_with_ai(
     record: dict[str, Any],
     fallback: dict[str, str],
     settings: TitleOptimizerSettings,
 ) -> dict[str, Any]:
-    from openai import OpenAI
-
-    kwargs: dict[str, str] = {"api_key": settings.api_key}
-    if settings.base_url:
-        kwargs["base_url"] = settings.base_url
-    client = OpenAI(**kwargs)
-
-    response = client.responses.create(
+    return request_text_json(
+        api_url=build_api_url(settings.base_url, "/chat/completions"),
+        api_key=settings.api_key,
         model=settings.text_model,
-        input=[
+        instruction=json.dumps(
             {
-                "role": "system",
-                "content": (
+                "role": (
                     "You are a Temu marketplace listing title optimizer. "
                     "Follow the user's listing optimization rules. Return strict JSON only. "
                     "Do not include markdown. Do not invent brands, platform names, certification claims, "
                     "medical claims, absolute guarantees, price or discount words."
                 ),
-            },
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "listing_optimization_rules": load_listing_prompt(),
-                        "task": (
-                            "Generate one optimized Chinese product title and one optimized English product title "
-                            "for a Dianxiaomi TEMU semi-managed import template."
-                        ),
-                        "requirements": [
-                            "title_cn must be Chinese.",
-                            "title_en must be English and contain no Chinese characters.",
-                            "Keep quantity or pack count when the source title clearly includes it.",
-                            "Remove exact size specs when they are not core SKU identity.",
-                            "Use differentiated SEO wording so repeated products do not share identical titles.",
-                            "Keep the meaning faithful to the source product and SKU/bundle structure.",
-                            "Avoid sensitive words, brand names, platform names, exaggerated claims, and medical claims.",
-                        ],
-                        "source": build_title_source_payload(record, fallback),
-                        "required_json": {
-                            "title_cn": "optimized Chinese title",
-                            "title_en": "optimized English title, 50-200 characters preferred",
-                        },
-                    },
-                    ensure_ascii=False,
+                "listing_optimization_rules": load_listing_prompt(),
+                "task": (
+                    "Generate one optimized Chinese product title and one optimized English product title "
+                    "for a Dianxiaomi TEMU semi-managed import template."
                 ),
+                "requirements": [
+                    "title_cn must be Chinese.",
+                    "title_en must be English and contain no Chinese characters.",
+                    "Keep quantity or pack count when the source title clearly includes it.",
+                    "Remove exact size specs when they are not core SKU identity.",
+                    "Use differentiated SEO wording so repeated products do not share identical titles.",
+                    "Keep the meaning faithful to the source product and SKU/bundle structure.",
+                    "Avoid sensitive words, brand names, platform names, exaggerated claims, and medical claims.",
+                ],
+                "source": build_title_source_payload(record, fallback),
+                "required_json": {
+                    "title_cn": "optimized Chinese title",
+                    "title_en": "optimized English title, 50-200 characters preferred",
+                },
             },
-        ],
+            ensure_ascii=False,
+        ),
+        temperature=0.1,
     )
-    return json.loads(response.output_text)
 
 
 def build_title_source_payload(record: dict[str, Any], fallback: dict[str, str]) -> dict[str, Any]:
@@ -475,20 +476,6 @@ def normalize_generated_titles(raw: dict[str, Any], fallback: dict[str, str]) ->
         "title_en": title_en,
         "source": "ai",
     }
-
-
-def build_title_cache_key(record: dict[str, Any], fallback: dict[str, str]) -> str:
-    payload = {
-        "schema": TITLE_CACHE_SCHEMA,
-        "product_id": record.get("productId") or record.get("id"),
-        "title_cn": fallback["title_cn"],
-        "title_en": fallback["title_en"],
-        "sku_names": [sku.get("name") for sku in record.get("skuEntries") or [] if isinstance(sku, dict)],
-        "source_titles": [
-            source.get("title") for source in record.get("sourceLinks") or [] if isinstance(source, dict)
-        ],
-    }
-    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def load_listing_prompt() -> str:

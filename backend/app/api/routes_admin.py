@@ -22,6 +22,7 @@ from app.core.database import (
     upsert_user_api_credential,
     upsert_app_setting,
 )
+from app.modules.admin_prompt_configs import list_admin_prompt_configs
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -59,8 +60,8 @@ class ApiRouteStageDefinition:
 
 
 SETTING_DEFINITIONS: tuple[SettingDefinition, ...] = (
-    SettingDefinition("OPENAI_API_KEY", "ai", "OpenAI API Key", "FluAPI / OpenAI 兼容 API 密钥", is_secret=True),
-    SettingDefinition("OPENAI_BASE_URL", "ai", "OpenAI Base URL", "FluAPI 地址，例如 https://svip.fluapi.com/v1"),
+    SettingDefinition("OPENAI_API_KEY", "ai", "OpenAI API Key", "初凡AI / OpenAI 兼容 API 密钥", is_secret=True),
+    SettingDefinition("OPENAI_BASE_URL", "ai", "OpenAI Base URL", "初凡AI 地址，例如 https://api.aicoming.top/v1"),
     SettingDefinition("OPENAI_TEXT_MODEL", "ai", "文本模型", "用于标题、关键词、提示词分析", "gpt-5.5"),
     SettingDefinition("OPENAI_TITLE_API_KEY", "ai", "Title API Key", "标题生成专用 API Key，留空继承通用 OPENAI_API_KEY", is_secret=True),
     SettingDefinition("OPENAI_TITLE_BASE_URL", "ai", "Title Base URL", "标题生成专用接口地址，留空继承通用 OPENAI_BASE_URL"),
@@ -82,12 +83,13 @@ SETTING_DEFINITIONS: tuple[SettingDefinition, ...] = (
     SettingDefinition("OPENAI_VISUAL_PROMPT_MODEL", "ai", "提示词规划模型", "把分析结果转成九宫格或四宫格母图提示词", "gpt-5.5"),
     SettingDefinition("OPENAI_IMAGE_API_KEY", "ai", "Image API Key", "图片生成专用 API Key，留空继承通用 OPENAI_API_KEY", is_secret=True),
     SettingDefinition("OPENAI_IMAGE_BASE_URL", "ai", "Image Base URL", "图片生成专用接口地址，留空继承通用 OPENAI_BASE_URL"),
-    SettingDefinition("OPENAI_IMAGE_MODEL", "ai", "生图模型", "用于 API 生图备选方案", "gpt-image-2"),
+    SettingDefinition("OPENAI_IMAGE_MODEL", "ai", "生图模型", "用于 API 生图备选方案", "gpt-image-2-1k"),
     SettingDefinition("OPENAI_IMAGE_QUALITY", "ai", "生图质量", "low / medium / high", "medium"),
     SettingDefinition("VISUAL_DEFAULT_MODE", "visual", "默认生图模式", "main-gallery / sku-gallery / single-refine", "main-gallery"),
     SettingDefinition("VISUAL_DEFAULT_LAYOUT", "visual", "默认母图布局", "1x1 / 2x2 / 3x3，对应单图、四宫格、九宫格", "3x3"),
     SettingDefinition("VISUAL_DEFAULT_REQUESTED_COUNT", "visual", "默认模块数量", "创建任务时默认需要生成的图片数量，1-9", "9"),
     SettingDefinition("VISUAL_IMAGE_SIZE", "visual", "母图生成尺寸", "传给生图模型的尺寸，例如 1024x1024", "1024x1024"),
+    SettingDefinition("VISUAL_IMAGE_REQUEST_TIMEOUT_SECONDS", "visual", "生图请求超时秒数", "等待第三方生图接口返回的最长秒数，建议 900", "900"),
     SettingDefinition("VISUAL_ALLOW_SHORT_LABELS", "visual", "允许短文案", "1 表示允许图片里出现安全短英文功能词，0 表示不放文字", "1"),
     SettingDefinition("VISUAL_USE_REFERENCE_IMAGE", "visual", "启用图生图参考", "1 表示使用商品原图作为生图参考，0 表示只用文本提示词", "1"),
     SettingDefinition("VISUAL_UPLOAD_TO_OSS_DEFAULT", "visual", "默认上传 OSS", "1 表示切图后默认上传到 OSS，0 表示只保存本地", "0"),
@@ -106,8 +108,8 @@ SETTING_DEFINITIONS: tuple[SettingDefinition, ...] = (
     SettingDefinition("VISUAL_QUEUE_DEAD_NAME", "visual", "Visual Dead Queue Name", "Redis list key for failed visual jobs after retries", "visual:tasks:dead"),
     SettingDefinition("VISUAL_QUEUE_MAX_RETRIES", "visual", "Visual Queue Max Retries", "Max retry attempts for one visual job", "2"),
     SettingDefinition("VISUAL_QUEUE_RETRY_DELAY_SECONDS", "visual", "Visual Queue Retry Delay", "Seconds to wait before retrying failed visual job", "30"),
-    SettingDefinition("VISUAL_USER_CONCURRENCY_LIMIT", "visual", "成员并发生图限制", "单个成员同时处于 queued/running 的视觉任务数量；0 表示不限制", "1"),
-    SettingDefinition("VISUAL_TEAM_CONCURRENCY_LIMIT", "visual", "团队并发生图限制", "同一管理员团队同时处于 queued/running 的视觉任务数量；0 表示不限制", "3"),
+    SettingDefinition("VISUAL_USER_CONCURRENCY_LIMIT", "visual", "成员任务并发限制", "单个成员同时运行的生图任务数量，也控制清单导出时商品链接并行处理数；超过后生图进入等待队列；0 表示不限制", "5"),
+    SettingDefinition("VISUAL_TEAM_CONCURRENCY_LIMIT", "visual", "团队并发生图限制", "同一管理员团队同时运行的视觉任务数量；超过后新任务进入等待队列；0 表示不限制", "5"),
     SettingDefinition("TMAPI_API_TOKEN", "1688", "1688 搜图 API Token", "TMAPI 或同类 1688 搜图服务 Token", is_secret=True),
     SettingDefinition("TMAPI_BASE_URL", "1688", "1688 API Base URL", "默认 http://api.tmapi.top", "http://api.tmapi.top"),
     SettingDefinition("ALIYUN_OSS_ENABLED", "oss", "启用 OSS", "1 表示启用，0 表示关闭", "0"),
@@ -122,16 +124,10 @@ SETTING_DEFINITIONS: tuple[SettingDefinition, ...] = (
 
 API_CHANNEL_DEFINITIONS: tuple[ApiChannelDefinition, ...] = (
     ApiChannelDefinition(
-        "fluapi",
-        "FluAPI",
-        "当前常用的 OpenAI 兼容代理渠道",
-        "https://svip.fluapi.com/v1",
-    ),
-    ApiChannelDefinition(
         "chufan_ai",
         "初凡AI",
         "OpenAI / Claude / Gemini 兼容聚合渠道",
-        "https://station-88.aicoming.top/v1",
+        "https://api.aicoming.top/v1",
         "gpt-5.5",
         "gpt-image-2-1k",
     ),
@@ -402,6 +398,11 @@ def admin_api_channels(_admin: dict[str, Any] = Depends(require_admin_user)):
     return serialize_api_channel_bundle()
 
 
+@router.get("/prompt-configs")
+def admin_prompt_configs(_admin: dict[str, Any] = Depends(require_admin_user)):
+    return {"items": list_admin_prompt_configs()}
+
+
 @router.put("/api-channels")
 def admin_update_api_channels(
     payload: AdminApiChannelsUpdateRequest,
@@ -547,26 +548,41 @@ def serialize_api_channel(definition: ApiChannelDefinition, saved_settings: dict
 
 def serialize_user_api_credentials(user_id: str) -> list[dict[str, Any]]:
     saved_credentials = get_user_api_credentials_map(user_id)
+    saved_settings = get_app_settings_map()
     items: list[dict[str, Any]] = []
     for definition in API_CHANNEL_DEFINITIONS:
+        channel_values = api_channel_runtime_values(definition, saved_settings)
         saved = saved_credentials.get(definition.id) or {}
         api_key = str(saved.get("apiKey") or "")
+        use_saved_runtime_values = bool(api_key)
         text_model = normalize_channel_text_model(
             definition,
-            str(saved.get("textModel") or definition.default_text_model),
+            str(
+                saved.get("textModel")
+                if use_saved_runtime_values and saved.get("textModel")
+                else channel_values["textModel"]
+            ),
         )
         image_model = normalize_channel_image_model(
             definition,
-            str(saved.get("imageModel") or definition.default_image_model),
+            str(
+                saved.get("imageModel")
+                if use_saved_runtime_values and saved.get("imageModel")
+                else channel_values["imageModel"]
+            ),
         )
         items.append(
             {
                 "userId": user_id,
                 "channelId": definition.id,
-                "name": definition.name,
+                "name": channel_values["name"],
                 "description": definition.description,
-                "enabled": bool(saved.get("enabled")),
-                "baseUrl": str(saved.get("baseUrl") or definition.default_base_url).rstrip("/"),
+                "enabled": bool(saved.get("enabled")) and bool(api_key),
+                "baseUrl": str(
+                    saved.get("baseUrl")
+                    if use_saved_runtime_values and saved.get("baseUrl")
+                    else channel_values["baseUrl"]
+                ).rstrip("/"),
                 "textModel": text_model,
                 "imageModel": image_model,
                 "apiKeyConfigured": bool(api_key),
@@ -583,10 +599,25 @@ def serialize_api_route(stage: ApiRouteStageDefinition, saved_settings: dict[str
     specific_base_url = setting_runtime_value(saved_settings, stage.base_url_key, "")
     specific_model = setting_runtime_value(saved_settings, stage.model_key, "")
     fallback_model = common_channel["imageModel"] if stage.model_type == "image" else common_channel["textModel"]
-    effective_api_key = specific_api_key or common_channel["apiKey"]
-    effective_base_url = specific_base_url or common_channel["baseUrl"]
     effective_model = specific_model or fallback_model
     is_inherited = not (specific_api_key or specific_base_url or specific_model)
+    active_channel_definition, active_channel_values = active_admin_api_channel_values(saved_settings)
+    if active_channel_definition and active_channel_values:
+        return {
+            "stage": stage.id,
+            "title": stage.title,
+            "description": stage.description,
+            "modelType": stage.model_type,
+            "channelId": active_channel_definition.id,
+            "channelName": active_channel_values["name"],
+            "model": effective_model,
+            "baseUrl": active_channel_values["baseUrl"],
+            "apiKeyConfigured": bool(active_channel_values["apiKey"]),
+            "isInherited": is_inherited,
+        }
+
+    effective_api_key = specific_api_key or common_channel["apiKey"]
+    effective_base_url = specific_base_url or common_channel["baseUrl"]
     channel_id = "inherited" if is_inherited else "manual"
     channel_name = "继承运行配置" if is_inherited else "手动配置"
 
@@ -612,6 +643,18 @@ def serialize_api_route(stage: ApiRouteStageDefinition, saved_settings: dict[str
         "apiKeyConfigured": bool(effective_api_key),
         "isInherited": is_inherited,
     }
+
+
+def active_admin_api_channel_values(
+    saved_settings: dict[str, dict[str, Any]],
+) -> tuple[ApiChannelDefinition | None, dict[str, Any] | None]:
+    for definition in API_CHANNEL_DEFINITIONS:
+        if definition.is_common:
+            continue
+        values = api_channel_runtime_values(definition, saved_settings)
+        if values["enabled"] and values["apiKey"] and values["baseUrl"]:
+            return definition, values
+    return None, None
 
 
 def common_api_runtime_values(saved_settings: dict[str, dict[str, Any]]) -> dict[str, Any]:

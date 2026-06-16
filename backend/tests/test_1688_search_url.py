@@ -1,4 +1,5 @@
 import unittest
+from urllib.parse import unquote_to_bytes
 
 from app.modules.sourcing_1688.search_url import build_1688_search_url, encode_1688_keyword
 
@@ -11,6 +12,14 @@ class Search1688UrlTest(unittest.TestCase):
         url = build_1688_search_url("龙虾扣 Y2K")
 
         self.assertEqual(url, "https://s.1688.com/selloffer/offer_search.htm?keywords=%C1%FA%CF%BA%BF%DB%20Y2K")
+
+    def test_chinese_keyword_round_trips_as_gbk_not_utf8(self):
+        keyword = "\u7eb8\u98de\u673a\u73a9\u5177"
+        url = build_1688_search_url(keyword)
+        encoded_keyword = url.split("keywords=", 1)[1]
+
+        self.assertEqual(unquote_to_bytes(encoded_keyword).decode("gbk"), keyword)
+        self.assertNotIn("%E7%BA%B8", encoded_keyword)
 
     def test_rejects_blank_keyword(self):
         with self.assertRaises(ValueError):

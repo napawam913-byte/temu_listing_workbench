@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -14,12 +15,12 @@ class AdminApiUsageTest(unittest.TestCase):
             normalize_image_model_for_channel,
         )
 
-        chufan_settings = {"channel_id": "chufan_ai", "base_url": "https://station-88.aicoming.top/v1"}
-        fluapi_settings = {"channel_id": "fluapi", "base_url": "https://svip.fluapi.com/v1"}
+        chufan_settings = {"channel_id": "chufan_ai", "base_url": "https://api.aicoming.top/v1"}
+        external_settings = {"channel_id": "external", "base_url": "https://external.example.com/v1"}
 
         self.assertEqual(normalize_image_model_for_channel(chufan_settings, "gpt-image-2"), "gpt-image-2-1k")
         self.assertTrue(is_chufan_ai_image_target(chufan_settings, "gpt-image-2-1k"))
-        self.assertFalse(is_chufan_ai_image_target(fluapi_settings, "gpt-image-2"))
+        self.assertFalse(is_chufan_ai_image_target(external_settings, "gpt-image-2"))
 
     def test_admin_api_usage_summary_requires_admin_and_aggregates_models(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -87,9 +88,9 @@ class AdminApiUsageTest(unittest.TestCase):
                 self.assertTrue(response.json()["channels"])
                 self.assertTrue(response.json()["routes"])
                 channels_by_id = {item["id"]: item for item in response.json()["channels"]}
-                self.assertEqual(set(channels_by_id), {"fluapi", "chufan_ai"})
+                self.assertEqual(set(channels_by_id), {"chufan_ai"})
                 self.assertEqual(channels_by_id["chufan_ai"]["name"], "初凡AI")
-                self.assertEqual(channels_by_id["chufan_ai"]["baseUrl"], "https://station-88.aicoming.top/v1")
+                self.assertEqual(channels_by_id["chufan_ai"]["baseUrl"], "https://api.aicoming.top/v1")
                 self.assertEqual(channels_by_id["chufan_ai"]["textModel"], "gpt-5.5")
                 self.assertEqual(channels_by_id["chufan_ai"]["imageModel"], "gpt-image-2-1k")
 
@@ -137,6 +138,52 @@ class AdminApiUsageTest(unittest.TestCase):
                 self.assertEqual(database.get_app_setting_value("OPENAI_RECOMMENDATION_MODEL"), "")
                 self.assertEqual(database.get_app_setting_value("OPENAI_IMAGE_MODEL"), "")
                 self.assertEqual(database.get_app_setting_value("OPENAI_IMAGE_BASE_URL"), "https://backup.example.com/v1")
+            finally:
+                database.DATABASE_PATH = original_path
+
+    def test_admin_prompt_configs_are_admin_only(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_path = database.DATABASE_PATH
+            database.DATABASE_PATH = Path(tmpdir) / "app.db"
+            try:
+                database.init_db()
+                database.create_user("prompt-member", "secret123")
+
+                from app.main import create_app
+
+                anonymous_client = TestClient(create_app())
+                self.assertEqual(anonymous_client.get("/api/admin/prompt-configs").status_code, 401)
+
+                member_client = TestClient(create_app())
+                member_login = member_client.post(
+                    "/api/auth/login",
+                    json={"username": "prompt-member", "password": "secret123"},
+                )
+                self.assertEqual(member_login.status_code, 200)
+                self.assertEqual(member_client.get("/api/admin/prompt-configs").status_code, 403)
+
+                admin_client = TestClient(create_app())
+                admin_login = admin_client.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
+                self.assertEqual(admin_login.status_code, 200)
+                response = admin_client.get("/api/admin/prompt-configs")
+                self.assertEqual(response.status_code, 200)
+                items = response.json()["items"]
+                ids = {item["id"] for item in items}
+                self.assertEqual(
+                    ids,
+                    {
+                        "title",
+                        "title_split",
+                        "recommendation",
+                        "product_attribute",
+                        "visual_analysis",
+                        "visual_prompt",
+                        "visual_image",
+                    },
+                )
+                visual_prompt = next(item for item in items if item["id"] == "visual_prompt")
+                self.assertEqual(visual_prompt["modelKey"], "OPENAI_VISUAL_PROMPT_MODEL")
+                self.assertIn("Return JSON only", visual_prompt["content"])
             finally:
                 database.DATABASE_PATH = original_path
 
@@ -223,7 +270,7 @@ class AdminApiUsageTest(unittest.TestCase):
                 initial_response = admin_client.get(f"/api/admin/users/{member['id']}/api-credentials")
                 self.assertEqual(initial_response.status_code, 200)
                 initial_items = {item["channelId"]: item for item in initial_response.json()["items"]}
-                self.assertEqual(set(initial_items), {"fluapi", "chufan_ai"})
+                self.assertEqual(set(initial_items), {"chufan_ai"})
                 self.assertFalse(initial_items["chufan_ai"]["apiKeyConfigured"])
 
                 update_response = admin_client.put(
@@ -234,7 +281,7 @@ class AdminApiUsageTest(unittest.TestCase):
                                 "channelId": "chufan_ai",
                                 "enabled": True,
                                 "apiKey": "sk-member-chufan",
-                                "baseUrl": "https://station-88.aicoming.top/v1",
+                                "baseUrl": "https://api.aicoming.top/v1",
                                 "textModel": "gpt-5.5",
                                 "imageModel": "gpt-image-2-1k",
                             }
@@ -245,13 +292,12 @@ class AdminApiUsageTest(unittest.TestCase):
                 updated_items = {item["channelId"]: item for item in update_response.json()["items"]}
                 self.assertTrue(updated_items["chufan_ai"]["enabled"])
                 self.assertTrue(updated_items["chufan_ai"]["apiKeyConfigured"])
-                self.assertFalse(updated_items["fluapi"]["enabled"])
 
                 runtime_credential = database.get_enabled_user_api_credential(member["id"])
                 self.assertIsNotNone(runtime_credential)
                 self.assertEqual(runtime_credential["channelId"], "chufan_ai")
                 self.assertEqual(runtime_credential["apiKey"], "sk-member-chufan")
-                self.assertEqual(runtime_credential["baseUrl"], "https://station-88.aicoming.top/v1")
+                self.assertEqual(runtime_credential["baseUrl"], "https://api.aicoming.top/v1")
                 self.assertEqual(runtime_credential["textModel"], "gpt-5.5")
 
                 with database.get_connection() as conn:
@@ -265,6 +311,54 @@ class AdminApiUsageTest(unittest.TestCase):
                     ).fetchone()
                 self.assertIsNotNone(row)
                 self.assertEqual(row["api_key"], "sk-member-chufan")
+            finally:
+                database.DATABASE_PATH = original_path
+
+    def test_member_channel_without_key_is_not_displayed_as_runtime_enabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_path = database.DATABASE_PATH
+            database.DATABASE_PATH = Path(tmpdir) / "app.db"
+            try:
+                database.init_db()
+                member = database.create_user("member-no-key", "secret123")
+                database.upsert_app_setting(key="AI_CHANNEL_CHUFAN_AI_ENABLED", value="1", category="ai_channel")
+                database.upsert_app_setting(key="AI_CHANNEL_CHUFAN_AI_API_KEY", value="sk-admin-chufan", category="ai_channel")
+                database.upsert_app_setting(
+                    key="AI_CHANNEL_CHUFAN_AI_BASE_URL",
+                    value="https://api.aicoming.top/v1",
+                    category="ai_channel",
+                )
+                database.upsert_app_setting(key="OPENAI_IMAGE_API_KEY", value="sk-old-stage", category="ai")
+                database.upsert_app_setting(
+                    key="OPENAI_IMAGE_BASE_URL",
+                    value="https://legacy-stage.example.com/v1",
+                    category="ai",
+                )
+                database.upsert_user_api_credential(
+                    user_id=member["id"],
+                    channel_id="chufan_ai",
+                    enabled=True,
+                    base_url="https://station-88.aicoming.top/v1",
+                    text_model="deepseek-v4-pro",
+                    image_model="gpt-image-2",
+                )
+
+                self.assertIsNone(database.get_enabled_user_api_credential(member["id"]))
+
+                from app.api.routes_admin import serialize_user_api_credentials
+
+                items = {item["channelId"]: item for item in serialize_user_api_credentials(member["id"])}
+                self.assertFalse(items["chufan_ai"]["enabled"])
+                self.assertFalse(items["chufan_ai"]["apiKeyConfigured"])
+                self.assertEqual(items["chufan_ai"]["baseUrl"], "https://api.aicoming.top/v1")
+                self.assertEqual(items["chufan_ai"]["textModel"], "gpt-5.5")
+                self.assertEqual(items["chufan_ai"]["imageModel"], "gpt-image-2-1k")
+
+                from app.api.routes_admin import serialize_api_channel_bundle
+
+                routes = {item["stage"]: item for item in serialize_api_channel_bundle()["routes"]}
+                self.assertEqual(routes["image"]["channelId"], "chufan_ai")
+                self.assertEqual(routes["image"]["baseUrl"], "https://api.aicoming.top/v1")
             finally:
                 database.DATABASE_PATH = original_path
 
@@ -290,12 +384,12 @@ class AdminApiUsageTest(unittest.TestCase):
                     json={
                         "items": [
                             {
-                                "channelId": "fluapi",
+                                "channelId": "chufan_ai",
                                 "enabled": True,
-                                "apiKey": "sk-self-fluapi",
-                                "baseUrl": "https://svip.fluapi.com/v1",
+                                "apiKey": "sk-self-chufan",
+                                "baseUrl": "https://api.aicoming.top/v1",
                                 "textModel": "gpt-5.5",
-                                "imageModel": "gpt-image-2",
+                                "imageModel": "gpt-image-2-1k",
                             }
                         ]
                     },
@@ -345,7 +439,7 @@ class AdminApiUsageTest(unittest.TestCase):
                     stage="image",
                     model="gpt-image-2",
                     user_id=lead["id"],
-                    channel_id="fluapi",
+                    channel_id="legacy_channel",
                     status="failed",
                     call_count=1,
                 )
@@ -385,7 +479,7 @@ class AdminApiUsageTest(unittest.TestCase):
 
                 channel_rows = {item["channelId"]: item for item in body["byChannel"]}
                 self.assertEqual(channel_rows["chufan_ai"]["callCount"], 2)
-                self.assertEqual(channel_rows["fluapi"]["failedCount"], 1)
+                self.assertEqual(channel_rows["legacy_channel"]["failedCount"], 1)
             finally:
                 database.DATABASE_PATH = original_path
 
@@ -410,10 +504,12 @@ class AdminApiUsageTest(unittest.TestCase):
 
                 from app.modules.visual_generation.service import (
                     TASK_STATUS_QUEUED,
+                    TASK_STATUS_RUNNING,
                     VisualTaskError,
                     assert_visual_concurrency_available,
                     create_visual_task,
                     ensure_visual_generation_schema,
+                    get_visual_task_status_summary,
                 )
 
                 task = create_visual_task(user_id=member_a["id"], record={"id": "record-a", "productTitle": "A"})
@@ -424,6 +520,18 @@ class AdminApiUsageTest(unittest.TestCase):
                         (TASK_STATUS_QUEUED, task["id"]),
                     )
 
+                assert_visual_concurrency_available(member_a["id"])
+                summary = get_visual_task_status_summary(user_id=member_a["id"])
+                self.assertEqual(summary["queuedCount"], 1)
+                self.assertEqual(summary["runningCount"], 0)
+
+                with database.get_connection() as conn:
+                    ensure_visual_generation_schema(conn)
+                    conn.execute(
+                        "UPDATE visual_generation_tasks SET status = ? WHERE id = ?",
+                        (TASK_STATUS_RUNNING, task["id"]),
+                    )
+
                 with self.assertRaises(VisualTaskError):
                     assert_visual_concurrency_available(member_a["id"])
                 assert_visual_concurrency_available(member_a["id"], exclude_task_id=task["id"])
@@ -432,6 +540,64 @@ class AdminApiUsageTest(unittest.TestCase):
                 database.upsert_app_setting(key="VISUAL_TEAM_CONCURRENCY_LIMIT", value="1", category="visual")
                 with self.assertRaises(VisualTaskError):
                     assert_visual_concurrency_available(member_b["id"])
+            finally:
+                database.DATABASE_PATH = original_path
+
+    def test_visual_run_queues_when_member_concurrency_is_full(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_path = database.DATABASE_PATH
+            database.DATABASE_PATH = Path(tmpdir) / "app.db"
+            try:
+                database.init_db()
+                database.upsert_app_setting(key="VISUAL_USER_CONCURRENCY_LIMIT", value="1", category="visual")
+                database.upsert_app_setting(key="VISUAL_TEAM_CONCURRENCY_LIMIT", value="10", category="visual")
+
+                from app.main import create_app
+                from app.modules.visual_generation.service import (
+                    TASK_STATUS_RUNNING,
+                    create_visual_task,
+                    ensure_visual_generation_schema,
+                    get_visual_task,
+                )
+
+                client = TestClient(create_app())
+                login = client.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
+                self.assertEqual(login.status_code, 200)
+
+                running = create_visual_task(
+                    user_id=database.DEFAULT_USER_ID,
+                    record={"id": "running-record", "productTitle": "Running"},
+                    source_image_ref="https://example.test/running.png",
+                )
+                queued = create_visual_task(
+                    user_id=database.DEFAULT_USER_ID,
+                    record={"id": "queued-record", "productTitle": "Queued"},
+                    source_image_ref="https://example.test/queued.png",
+                )
+                with database.get_connection() as conn:
+                    ensure_visual_generation_schema(conn)
+                    conn.execute(
+                        "UPDATE visual_generation_tasks SET status = ? WHERE id = ?",
+                        (TASK_STATUS_RUNNING, running["id"]),
+                    )
+
+                with patch("app.api.routes_visual_generation.run_visual_job") as run_job:
+                    response = client.post(
+                        f"/api/visual/tasks/{queued['id']}/run",
+                        json={"sourceImageRef": "https://example.test/queued.png"},
+                    )
+
+                self.assertEqual(response.status_code, 200)
+                body = response.json()
+                self.assertTrue(body["queued"])
+                self.assertTrue(body["waitingForConcurrency"])
+                self.assertIn("等待队列", body["message"])
+                self.assertEqual(body["item"]["status"], "queued")
+                run_job.assert_called_once()
+                self.assertEqual(
+                    get_visual_task(task_id=queued["id"], user_id=database.DEFAULT_USER_ID)["status"],
+                    "queued",
+                )
             finally:
                 database.DATABASE_PATH = original_path
 

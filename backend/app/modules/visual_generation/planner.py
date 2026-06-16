@@ -50,19 +50,23 @@ Input context:
 
 Rules:
 1. Extract only visible or strongly supported product facts.
-2. Use productTitle and skuNames only as text hints for category, option names, and possible colors/specs.
+2. Use productTitle, skuNames, skuBindings, and skuCombinationBindings only as text hints for category, option names, source-product binding, and possible colors/specs.
 3. Do not invent accessories, SKU options, materials, functions, brand names, platform names, claims, price, stock, weight, MOQ, SKU ID, or source spec tables.
-4. Treat each attached reference image as a binding visual reference for the visible product subject.
-5. For each reference image, identify the exact visible subject: product category, shape, color, material, quantity, surface texture, edge/rim details, printed pattern, and component relationship.
-6. If uncertain, use "unknown" or an empty array.
-7. Mark only visual facts that future generation must preserve or must not change.
-8. Mark visible risks in the source image: logo, watermark, QR code, price, discount, rating, platform UI, or unsafe/unsupported claims.
+4. Treat all attached reference images as equal product reference images. Do not rank them as main image versus material image.
+5. For each reference image, use the image itself, its label/title, and skuBindings to identify the exact visible subject: product category, shape, color, material, quantity, surface texture, edge/rim details, printed pattern, and component relationship.
+6. If multiple products or SKU components are shown across the reference images, analyze each one separately and preserve the image-to-product binding.
+7. If SKU/component names are quantity-like or ambiguous, such as 1pc and 6pc, keep the sourceTitle and referenceImageIndex binding from skuBindings. Do not merge or swap components across source products.
+8. If uncertain, use "unknown" or an empty array.
+9. Mark only visual facts that future generation must preserve or must not change.
+10. Mark visible risks in the source image: logo, watermark, QR code, price, discount, rating, platform UI, or unsafe/unsupported claims.
 
 Return this JSON shape:
 {{
   "productUnderstanding": {{
     "productTitle": "",
     "skuNames": [],
+    "skuBindings": [],
+    "skuCombinationBindings": [],
     "overallCategory": "",
     "referenceAnalyses": [
       {{
@@ -148,6 +152,28 @@ def context_sku_names(context: dict[str, Any] | None, product_understanding: dic
     return result
 
 
+def context_sku_bindings(context: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(context, dict):
+        return []
+    bindings = context.get("skuBindings")
+    if not isinstance(bindings, list):
+        return []
+    return [item for item in bindings if isinstance(item, dict)]
+
+
+def context_sku_combination_bindings(context: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(context, dict):
+        return []
+    bindings = context.get("skuCombinationBindings")
+    if isinstance(bindings, list):
+        return [item for item in bindings if isinstance(item, dict)]
+    return [
+        item
+        for item in context_sku_bindings(context)
+        if item.get("skuKind") == "combo" or len(item.get("components") or []) > 1
+    ]
+
+
 def context_reference_images(context: dict[str, Any] | None) -> list[dict[str, Any]]:
     if not isinstance(context, dict):
         return []
@@ -172,6 +198,8 @@ def build_prompt_plan_instruction(
     modules = candidate_modules or default_slot_blueprints(layout)
     product_json = json.dumps(product_analysis, ensure_ascii=False, indent=2)
     sku_json = json.dumps(context_sku_names(context, product_analysis), ensure_ascii=False, indent=2)
+    sku_binding_json = json.dumps(context_sku_bindings(context), ensure_ascii=False, indent=2)
+    sku_combo_json = json.dumps(context_sku_combination_bindings(context), ensure_ascii=False, indent=2)
     module_json = json.dumps(modules, ensure_ascii=False, indent=2)
     return f"""
 You are an ecommerce listing image task planner.
@@ -186,24 +214,29 @@ Input:
   "requestedCount": {expected},
   "layout": "{key}",
   "skuNames": {sku_json},
+  "skuBindings": {sku_binding_json},
+  "skuCombinationBindings": {sku_combo_json},
   "candidateModules": {module_json}
 }}
 
 Rules:
 1. The requestedCount is fixed by the user/system. Return exactly {expected} modules.
 2. Do not decide a different image count.
-3. Choose, replace, and order modules from the candidateModules according to the product title, visible product facts, SKU names, and commercial listing needs.
+3. Choose, replace, and order modules from the candidateModules according to the product title, visible product facts, SKU bindings, and commercial listing needs.
 4. Do not invent SKU details, price, weight, stock, MOQ, SKU ID, source specification tables, brand names, certifications, platform names, or unsupported claims.
-5. Use SKU names only as option/category/color/spec text hints.
-6. If the product has multiple SKU names, plan whether the batch should show one selected SKU, multiple SKU color options, bundle/combination value, or SKU-specific detail images.
-7. Each module must preserve productUnderstanding.globalMustPreserve and avoid productUnderstanding.globalDoNotChange.
-8. Each module may plan whether on-image copy is useful.
-9. On-image copy intent can include feature introduction, benefit emphasis, usage scene, component explanation, comparison, bundle value, or SKU option clarification.
-10. Do not write the final full on-image copy here. Only define copyIntent and textPolicy.
-11. Text must be objective, safe, purchase-oriented, and supported by productTitle, skuNames, or visible product facts.
-12. Do not use medical claims, absolute promises, certification claims, platform names, brand names, price, discount, rating, stock, shipping time, or unverifiable claims.
-13. Keep the overall batch visually coherent: consistent product identity, lighting family, marketplace polish, and non-conflicting backgrounds.
-14. Text availability rule: {label_policy_text(allow_short_labels)}
+5. Use skuNames as option/category/color/spec text hints, but use skuBindings and reference image labels/titles as the authority for which SKU/component belongs to which source product and reference image.
+6. Treat all reference images as equal product references. Do not prioritize "main image" over "material image"; infer the product shown in each image from the image content and label/title.
+7. If the product has multiple SKU names or combo SKU components, plan whether the batch should show one selected SKU, multiple SKU color options, bundle/combination value, or SKU-specific detail images.
+8. If SKU/component names are quantity-like or ambiguous, such as 1pc and 6pc, never interpret them by name alone. Preserve each component's sourceTitle and referenceImageIndex binding.
+9. For combo SKUs, every component listed in skuCombinationBindings must be represented in combo/package/option panels unless the component is explicitly marked unsafe or visually unavailable.
+10. Each module must preserve productUnderstanding.globalMustPreserve and avoid productUnderstanding.globalDoNotChange.
+11. Each module may plan whether on-image copy is useful.
+12. On-image copy intent can include feature introduction, benefit emphasis, usage scene, component explanation, comparison, bundle value, or SKU option clarification.
+13. Do not write the final full on-image copy here. Only define copyIntent and textPolicy.
+14. Text must be objective, safe, purchase-oriented, and supported by productTitle, skuNames, skuBindings, reference image labels/titles, or visible product facts.
+15. Do not use medical claims, absolute promises, certification claims, platform names, brand names, price, discount, rating, stock, shipping time, or unverifiable claims.
+16. Keep the overall batch visually coherent: consistent product identity, lighting family, marketplace polish, and non-conflicting backgrounds.
+17. Text availability rule: {label_policy_text(allow_short_labels)}
 
 Return this JSON shape:
 {{
@@ -220,6 +253,7 @@ Return this JSON shape:
         "title": "",
         "purpose": "",
         "targetSkuName": "",
+        "targetSkuBinding": "",
         "referenceIndexes": [],
         "visualFocus": [],
         "compositionBrief": "",
@@ -250,6 +284,8 @@ def build_panel_prompt_instruction(
     product_json = json.dumps(product_understanding, ensure_ascii=False, indent=2)
     plan_json = json.dumps(visual_task_plan, ensure_ascii=False, indent=2)
     sku_json = json.dumps(context_sku_names(context, product_understanding), ensure_ascii=False, indent=2)
+    sku_binding_json = json.dumps(context_sku_bindings(context), ensure_ascii=False, indent=2)
+    sku_combo_json = json.dumps(context_sku_combination_bindings(context), ensure_ascii=False, indent=2)
     reference_json = json.dumps(context_reference_images(context), ensure_ascii=False, indent=2)
     rows, cols = parse_layout(layout)
     key = layout_key(rows, cols)
@@ -266,6 +302,8 @@ Input:
   "visualTaskPlan": {plan_json},
   "layout": "{key}",
   "skuNames": {sku_json},
+  "skuBindings": {sku_binding_json},
+  "skuCombinationBindings": {sku_combo_json},
   "referenceImages": {reference_json}
 }}
 
@@ -273,18 +311,20 @@ Rules:
 1. Create one panel prompt for each module in visualTaskPlan.modules.
 2. Each panel prompt must be written in English and ready for an image generation model.
 3. Preserve the exact product facts from productUnderstanding: product category, shape, color, material, quantity, texture, rim/edge details, printed pattern, visible components, and component relationship.
-4. Treat reference images as binding visual references, not loose inspiration.
+4. Treat reference images as equal binding product references, not loose inspiration. Do not rank them as main image versus material image.
 5. Do not replace the selected SKU/product with a generic category item.
-6. Use targetSkuName and skuNames only as option/category/color/spec hints. Do not add hidden SKU data.
-7. Add composition, camera angle, lighting, background, scene, props, text placement, and ecommerce style only when they support the module purpose.
-8. On-image copy is allowed when useful for purchase motivation, feature introduction, usage explanation, component explanation, comparison, bundle value, or SKU clarification.
-9. On-image copy does not have to be extremely short. It may be a concise phrase or a short sentence when the module needs clearer selling-point explanation.
-10. On-image copy must be objective, safe, and supported by productTitle, skuNames, or visible product facts.
-11. Do not include medical claims, absolute promises, certification claims, brand names, platform names, price, discount, rating, stock, shipping time, QR code, watermark, or platform UI.
-12. Text must not cover the product subject, must not dominate the product, and must stay inside the panel.
-13. Keep all panels visually coherent as one listing batch: consistent product identity, lighting family, color temperature, marketplace polish, and compatible background language.
-14. Make every prompt self-contained enough for the image generation model to produce the intended panel.
-15. Text availability rule: {label_policy_text(allow_short_labels)}
+6. Use targetSkuName and skuNames as option/category/color/spec hints, but use skuBindings plus reference image labels/titles as the authority for component-to-source-product and reference-image binding. Do not add hidden SKU data.
+7. If SKU/component names are quantity-like or ambiguous, such as 1pc and 6pc, write the prompt so each component remains tied to its sourceTitle and referenceImageIndex. Do not swap, merge, or treat them as generic quantities.
+8. For combo/package/option panels, include every component listed in the target SKU binding. If the user supplied images and titles for multiple components, the prompt must ask for all those components in the same panel when the SKU represents a combo.
+9. Add composition, camera angle, lighting, background, scene, props, text placement, and ecommerce style only when they support the module purpose.
+10. On-image copy is allowed when useful for purchase motivation, feature introduction, usage explanation, component explanation, comparison, bundle value, or SKU clarification.
+11. On-image copy does not have to be extremely short. It may be a concise phrase or a short sentence when the module needs clearer selling-point explanation.
+12. On-image copy must be objective, safe, and supported by productTitle, skuNames, skuBindings, reference image labels/titles, or visible product facts.
+13. Do not include medical claims, absolute promises, certification claims, brand names, platform names, price, discount, rating, stock, shipping time, QR code, watermark, or platform UI.
+14. Text must not cover the product subject, must not dominate the product, and must stay inside the panel.
+15. Keep all panels visually coherent as one listing batch: consistent product identity, lighting family, color temperature, marketplace polish, and compatible background language.
+16. Make every prompt self-contained enough for the image generation model to produce the intended panel.
+17. Text availability rule: {label_policy_text(allow_short_labels)}
 
 Return this JSON shape:
 {{
@@ -295,6 +335,7 @@ Return this JSON shape:
         "position": 1,
         "slotType": "",
         "targetSkuName": "",
+        "targetSkuBinding": "",
         "onImageCopy": [],
         "panelPrompt": "",
         "negativePrompt": "",
@@ -329,6 +370,7 @@ def normalized_visual_task_plan(
                 "title": str(raw.get("title") or blueprint.get("title") or f"Panel {index + 1}"),
                 "purpose": str(raw.get("purpose") or blueprint.get("purpose") or "clear ecommerce product image"),
                 "targetSkuName": str(raw.get("targetSkuName") or ""),
+                "targetSkuBinding": str(raw.get("targetSkuBinding") or ""),
                 "referenceIndexes": raw.get("referenceIndexes") if isinstance(raw.get("referenceIndexes"), list) else [],
                 "visualFocus": raw.get("visualFocus") if isinstance(raw.get("visualFocus"), list) else [],
                 "compositionBrief": str(raw.get("compositionBrief") or ""),
@@ -362,6 +404,8 @@ def _panel_prompt_fallback(
     product_hint = json.dumps(compact_json_value(product_understanding, max_items=5, max_chars=120), ensure_ascii=False)
     target_sku = str(module.get("targetSkuName") or "").strip()
     sku_line = f" Target SKU option: {target_sku}." if target_sku else ""
+    target_binding = str(module.get("targetSkuBinding") or "").strip()
+    binding_line = f" SKU/component binding: {target_binding}." if target_binding else ""
     copy_line = (
         f" On-image copy intent: {module.get('copyIntent')}. Text policy: {module.get('textPolicy')}. "
         if module.get("copyRequired")
@@ -369,7 +413,7 @@ def _panel_prompt_fallback(
     )
     return ensure_reference_fidelity_text(
         "Create a square 1:1 ecommerce product image. "
-        f"Module: {module.get('title')}. Purpose: {module.get('purpose')}.{sku_line} "
+        f"Module: {module.get('title')}. Purpose: {module.get('purpose')}.{sku_line}{binding_line} "
         f"Product facts to preserve: {product_hint}. "
         f"Composition: {module.get('compositionBrief')}. Scene: {module.get('sceneBrief')}. "
         f"{copy_line}{label_policy_text(allow_short_labels)} "
@@ -409,6 +453,7 @@ def normalized_panel_prompt_plan(
                 "position": index + 1,
                 "slotType": str(raw.get("slotType") or module.get("slotType") or ""),
                 "targetSkuName": str(raw.get("targetSkuName") or module.get("targetSkuName") or ""),
+                "targetSkuBinding": str(raw.get("targetSkuBinding") or module.get("targetSkuBinding") or ""),
                 "onImageCopy": on_image_copy,
                 "panelPrompt": panel_prompt,
                 "negativePrompt": str(raw.get("negativePrompt") or ""),
@@ -448,6 +493,7 @@ def normalized_panel_tasks(plan: dict[str, Any], layout: str, allow_short_labels
                     "title": module.get("title"),
                     "purpose": module.get("purpose"),
                     "targetSkuName": panel.get("targetSkuName") or module.get("targetSkuName"),
+                    "targetSkuBinding": panel.get("targetSkuBinding") or module.get("targetSkuBinding"),
                     "safeLabels": on_image_copy,
                     "riskControl": "; ".join(str(note) for note in safety_notes),
                     "panelPrompt": panel.get("panelPrompt"),
@@ -493,6 +539,7 @@ def normalized_panel_tasks(plan: dict[str, Any], layout: str, allow_short_labels
                 "title": str(raw.get("title") or blueprint["title"]),
                 "purpose": str(raw.get("purpose") or blueprint["purpose"]),
                 "targetSkuName": str(raw.get("targetSkuName") or ""),
+                "targetSkuBinding": str(raw.get("targetSkuBinding") or ""),
                 "safeLabels": raw.get("safeLabels") if allow_short_labels and isinstance(raw.get("safeLabels"), list) else [],
                 "riskControl": str(raw.get("riskControl") or ""),
                 "negativePrompt": str(raw.get("negativePrompt") or ""),
@@ -508,16 +555,19 @@ def build_mother_prompt_from_plan(plan: dict[str, Any], layout: str, allow_short
     tasks = normalized_panel_tasks(plan, layout, allow_short_labels)
     expected = rows * cols
     product_json = json.dumps(plan.get("productUnderstanding") or plan.get("productAnalysis") or {}, ensure_ascii=False, indent=2)
+    sku_binding_json = json.dumps(plan.get("skuBindings") or [], ensure_ascii=False, indent=2)
+    sku_combo_json = json.dumps(plan.get("skuCombinationBindings") or [], ensure_ascii=False, indent=2)
     panel_lines = []
     for task in tasks:
         labels = task.get("safeLabels") or []
         label_line = f" Planned on-image copy: {', '.join(str(label) for label in labels)}." if labels else ""
         risk_line = f" Risk control: {task['riskControl']}." if task.get("riskControl") else ""
         sku_line = f" Target SKU: {task['targetSkuName']}." if task.get("targetSkuName") else ""
+        binding_line = f" SKU/component binding: {task['targetSkuBinding']}." if task.get("targetSkuBinding") else ""
         negative_line = f" Negative prompt: {task['negativePrompt']}." if task.get("negativePrompt") else ""
         panel_lines.append(
             f"Panel {task['panelIndex']} - {task['position']} ({task['title']} / {task['slotType']}): "
-            f"Purpose: {task['purpose']}.{sku_line}{label_line}{risk_line}{negative_line}\n"
+            f"Purpose: {task['purpose']}.{sku_line}{binding_line}{label_line}{risk_line}{negative_line}\n"
             f"{task['panelPrompt']}"
         )
 
@@ -538,13 +588,21 @@ Grid rules:
 9. The final image must be suitable for precise programmatic slicing into separate square ecommerce listing images.
 
 Global product consistency:
-1. Use the attached reference images as binding product visual references.
-2. Preserve product shape, color, material, quantity, structure, component relationship, surface texture, rim/edge details, and printed pattern.
-3. Do not replace the selected product/SKU with a generic category item.
-4. Keep all panels visually coherent as one commercial listing batch.
+1. Use the analyzed reference image facts, reference image labels/titles, and SKU/component binding facts as binding product references.
+2. Treat all reference images as equal product references; do not prioritize a "main" image over other supplied product images.
+3. Preserve product shape, color, material, quantity, structure, component relationship, surface texture, rim/edge details, and printed pattern for every SKU/component with supplied visual facts.
+4. For combo SKUs, include every component listed in the combo binding when a panel is about combo/package/option contents.
+5. Do not replace the selected product/SKU with a generic category item.
+6. Keep all panels visually coherent as one commercial listing batch.
 
 Product facts to preserve:
 {product_json}
+
+SKU/component binding facts:
+{sku_binding_json}
+
+Combo SKU composition facts:
+{sku_combo_json}
 
 Global safety:
 No brand logo, platform logo, watermark, QR code, price, discount, rating, certification badge, medical claim, absolute claim, stock claim, shipping-time claim, or platform UI.
@@ -593,15 +651,28 @@ def build_compact_mother_prompt_from_plan(plan: dict[str, Any], layout: str, all
         ensure_ascii=False,
         separators=(",", ":"),
     )
+    sku_binding_json = json.dumps(
+        compact_json_value(plan.get("skuBindings") or [], max_items=10, max_chars=140),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    sku_combo_json = json.dumps(
+        compact_json_value(plan.get("skuCombinationBindings") or [], max_items=10, max_chars=140),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     panel_lines = []
     for task in tasks:
         labels = task.get("safeLabels") or []
         label_line = f" Copy: {', '.join(str(label) for label in labels[:3])}." if labels else ""
         risk_line = f" Avoid: {compact_text(task.get('riskControl'), 120)}." if task.get("riskControl") else ""
         sku_line = f" SKU: {compact_text(task.get('targetSkuName'), 80)}." if task.get("targetSkuName") else ""
+        binding_line = (
+            f" Binding: {compact_text(task.get('targetSkuBinding'), 160)}." if task.get("targetSkuBinding") else ""
+        )
         panel_lines.append(
             f"Panel {task['panelIndex']} - {task['position']} ({task['title']} / {task['slotType']}): "
-            f"{compact_text(task['purpose'], 160)}.{sku_line}{label_line}{risk_line}\n"
+            f"{compact_text(task['purpose'], 160)}.{sku_line}{binding_line}{label_line}{risk_line}\n"
             f"{compact_text(task['panelPrompt'], 900)}"
         )
 
@@ -611,13 +682,21 @@ Create one single {key} ecommerce mother image with {rows * cols} independent sq
 Product facts to preserve:
 {product_json}
 
+SKU/component binding facts:
+{sku_binding_json}
+
+Combo SKU composition facts:
+{sku_combo_json}
+
 Grid rules:
 Use a strict {key} grid, equal square panels, clean white gutters, no merged panels, no blank panels, no panel numbers,
 and no product, text, prop, shadow, or background crossing panel boundaries.
 
 Global product consistency:
-Use attached reference images as binding product visual references. Preserve product shape, color, material, quantity,
-structure, component relationship, surface texture, rim/edge details, and printed pattern. Do not replace the selected product/SKU with a generic category item.
+Use analyzed reference image facts, reference image labels/titles, and SKU/component binding facts as binding product references.
+Treat all supplied images as equal product references, not main-versus-material hierarchy. Preserve product shape, color, material, quantity,
+structure, component relationship, surface texture, rim/edge details, and printed pattern for every SKU/component with supplied visual facts.
+For combo/package/option panels, include every component listed in the combo binding. Do not replace the selected product/SKU with a generic category item.
 
 Global safety:
 No brand logo, platform logo, watermark, QR code, price, discount, rating, certification badge, medical claim,
@@ -694,6 +773,8 @@ def request_prompt_plan(
     context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     candidate_modules = default_slot_blueprints(layout)
+    sku_bindings = context_sku_bindings(context)
+    sku_combination_bindings = context_sku_combination_bindings(context)
     parsed_task_plan = request_text_json(
         api_url=api_url,
         api_key=api_key,
@@ -737,6 +818,8 @@ def request_prompt_plan(
     raw_plan = {
         "productUnderstanding": product_analysis,
         "productAnalysis": product_analysis,
+        "skuBindings": sku_bindings,
+        "skuCombinationBindings": sku_combination_bindings,
         "visualTaskPlan": visual_task_plan,
         "panelPromptPlan": panel_prompt_plan,
     }
@@ -748,6 +831,8 @@ def request_prompt_plan(
     return {
         "productUnderstanding": product_analysis,
         "productAnalysis": product_analysis,
+        "skuBindings": sku_bindings,
+        "skuCombinationBindings": sku_combination_bindings,
         "visualTaskPlan": visual_task_plan,
         "panelPromptPlan": panel_prompt_plan,
         "panelTasks": tasks,

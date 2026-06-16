@@ -48,6 +48,7 @@ TASK_STATUS_SPLIT = "split"
 TASK_STATUS_COMPLETED = "completed"
 TASK_STATUS_FAILED = "failed"
 ACTIVE_VISUAL_TASK_STATUSES = (TASK_STATUS_QUEUED, TASK_STATUS_RUNNING, TASK_STATUS_RETRY_WAITING)
+RUNNING_VISUAL_TASK_STATUSES = (TASK_STATUS_RUNNING,)
 
 BOOL_TRUE_VALUES = {"1", "true", "yes", "on"}
 IMAGE_PAYLOAD_RETRY_PROFILES = [
@@ -128,26 +129,26 @@ def visual_float_setting(key: str, default: float, *, minimum: float, maximum: f
 
 
 def assert_visual_concurrency_available(user_id: str, *, exclude_task_id: str | None = None) -> None:
-    user_limit = visual_int_setting("VISUAL_USER_CONCURRENCY_LIMIT", 1, minimum=0, maximum=100)
-    team_limit = visual_int_setting("VISUAL_TEAM_CONCURRENCY_LIMIT", 3, minimum=0, maximum=500)
+    user_limit = visual_int_setting("VISUAL_USER_CONCURRENCY_LIMIT", 5, minimum=0, maximum=100)
+    team_limit = visual_int_setting("VISUAL_TEAM_CONCURRENCY_LIMIT", 5, minimum=0, maximum=500)
     if user_limit <= 0 and team_limit <= 0:
         return
 
     with get_connection() as conn:
         ensure_visual_generation_schema(conn)
-        user_count = count_active_visual_tasks_for_user(conn, user_id, exclude_task_id=exclude_task_id)
+        user_count = count_running_visual_tasks_for_user(conn, user_id, exclude_task_id=exclude_task_id)
         team_scope = resolve_visual_team_scope(conn, user_id)
         team_count = (
-            count_active_visual_tasks_for_team(conn, team_scope["adminUserId"], exclude_task_id=exclude_task_id)
+            count_running_visual_tasks_for_team(conn, team_scope["adminUserId"], exclude_task_id=exclude_task_id)
             if team_scope["adminUserId"]
             else user_count
         )
 
     if user_limit > 0 and user_count >= user_limit:
-        raise VisualTaskError(f"当前成员已有 {user_count} 个生图任务在排队或运行，成员并发上限为 {user_limit}")
+        raise VisualTaskError(f"当前成员已有 {user_count} 个生图任务正在运行，成员并发上限为 {user_limit}")
     if team_limit > 0 and team_count >= team_limit:
         team_name = team_scope.get("teamName") or "当前团队"
-        raise VisualTaskError(f"{team_name} 已有 {team_count} 个生图任务在排队或运行，团队并发上限为 {team_limit}")
+        raise VisualTaskError(f"{team_name} 已有 {team_count} 个生图任务正在运行，团队并发上限为 {team_limit}")
 
 
 def resolve_visual_team_scope(conn, user_id: str) -> dict[str, str]:
@@ -178,9 +179,17 @@ def resolve_visual_team_scope(conn, user_id: str) -> dict[str, str]:
     }
 
 
-def count_active_visual_tasks_for_user(conn, user_id: str, *, exclude_task_id: str | None = None) -> int:
-    params: list[Any] = [user_id, *ACTIVE_VISUAL_TASK_STATUSES]
-    placeholders = ", ".join("?" for _ in ACTIVE_VISUAL_TASK_STATUSES)
+def count_visual_tasks_for_user(
+    conn,
+    user_id: str,
+    statuses: tuple[str, ...],
+    *,
+    exclude_task_id: str | None = None,
+) -> int:
+    if not statuses:
+        return 0
+    params: list[Any] = [user_id, *statuses]
+    placeholders = ", ".join("?" for _ in statuses)
     where = f"user_id = ? AND status IN ({placeholders})"
     if exclude_task_id:
         where += " AND id != ?"
@@ -188,9 +197,35 @@ def count_active_visual_tasks_for_user(conn, user_id: str, *, exclude_task_id: s
     return int(conn.execute(f"SELECT COUNT(*) FROM visual_generation_tasks WHERE {where}", params).fetchone()[0] or 0)
 
 
-def count_active_visual_tasks_for_team(conn, admin_user_id: str, *, exclude_task_id: str | None = None) -> int:
-    params: list[Any] = [admin_user_id, admin_user_id, *ACTIVE_VISUAL_TASK_STATUSES]
-    placeholders = ", ".join("?" for _ in ACTIVE_VISUAL_TASK_STATUSES)
+def count_active_visual_tasks_for_user(conn, user_id: str, *, exclude_task_id: str | None = None) -> int:
+    return count_visual_tasks_for_user(
+        conn,
+        user_id,
+        ACTIVE_VISUAL_TASK_STATUSES,
+        exclude_task_id=exclude_task_id,
+    )
+
+
+def count_running_visual_tasks_for_user(conn, user_id: str, *, exclude_task_id: str | None = None) -> int:
+    return count_visual_tasks_for_user(
+        conn,
+        user_id,
+        RUNNING_VISUAL_TASK_STATUSES,
+        exclude_task_id=exclude_task_id,
+    )
+
+
+def count_visual_tasks_for_team(
+    conn,
+    admin_user_id: str,
+    statuses: tuple[str, ...],
+    *,
+    exclude_task_id: str | None = None,
+) -> int:
+    if not statuses:
+        return 0
+    params: list[Any] = [admin_user_id, admin_user_id, *statuses]
+    placeholders = ", ".join("?" for _ in statuses)
     task_filter = ""
     if exclude_task_id:
         task_filter = "AND visual_generation_tasks.id != ?"
@@ -211,6 +246,24 @@ def count_active_visual_tasks_for_team(conn, admin_user_id: str, *, exclude_task
     )
 
 
+def count_active_visual_tasks_for_team(conn, admin_user_id: str, *, exclude_task_id: str | None = None) -> int:
+    return count_visual_tasks_for_team(
+        conn,
+        admin_user_id,
+        ACTIVE_VISUAL_TASK_STATUSES,
+        exclude_task_id=exclude_task_id,
+    )
+
+
+def count_running_visual_tasks_for_team(conn, admin_user_id: str, *, exclude_task_id: str | None = None) -> int:
+    return count_visual_tasks_for_team(
+        conn,
+        admin_user_id,
+        RUNNING_VISUAL_TASK_STATUSES,
+        exclude_task_id=exclude_task_id,
+    )
+
+
 def get_visual_task_status_summary(*, user_id: str) -> dict[str, Any]:
     with get_connection() as conn:
         ensure_visual_generation_schema(conn)
@@ -225,18 +278,28 @@ def get_visual_task_status_summary(*, user_id: str) -> dict[str, Any]:
         ).fetchall()
         counts = {clean_text(row["status"]) or TASK_STATUS_DRAFT: int(row["count"] or 0) for row in rows}
         active_count = sum(counts.get(status, 0) for status in ACTIVE_VISUAL_TASK_STATUSES)
+        running_count = counts.get(TASK_STATUS_RUNNING, 0)
+        queued_count = counts.get(TASK_STATUS_QUEUED, 0)
         team_scope = resolve_visual_team_scope(conn, user_id)
         team_active_count = (
             count_active_visual_tasks_for_team(conn, team_scope["adminUserId"])
             if team_scope.get("adminUserId")
             else active_count
         )
-    user_limit = visual_int_setting("VISUAL_USER_CONCURRENCY_LIMIT", 1, minimum=0, maximum=100)
-    team_limit = visual_int_setting("VISUAL_TEAM_CONCURRENCY_LIMIT", 3, minimum=0, maximum=500)
+        team_running_count = (
+            count_running_visual_tasks_for_team(conn, team_scope["adminUserId"])
+            if team_scope.get("adminUserId")
+            else running_count
+        )
+    user_limit = visual_int_setting("VISUAL_USER_CONCURRENCY_LIMIT", 5, minimum=0, maximum=100)
+    team_limit = visual_int_setting("VISUAL_TEAM_CONCURRENCY_LIMIT", 5, minimum=0, maximum=500)
     return {
         "counts": counts,
         "activeCount": active_count,
+        "runningCount": running_count,
+        "queuedCount": queued_count,
         "teamActiveCount": team_active_count,
+        "teamRunningCount": team_running_count,
         "userConcurrencyLimit": user_limit,
         "teamConcurrencyLimit": team_limit,
         "team": team_scope,
@@ -625,12 +688,8 @@ def generate_visual_task(
         visual_bool_setting("VISUAL_USE_REFERENCE_IMAGE", True) if use_reference_image is None else use_reference_image
     )
     resolved_image_model = normalize_image_model_for_channel(settings, image_model or settings["model"])
-    use_chufan_generation_mode = is_chufan_ai_image_target(settings, resolved_image_model)
-    reference_paths = (
-        materialize_reference_image_refs(reference_refs, task_dir)
-        if resolved_use_reference_image and not use_chufan_generation_mode
-        else []
-    )
+    use_chufan_image_target = is_chufan_ai_image_target(settings, resolved_image_model)
+    reference_paths = materialize_reference_image_refs(reference_refs, task_dir) if resolved_use_reference_image else []
     reference_path = reference_paths[0] if reference_paths else None
     image_endpoint = "/images/edits" if reference_paths else "/images/generations"
     image_url = build_api_url(settings["base_url"], image_endpoint)
@@ -639,7 +698,7 @@ def generate_visual_task(
         clean_text(task.get("layout")) or "3x3",
         visual_bool_setting("VISUAL_ALLOW_SHORT_LABELS", True),
     )
-    request_image_size = "" if use_chufan_generation_mode else resolved_image_size
+    request_image_size = "" if use_chufan_image_target else resolved_image_size
 
     update_task_status(task_id, user_id, TASK_STATUS_RUNNING)
     try:
@@ -1355,6 +1414,7 @@ def build_visual_prompt_context(*, task: dict[str, Any], record: dict[str, Any],
         or clean_text(task.get("productTitle"))
         or "Untitled product"
     )
+    sku_bindings = extract_record_sku_bindings(record, reference_refs)
     return {
         "linkRecordId": clean_text(task.get("linkRecordId")) or clean_text(record.get("id")),
         "productId": clean_text(task.get("productId")) or clean_text(record.get("productId")),
@@ -1362,10 +1422,22 @@ def build_visual_prompt_context(*, task: dict[str, Any], record: dict[str, Any],
         "requestedCount": task.get("requestedCount"),
         "productTitle": product_title,
         "skuNames": extract_record_sku_names(record),
+        "skuBindingRule": (
+            "SKU names may be quantity-like or repeated across source products. "
+            "Always interpret each SKU/component through skuBindings and skuCombinationBindings, "
+            "including sourceTitle and referenceImageIndex. Do not merge 1pc/6pc labels across different products."
+        ),
+        "skuBindings": sku_bindings,
+        "skuCombinationBindings": [
+            binding
+            for binding in sku_bindings
+            if binding.get("skuKind") == "combo" or len(binding.get("components") or []) > 1
+        ],
         "referenceImageBindingRule": (
-            "All reference images are selected SKU/product image parameters. "
-            "They must be treated as binding visual references. Preserve the exact product subject appearance "
-            "and do not replace selected SKU components with generic category items."
+            "All reference images are equal product image parameters. Do not treat the first image as the only main product, "
+            "and do not rank images as main/material. Use each image label and SKU binding to identify which product or SKU "
+            "component it shows. Preserve the exact visible product subject appearance and do not replace selected SKU "
+            "components with generic category items."
         ),
         "referenceImages": [
             {
@@ -1376,6 +1448,221 @@ def build_visual_prompt_context(*, task: dict[str, Any], record: dict[str, Any],
             for index, ref in enumerate(reference_refs)
         ],
     }
+
+
+def extract_record_sku_bindings(record: dict[str, Any], reference_refs: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    sku_entries = record.get("skuEntries")
+    if not isinstance(sku_entries, list):
+        return []
+    reference_lookup = build_reference_lookup(reference_refs or [])
+    source_lookup = build_record_source_lookup(record)
+    bindings: list[dict[str, Any]] = []
+    for index, entry in enumerate(sku_entries, start=1):
+        if not isinstance(entry, dict):
+            continue
+        sku_name = clean_text(entry.get("name")) or f"SKU {index}"
+        sku_kind = clean_text(entry.get("kind")) or ("combo" if len(entry.get("componentSkus") or []) > 1 else "single")
+        components = extract_sku_component_bindings(entry, sku_name, reference_lookup, source_lookup)
+        composition_text = " + ".join(format_component_binding(component) for component in components) or sku_name
+        reference_indexes = sorted(
+            {
+                int(component["referenceImageIndex"])
+                for component in components
+                if isinstance(component.get("referenceImageIndex"), int) and component.get("referenceImageIndex")
+            }
+        )
+        binding: dict[str, Any] = {
+            "skuIndex": index,
+            "skuName": sku_name,
+            "skuKind": sku_kind,
+            "compositionText": composition_text,
+            "components": components,
+        }
+        if reference_indexes:
+            binding["referenceIndexes"] = reference_indexes
+        bindings.append(binding)
+    return bindings[:50]
+
+
+def extract_sku_component_bindings(
+    sku_entry: dict[str, Any],
+    sku_name: str,
+    reference_lookup: dict[str, Any],
+    source_lookup: dict[str, dict[str, str]],
+) -> list[dict[str, Any]]:
+    raw_components = [item for item in sku_entry.get("componentSkus") or [] if isinstance(item, dict)]
+    components = raw_components or source_links_as_components(sku_entry, source_lookup)
+    if not components:
+        components = [
+            {
+                "name": sku_name,
+                "specText": sku_name,
+                "optionText": "",
+                "sourceTitle": "",
+                "imageUrl": first_clean_text(
+                    sku_entry.get("imageUrl"),
+                    *asset_image_url_candidates(sku_entry.get("imageAsset")),
+                ),
+            }
+        ]
+
+    result: list[dict[str, Any]] = []
+    for index, component in enumerate(components[:12], start=1):
+        component_name = first_clean_text(
+            component.get("name"),
+            component.get("optionText"),
+            component.get("specText"),
+            component.get("sourceTitle"),
+            sku_name,
+        )
+        source_title = resolve_component_source_title(component, source_lookup)
+        spec_text = clean_text(component.get("specText"))
+        option_text = clean_text(component.get("optionText"))
+        url_candidates = [
+            clean_text(component.get("imageUrl")),
+            clean_text(component.get("sourceImageUrl")),
+            clean_text(sku_entry.get("imageUrl")),
+            *asset_image_url_candidates(sku_entry.get("imageAsset")),
+        ]
+        reference_index = match_reference_index(
+            reference_lookup,
+            url_candidates=url_candidates,
+            label_candidates=[source_title, component_name, spec_text, option_text, sku_name],
+            source_title=source_title,
+            component_name=component_name,
+        )
+        result.append(
+            {
+                "componentIndex": index,
+                "componentName": component_name,
+                "sourceTitle": source_title,
+                "specText": spec_text,
+                "optionText": option_text,
+                "referenceImageIndex": reference_index,
+            }
+        )
+    return result
+
+
+def source_links_as_components(sku_entry: dict[str, Any], source_lookup: dict[str, dict[str, str]]) -> list[dict[str, Any]]:
+    components: list[dict[str, Any]] = []
+    for link in sku_entry.get("sourceSkuLinks") or []:
+        if not isinstance(link, dict):
+            continue
+        components.append(
+            {
+                "name": first_clean_text(link.get("optionText"), link.get("specText"), link.get("sourceTitle")),
+                "specText": clean_text(link.get("specText")),
+                "optionText": clean_text(link.get("optionText")),
+                "sourceTitle": resolve_component_source_title(link, source_lookup),
+                "imageUrl": clean_text(link.get("imageUrl")),
+            }
+        )
+    return components
+
+
+def build_record_source_lookup(record: dict[str, Any]) -> dict[str, dict[str, str]]:
+    lookup: dict[str, dict[str, str]] = {}
+    for source in record.get("sourceLinks") or []:
+        if not isinstance(source, dict):
+            continue
+        meta = {
+            "title": clean_text(source.get("title")),
+            "shopName": clean_text(source.get("shopName")),
+            "productUrl": clean_text(source.get("productUrl")),
+            "imageUrl": clean_text(source.get("imageUrl")),
+        }
+        for key in (source.get("id"), source.get("productUrl")):
+            clean_key = clean_text(key)
+            if clean_key:
+                lookup[clean_key] = meta
+    return lookup
+
+
+def resolve_component_source_title(component: dict[str, Any], source_lookup: dict[str, dict[str, str]]) -> str:
+    source_meta = source_lookup.get(clean_text(component.get("sourceId"))) or source_lookup.get(
+        clean_text(component.get("sourceUrl") or component.get("sourceProductUrl"))
+    )
+    if source_meta:
+        title = clean_text(source_meta.get("title"))
+        if title:
+            return title
+    return clean_text(component.get("sourceTitle"))
+
+
+def build_reference_lookup(reference_refs: list[dict[str, Any]]) -> dict[str, Any]:
+    by_url: dict[str, int] = {}
+    labels: list[tuple[int, str]] = []
+    for index, ref in enumerate(reference_refs, start=1):
+        if not isinstance(ref, dict):
+            continue
+        url = clean_text(ref.get("url") or ref.get("imageUrl") or ref.get("sourceUrl"))
+        if url and url not in by_url:
+            by_url[url] = index
+        label = clean_text(ref.get("label") or ref.get("name"))
+        if label:
+            labels.append((index, normalize_lookup_text(label)))
+    return {"byUrl": by_url, "labels": labels}
+
+
+def match_reference_index(
+    reference_lookup: dict[str, Any],
+    *,
+    url_candidates: list[str],
+    label_candidates: list[str],
+    source_title: str,
+    component_name: str,
+) -> int | None:
+    by_url = reference_lookup.get("byUrl") if isinstance(reference_lookup.get("byUrl"), dict) else {}
+    for url in url_candidates:
+        clean_url = clean_text(url)
+        if clean_url and clean_url in by_url:
+            return by_url[clean_url]
+
+    labels = reference_lookup.get("labels") if isinstance(reference_lookup.get("labels"), list) else []
+    source_key = normalize_lookup_text(source_title)
+    component_key = normalize_lookup_text(component_name)
+    if source_key and component_key:
+        for index, label_key in labels:
+            if source_key in label_key and component_key in label_key:
+                return index
+
+    for candidate in label_candidates:
+        candidate_key = normalize_lookup_text(candidate)
+        if not candidate_key:
+            continue
+        for index, label_key in labels:
+            if candidate_key in label_key or label_key in candidate_key:
+                return index
+    return None
+
+
+def format_component_binding(component: dict[str, Any]) -> str:
+    component_name = clean_text(component.get("componentName")) or "component"
+    source_title = clean_text(component.get("sourceTitle"))
+    return f"{component_name} from {source_title}" if source_title else component_name
+
+
+def first_clean_text(*values: Any) -> str:
+    for value in values:
+        text = clean_text(value)
+        if text:
+            return text
+    return ""
+
+
+def asset_image_url_candidates(asset: Any) -> list[str]:
+    if not isinstance(asset, dict):
+        return []
+    return [
+        clean_text(asset.get(key))
+        for key in ("editedCloudUrl", "displayCloudUrl", "sourceCloudUrl", "editedUrl", "displayUrl", "sourceUrl")
+        if clean_text(asset.get(key))
+    ]
+
+
+def normalize_lookup_text(value: Any) -> str:
+    return "".join(char.lower() for char in clean_text(value) if char.isalnum())
 
 
 def extract_record_sku_names(record: dict[str, Any]) -> list[str]:

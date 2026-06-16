@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import io
 import re
 import shutil
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from copy import copy
 from datetime import datetime
 from pathlib import Path
@@ -17,7 +19,14 @@ from app.modules.creative_generation.listing_title_optimizer import (
     translate_variant_values_to_english,
 )
 from app.modules.exports.product_attributes import get_product_attribute_for_export_record
-from app.modules.image_storage.aliyun_oss import ImageStorageError, mirror_export_image
+from app.modules.image_storage.aliyun_oss import ImageStorageError, mirror_export_image, read_image_ref, upload_image_bytes
+from app.modules.visual_generation.clients import get_runtime_setting
+
+try:
+    from PIL import Image, ImageOps
+except Exception:  # pragma: no cover - runtime dependency guard
+    Image = None
+    ImageOps = None
 
 TEMPLATE_SHEET_NAME = "popTemu_product"
 HEADER_ROW = 1
@@ -35,6 +44,22 @@ DEFAULT_STOCK = 0
 
 MAX_CAROUSEL_IMAGE_COUNT = 10
 MAX_PRODUCT_MATERIAL_IMAGE_COUNT = 1
+MAX_EXPORT_RECORD_CONCURRENCY = 20
+EXPORT_LISTING_IMAGE_SIZE = 800
+
+SKU_PROMOTION_PATTERNS = (
+    r"\b\d+(?:,\d+)*\s*sold(?:\s+from\s+this\s+store)?\b",
+    r"\bsold\s+from\s+this\s+store\b",
+    r"\b(?:best\s*seller|hot\s*sale|top\s*rated|free\s*shipping|limited\s*time|flash\s*deal|sale|discount)\b",
+    r"\bpopular\s+s(?:eller)?\b",
+    r"\b(?:valentine'?s?\s+day|christmas|halloween|birthday|wedding|date\s+night|couples?)\b[^,+-]*",
+    r"\bfor\s+RPGs?,?\s+Tabletop\s+Role[- ]Playing\s+Games?,?\s+and\s+Activities\b",
+    r"\bfor\s+Tabletop\s+Role[- ]Playing\s+Games?,?\s+and\s+Activities\b",
+    r"\b(?:畅销商品|热卖|爆款|包邮|促销|折扣|限时优惠)\b",
+    r"(?:已售出?|售出)\s*\d+\s*件",
+    r"\d+\s*(?:条)?(?:评价|评论)",
+    r"(?:评分|星级)\s*[0-5](?:\.\d+)?",
+)
 
 
 class DianxiaomiExportError(Exception):
@@ -72,9 +97,11 @@ def export_dianxiaomi_temu_template(
     for column_index in range(1, worksheet.max_column + 1):
         worksheet.cell(row=DATA_START_ROW, column=column_index).value = None
 
-    output_rows: list[dict[str, Any]] = []
-    for record in normalized_records:
-        output_rows.extend(build_template_rows(record, export_mode=export_mode, user_id=user_id))
+    output_rows = build_template_rows_for_export_records(
+        normalized_records,
+        export_mode=export_mode,
+        user_id=user_id,
+    )
 
     for offset, values in enumerate(output_rows):
         row_index = DATA_START_ROW + offset
@@ -84,6 +111,56 @@ def export_dianxiaomi_temu_template(
 
     workbook.save(export_path)
     return export_path
+
+
+def build_template_rows_for_export_records(
+    records: list[dict[str, Any]],
+    export_mode: str = EXPORT_MODE_CURATED,
+    *,
+    user_id: str | None = None,
+) -> list[dict[str, Any]]:
+    concurrency = export_record_concurrency_limit(len(records))
+    if concurrency <= 1:
+        output_rows: list[dict[str, Any]] = []
+        for record in records:
+            output_rows.extend(build_template_rows_for_export_record(record, export_mode=export_mode, user_id=user_id))
+        return output_rows
+
+    output_rows: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        for record_rows in executor.map(
+            lambda record: build_template_rows_for_export_record(record, export_mode=export_mode, user_id=user_id),
+            records,
+        ):
+            output_rows.extend(record_rows)
+    return output_rows
+
+
+def export_record_concurrency_limit(record_count: int) -> int:
+    if record_count <= 1:
+        return 1
+    try:
+        configured = int(float(get_runtime_setting("VISUAL_USER_CONCURRENCY_LIMIT", "5")))
+    except ValueError:
+        configured = 5
+    if configured <= 0:
+        return min(record_count, MAX_EXPORT_RECORD_CONCURRENCY)
+    return max(1, min(record_count, configured, MAX_EXPORT_RECORD_CONCURRENCY))
+
+
+def build_template_rows_for_export_record(
+    record: dict[str, Any],
+    export_mode: str = EXPORT_MODE_CURATED,
+    *,
+    user_id: str | None = None,
+) -> list[dict[str, Any]]:
+    try:
+        return build_template_rows(record, export_mode=export_mode, user_id=user_id)
+    except DianxiaomiExportError:
+        raise
+    except Exception as exc:
+        title = clean_text(record.get("productTitle")) or clean_text(record.get("id")) or clean_text(record.get("productId")) or "record"
+        raise DianxiaomiExportError(f"Export failed for {title}: {exc}") from exc
 
 
 def build_template_rows(
@@ -100,14 +177,19 @@ def build_template_rows(
     product_title = clean_text(record.get("productTitle")) or _cn("\\u672a\\u547d\\u540d\\u5546\\u54c1")
     product_title_en = normalize_english_title(record.get("productTitleEn"), product_title)
     if optimize_titles:
-        optimized_titles = optimize_listing_titles(
-            record,
-            fallback_title_cn=product_title,
-            fallback_title_en=product_title_en,
-            user_id=user_id,
-        )
-        product_title = clean_text(optimized_titles.get("title_cn")) or product_title
-        product_title_en = clean_text(optimized_titles.get("title_en")) or product_title_en
+        try:
+            optimized_titles = optimize_listing_titles(
+                record,
+                fallback_title_cn=product_title,
+                fallback_title_en=product_title_en,
+                user_id=user_id,
+                strict=False,
+            )
+            product_title = clean_text(optimized_titles.get("title_cn")) or product_title
+            product_title_en = clean_text(optimized_titles.get("title_en")) or product_title_en
+        except Exception:
+            # Title optimization is best-effort; a transient AI empty response must not block the Excel export.
+            pass
 
     product_id = clean_text(record.get("productId")) or uuid.uuid4().hex[:10]
     raw_main_image_url = pick_record_main_image(record, export_mode)
@@ -127,36 +209,63 @@ def build_template_rows(
     description = build_description_from_images(carousel_image_urls)
     source_url = pick_record_source_url(record)
 
-    product_attribute = get_product_attribute_for_export_record(record, user_id=user_id)
+    try:
+        product_attribute = get_product_attribute_for_export_record(
+            record,
+            user_id=user_id,
+            strict=True,
+            title_context={"title_cn": product_title, "title_en": product_title_en},
+        )
+    except ValueError as exc:
+        raise DianxiaomiExportError(str(exc)) from exc
     product_attribute_text = clean_text(product_attribute.get("product_attribute_text"))
     category_id = clean_text(product_attribute.get("category_id"))
 
     prepared_skus: list[tuple[dict[str, Any], str, list[tuple[str, str]]]] = []
     for index, sku_entry in enumerate(sku_entries, start=1):
         sku_name = clean_text(sku_entry.get("name")) or f"SKU {index}"
-        variant_pairs = derive_variant_pairs(sku_entry, sku_name)
+        variant_pairs = derive_variant_pairs(sku_entry, sku_name, record)
         prepared_skus.append((sku_entry, sku_name, variant_pairs))
     prepared_skus = enforce_consistent_variant_schema(prepared_skus)
     raw_variant_values = [
         value
-        for _sku_entry, _sku_name, variant_pairs in prepared_skus
+        for sku_entry, _sku_name, variant_pairs in prepared_skus
         for _name, value in variant_pairs
+        if should_translate_variant_value(sku_entry, _name)
     ]
-
-    variant_value_translations = (
-        translate_variant_values_to_english(raw_variant_values, user_id=user_id)
-        if translate_variants
-        else {value: fallback_translate_variant_value(value) for value in raw_variant_values}
+    variant_context = build_variant_generation_context(
+        record,
+        prepared_skus,
+        export_mode=export_mode,
+        main_image_url=raw_main_image_url,
+        material_image_urls=material_image_urls,
     )
+
+    if translate_variants:
+        try:
+            variant_value_translations = translate_variant_values_to_english(
+                raw_variant_values,
+                user_id=user_id,
+                strict=True,
+                context=variant_context,
+            )
+        except ValueError as exc:
+            raise DianxiaomiExportError(f"Variant translation failed before export: {exc}") from exc
+    else:
+        variant_value_translations = {value: fallback_translate_variant_value(value) for value in raw_variant_values}
 
     rows: list[dict[str, Any]] = []
     for index, (sku_entry, sku_name, raw_variant_pairs) in enumerate(prepared_skus, start=1):
         sku_image_url = export_image_url(pick_sku_image(sku_entry, export_mode), product_id, "sku", index, record) or main_image_url
         weight_g = weight_to_grams(sku_entry.get("weight")) or DEFAULT_WEIGHT_G
-        variant_pairs = [
-            (name, variant_value_translations.get(value, value))
-            for name, value in raw_variant_pairs
-        ]
+        variant_pairs = []
+        for name, value in raw_variant_pairs:
+            next_value = variant_value_translations.get(value, value) if should_translate_variant_value(sku_entry, name) else value
+            if should_validate_sku_product_label(sku_entry, name):
+                next_value = sanitize_sku_product_label(next_value)
+            variant_pairs.append((name, next_value))
+        if is_combo_sku_entry(sku_entry) and variant_pairs:
+            sku_name = clean_text(variant_pairs[0][1]) or sku_name
         variant_one = variant_pairs[0] if variant_pairs else (_cn("\\u578b\\u53f7"), sku_name)
         variant_two = variant_pairs[1] if len(variant_pairs) > 1 else ("", "")
 
@@ -523,7 +632,14 @@ def contains_cjk(value: Any) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", str(value or "")))
 
 
-def derive_variant_pairs(sku_entry: dict[str, Any], fallback_value: str) -> list[tuple[str, str]]:
+def derive_variant_pairs(
+    sku_entry: dict[str, Any],
+    fallback_value: str,
+    record: dict[str, Any] | None = None,
+) -> list[tuple[str, str]]:
+    if is_combo_sku_entry(sku_entry):
+        return [(VARIANT_LABELS["model"], build_combo_variant_value(sku_entry, fallback_value, record))]
+
     candidates: list[tuple[str, str]] = []
 
     for component in sku_entry.get("componentSkus") or []:
@@ -560,6 +676,235 @@ def derive_variant_pairs(sku_entry: dict[str, Any], fallback_value: str) -> list
     if pairs:
         return pairs[:2]
     return [(VARIANT_LABELS["model"], clean_text(fallback_value) or _cn("\\u9ed8\\u8ba4\\u6b3e"))]
+
+
+def is_combo_sku_entry(sku_entry: dict[str, Any]) -> bool:
+    kind = clean_text(sku_entry.get("kind")).lower()
+    component_count = len([component for component in sku_entry.get("componentSkus") or [] if isinstance(component, dict)])
+    source_link_count = len([source for source in sku_entry.get("sourceSkuLinks") or [] if isinstance(source, dict)])
+    return kind == "combo" or component_count > 1 or source_link_count > 1
+
+
+def should_translate_variant_value(sku_entry: dict[str, Any], variant_name: str) -> bool:
+    return True
+
+
+def should_validate_sku_product_label(sku_entry: dict[str, Any], variant_name: str) -> bool:
+    return is_combo_sku_entry(sku_entry) or clean_text(variant_name) == VARIANT_LABELS["model"]
+
+
+def build_variant_generation_context(
+    record: dict[str, Any],
+    prepared_skus: list[tuple[dict[str, Any], str, list[tuple[str, str]]]],
+    *,
+    export_mode: str,
+    main_image_url: str,
+    material_image_urls: list[str],
+) -> dict[str, Any]:
+    source_lookup, source_items = build_variant_source_context(record)
+    image_urls = [main_image_url, *material_image_urls]
+    sku_items: list[dict[str, Any]] = []
+
+    for index, (sku_entry, sku_name, variant_pairs) in enumerate(prepared_skus, start=1):
+        sku_images = unique_strings(
+            [
+                pick_sku_image(sku_entry, export_mode),
+                *pick_sku_link_images(sku_entry),
+            ]
+        )
+        image_urls.extend(sku_images)
+        component_items = [
+            build_combo_component_context(component, source_lookup)
+            for component in combo_variant_components(sku_entry)
+        ]
+        for component in component_items:
+            image_urls.append(clean_text(component.get("image_url")))
+        sku_items.append(
+            {
+                "index": index,
+                "sku_name": clean_text(sku_name),
+                "is_combo": is_combo_sku_entry(sku_entry),
+                "variant_fields": [
+                    {"name": clean_text(name), "value": clean_text(value)}
+                    for name, value in variant_pairs
+                ],
+                "sku_images": sku_images[:4],
+                "combo_components": component_items,
+            }
+        )
+
+    return {
+        "title_cn": clean_text(record.get("productTitle")),
+        "title_en": clean_text(record.get("productTitleEn")),
+        "source_links": source_items[:8],
+        "sku_items": sku_items[:40],
+        "image_urls": unique_http_urls(image_urls)[:8],
+    }
+
+
+def build_variant_source_context(record: dict[str, Any]) -> tuple[dict[str, dict[str, str]], list[dict[str, str]]]:
+    lookup: dict[str, dict[str, str]] = {}
+    items: list[dict[str, str]] = []
+    for index, source in enumerate(record.get("sourceLinks") or [], start=1):
+        if not isinstance(source, dict):
+            continue
+        item = {
+            "id": clean_text(source.get("id") or source.get("sourceId") or str(index)),
+            "title": clean_text(source.get("title")),
+            "url": first_non_empty(source.get("productUrl"), source.get("sourceProductUrl"), source.get("sourceUrl"), source.get("url")),
+            "image_url": first_non_empty(source.get("imageUrl"), source.get("sourceImageUrl"), source.get("mainImageUrl")),
+        }
+        if item["title"] or item["image_url"] or item["url"]:
+            items.append(item)
+        for key in (
+            source.get("id"),
+            source.get("sourceId"),
+            source.get("productUrl"),
+            source.get("sourceProductUrl"),
+            source.get("sourceUrl"),
+            source.get("url"),
+        ):
+            clean_key = clean_text(key)
+            if clean_key:
+                lookup[clean_key] = item
+    return lookup, items
+
+
+def build_combo_component_context(component: dict[str, Any], source_lookup: dict[str, dict[str, str]]) -> dict[str, Any]:
+    source = first_source_context(
+        source_lookup,
+        component.get("sourceId"),
+        component.get("sourceProductUrl"),
+        component.get("sourceUrl"),
+        component.get("url"),
+    )
+    image_url = first_non_empty(
+        component.get("imageUrl"),
+        component.get("sourceImageUrl"),
+        (source or {}).get("image_url"),
+    )
+    title = first_non_empty(
+        (source or {}).get("title"),
+        component.get("sourceTitle"),
+        component.get("sourceProductTitle"),
+        component.get("title"),
+    )
+    raw_specs = component.get("rawSpecs") if isinstance(component.get("rawSpecs"), dict) else {}
+    return {
+        "title": clean_text(title),
+        "image_url": clean_text(image_url),
+        "spec_value": combo_component_spec_value(component),
+        "raw_specs": {clean_text(key): clean_text(value) for key, value in raw_specs.items()},
+    }
+
+
+def first_source_context(source_lookup: dict[str, dict[str, str]], *keys: Any) -> dict[str, str] | None:
+    for key in keys:
+        source = source_lookup.get(clean_text(key))
+        if source:
+            return source
+    return None
+
+
+def build_combo_variant_value(
+    sku_entry: dict[str, Any],
+    fallback_value: str,
+    record: dict[str, Any] | None = None,
+) -> str:
+    components = combo_variant_components(sku_entry)
+    source_title_lookup = build_source_title_lookup(record or {})
+    labels = [combo_component_variant_label(component, source_title_lookup) for component in components]
+    labels = [label for label in labels if label]
+    if labels:
+        return "+".join(labels)
+    return clean_text(fallback_value) or _cn("\\u9ed8\\u8ba4\\u6b3e")
+
+
+def combo_variant_components(sku_entry: dict[str, Any]) -> list[dict[str, Any]]:
+    components = [component for component in sku_entry.get("componentSkus") or [] if isinstance(component, dict)]
+    if components:
+        return components
+    return [source for source in sku_entry.get("sourceSkuLinks") or [] if isinstance(source, dict)]
+
+
+def combo_component_variant_label(component: dict[str, Any], source_title_lookup: dict[str, str]) -> str:
+    spec_value = sanitize_sku_product_label(combo_component_spec_value(component))
+    source_title = sanitize_sku_product_label(first_non_empty(
+        source_title_lookup.get(clean_text(component.get("sourceId"))),
+        source_title_lookup.get(clean_text(component.get("sourceProductUrl"))),
+        source_title_lookup.get(clean_text(component.get("sourceUrl"))),
+        component.get("sourceTitle"),
+        component.get("sourceProductTitle"),
+        component.get("title"),
+    ))
+    if spec_value and source_title:
+        if sku_label_key(source_title).startswith(sku_label_key(spec_value)):
+            return source_title
+        return f"{spec_value}{source_title}"
+    return spec_value or source_title
+
+
+def build_source_title_lookup(record: dict[str, Any]) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for source in record.get("sourceLinks") or []:
+        if not isinstance(source, dict):
+            continue
+        title = sanitize_sku_product_label(source.get("title"))
+        if not title:
+            continue
+        for key in (
+            source.get("id"),
+            source.get("sourceId"),
+            source.get("productUrl"),
+            source.get("sourceProductUrl"),
+            source.get("url"),
+        ):
+            clean_key = clean_text(key)
+            if clean_key:
+                lookup[clean_key] = title
+    return lookup
+
+
+def sanitize_sku_product_label(value: Any) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text)
+    text = re.sub(r"[，。；：、]+", " ", text)
+    text = re.sub(r"[.。](?=[A-Za-z])", " ", text)
+    text = re.sub(r"(?i)\bsuitable\s+for\b.*?\s+-\s+", " ", text)
+    text = re.sub(r"(?i)\bsuitable\s+for\b.*$", " ", text)
+    for pattern in SKU_PROMOTION_PATTERNS:
+        text = re.sub(pattern, " ", text, flags=re.I)
+    text = re.sub(r"(?i)(?:^|[\s+])(?:[0-5](?:\.\d+)?)\s*(?:stars?|星)?\s*$", " ", text)
+    text = re.sub(r"\s*([+/&])\s*", r"\1", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" -_/,.+&")
+
+
+def sku_label_key(value: Any) -> str:
+    return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", clean_text(value)).lower()
+
+
+def combo_component_spec_value(component: dict[str, Any]) -> str:
+    raw_specs = component.get("rawSpecs") or {}
+    if isinstance(raw_specs, dict):
+        values = [clean_text(value) for value in raw_specs.values() if clean_text(value)]
+        if values:
+            return "".join(values)
+
+    for key in ("optionText", "name", "specText"):
+        value = clean_text(component.get(key))
+        if not value:
+            continue
+        candidates: list[tuple[str, str]] = []
+        add_variant_candidates_from_text(candidates, value)
+        extracted_values = [clean_text(raw_value) for _raw_name, raw_value in candidates if clean_text(raw_value)]
+        if extracted_values:
+            return "".join(extracted_values)
+        return value
+    return ""
 
 
 def enforce_consistent_variant_schema(
@@ -868,14 +1213,62 @@ def export_image_url(image_url: str, product_id: str, role: str, index: int, rec
     clean_url = clean_text(image_url)
     if not clean_url:
         return ""
+    key_hint = f"{build_image_key_product_part(product_id)}/{role}-{index}"
     if is_http_url(clean_url) and not is_processed_image_url(record, clean_url):
+        if should_force_listing_image_processing(role) and export_image_processing_enabled():
+            return mirror_listing_square_image(clean_url, key_hint)
         return clean_url
     try:
-        return mirror_export_image(clean_url, f"{build_image_key_product_part(product_id)}/{role}-{index}")
+        return mirror_export_image(clean_url, key_hint)
     except ImageStorageError as exc:
         if is_http_url(clean_url):
             return clean_url
         raise DianxiaomiExportError(str(exc)) from exc
+
+
+def should_force_listing_image_processing(role: str) -> bool:
+    return clean_text(role) in {"main", "material"}
+
+
+def export_image_processing_enabled() -> bool:
+    return clean_text(get_runtime_setting("ALIYUN_OSS_ENABLED", "")).lower() in {"1", "true", "yes", "on"}
+
+
+def mirror_listing_square_image(source_ref: str, key_hint: str) -> str:
+    if Image is None or ImageOps is None:
+        raise DianxiaomiExportError("Pillow is required to prepare 800x800 listing images")
+    try:
+        image_bytes, _content_type, _source_name = read_image_ref(source_ref)
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            image = ImageOps.exif_transpose(image)
+            image = ImageOps.contain(
+                image,
+                (EXPORT_LISTING_IMAGE_SIZE, EXPORT_LISTING_IMAGE_SIZE),
+                method=image_resampling_lanczos(),
+            )
+            canvas = Image.new("RGB", (EXPORT_LISTING_IMAGE_SIZE, EXPORT_LISTING_IMAGE_SIZE), "white")
+            if image.mode in {"RGBA", "LA"}:
+                layer = Image.new("RGBA", image.size, "white")
+                layer.alpha_composite(image.convert("RGBA"))
+                image = layer.convert("RGB")
+            else:
+                image = image.convert("RGB")
+            left = (EXPORT_LISTING_IMAGE_SIZE - image.width) // 2
+            top = (EXPORT_LISTING_IMAGE_SIZE - image.height) // 2
+            canvas.paste(image, (left, top))
+        output = io.BytesIO()
+        canvas.save(output, format="JPEG", quality=92, optimize=True)
+        upload = upload_image_bytes(output.getvalue(), "image/jpeg", key_hint)
+    except ImageStorageError:
+        raise
+    except Exception as exc:
+        raise ImageStorageError(f"prepare 800x800 export image failed: {source_ref}") from exc
+    return clean_text(upload.get("url"))
+
+
+def image_resampling_lanczos():
+    resampling = getattr(Image, "Resampling", Image)
+    return getattr(resampling, "LANCZOS")
 
 
 def is_processed_image_url(record: dict[str, Any], image_url: str) -> bool:

@@ -31,6 +31,9 @@ DEFAULT_USER_ID = "default-user"
 CANONICAL_CATEGORY_PROVIDER = "dxm_temu"
 PRODUCT_CATALOG_SCOPE_ADMIN = "admin_catalog"
 PRODUCT_CATALOG_SCOPE_POOL_ONLY = "pool_only"
+CHUFAN_AI_BASE_URL = "https://api.aicoming.top/v1"
+LEGACY_FLUAPI_BASE_URL = "https://svip.fluapi.com/v1"
+LEGACY_CHUFAN_AI_BASE_URL = "https://station-88.aicoming.top/v1"
 CATEGORY_AUTO_THRESHOLD = 0.82
 CATEGORY_REVIEW_THRESHOLD = 0.65
 MAPPING_STOP_TERMS = {
@@ -473,6 +476,7 @@ def init_db() -> None:
         ensure_api_usage_schema(conn)
         ensure_user_team_schema(conn)
         ensure_user_api_settings_schema(conn)
+        migrate_single_chufan_api_settings(conn)
         ensure_user_usage_limit_schema(conn)
         ensure_column(conn, "products", "source_type", "source_type TEXT NOT NULL DEFAULT 'yunqi'")
         ensure_column(conn, "products", "catalog_scope", "catalog_scope TEXT NOT NULL DEFAULT 'admin_catalog'")
@@ -671,6 +675,45 @@ def ensure_user_api_settings_schema(conn: sqlite3.Connection) -> None:
 
 def ensure_user_api_credentials_schema(conn: sqlite3.Connection) -> None:
     ensure_user_api_settings_schema(conn)
+
+
+def migrate_single_chufan_api_settings(conn: sqlite3.Connection) -> None:
+    now = utc_now_text()
+    conn.execute("DELETE FROM app_settings WHERE key LIKE 'AI_CHANNEL_FLUAPI_%'")
+    conn.execute("DELETE FROM user_api_settings WHERE channel_id = 'fluapi'")
+    conn.execute(
+        """
+        UPDATE app_settings
+        SET value = ?, updated_at = ?, updated_by = ?
+        WHERE value IN (?, ?)
+          AND (
+            key = 'OPENAI_BASE_URL'
+            OR key LIKE 'OPENAI_%_BASE_URL'
+            OR key = 'AI_CHANNEL_CHUFAN_AI_BASE_URL'
+          )
+        """,
+        (
+            CHUFAN_AI_BASE_URL,
+            now,
+            "single-chufan-migration",
+            LEGACY_FLUAPI_BASE_URL,
+            LEGACY_CHUFAN_AI_BASE_URL,
+        ),
+    )
+    conn.execute(
+        """
+        UPDATE user_api_settings
+        SET base_url = ?, updated_at = ?, updated_by = ?
+        WHERE channel_id = 'chufan_ai' AND base_url IN (?, ?)
+        """,
+        (
+            CHUFAN_AI_BASE_URL,
+            now,
+            "single-chufan-migration",
+            LEGACY_FLUAPI_BASE_URL,
+            LEGACY_CHUFAN_AI_BASE_URL,
+        ),
+    )
 
 
 def ensure_user_usage_limit_schema(conn: sqlite3.Connection) -> None:
@@ -975,6 +1018,8 @@ def upsert_user_api_credential(
             next_image_model = str(image_model or "").strip()
 
         next_enabled = int(bool(existing["enabled"])) if existing and enabled is None else (1 if enabled else 0)
+        if next_enabled and not next_api_key:
+            next_enabled = 0
         if next_enabled:
             conn.execute(
                 """
@@ -2463,8 +2508,7 @@ def get_app_setting_value(key: str, default: str = "") -> str:
 
 
 ADMIN_API_CHANNEL_DEFAULTS: tuple[tuple[str, str], ...] = (
-    ("fluapi", "https://svip.fluapi.com/v1"),
-    ("chufan_ai", "https://station-88.aicoming.top/v1"),
+    ("chufan_ai", CHUFAN_AI_BASE_URL),
 )
 
 

@@ -1,16 +1,47 @@
 import os
+import tempfile
+import threading
+import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ["ALIYUN_OSS_ENABLED"] = "0"
 os.environ["OPENAI_API_KEY"] = ""
 
 from app.modules.image_storage.aliyun_oss import ImageStorageError
-from app.modules.exports.dianxiaomi_temu import build_rows_for_record, build_template_rows
+from app.core import database
+from app.core.database import DEFAULT_USER_ID
+from app.modules.exports.dianxiaomi_export_tasks import (
+    create_dianxiaomi_export_task,
+    get_completed_export_task_path,
+    get_dianxiaomi_export_task,
+    run_dianxiaomi_export_task,
+)
+from app.modules.exports.dianxiaomi_temu import (
+    DianxiaomiExportError,
+    build_rows_for_record,
+    build_template_rows,
+    build_template_rows_for_export_records,
+)
 
 
 class DianxiaomiExportTest(unittest.TestCase):
-    def test_export_uses_optimized_chinese_and_english_titles(self):
+    def setUp(self):
+        self.attribute_patcher = patch(
+            "app.modules.exports.dianxiaomi_temu.get_product_attribute_for_export_record",
+            return_value={"category_id": "31075", "product_attribute_text": "[]"},
+        )
+        self.attribute_patcher.start()
+
+    def tearDown(self):
+        self.attribute_patcher.stop()
+
+    @patch(
+        "app.modules.exports.dianxiaomi_temu.get_product_attribute_for_export_record",
+        return_value={"category_id": "31075", "product_attribute_text": "[]"},
+    )
+    def test_export_uses_optimized_chinese_and_english_titles(self, _attribute_getter):
         with patch(
             "app.modules.exports.dianxiaomi_temu.optimize_listing_titles",
             return_value={
@@ -35,6 +66,93 @@ class DianxiaomiExportTest(unittest.TestCase):
             rows[0][1],
             "1 PCS Heart Initial Keychain Bag Charm, Tassel Key Ring Car Decoration Accessory",
         )
+
+    def test_template_rows_uses_best_effort_title_optimizer(self):
+        with (
+            patch(
+                "app.modules.exports.dianxiaomi_temu.optimize_listing_titles",
+                return_value={
+                    "title_cn": "AI Chinese Title",
+                    "title_en": "AI English Title",
+                    "source": "ai",
+                },
+            ) as optimizer,
+            patch(
+                "app.modules.exports.dianxiaomi_temu.get_product_attribute_for_export_record",
+                return_value={"category_id": "31075", "product_attribute_text": "[]"},
+            ),
+        ):
+            build_template_rows(
+                {
+                    "id": "record-1",
+                    "productId": "p1",
+                    "productTitle": "Original Title",
+                    "mainImage": {"sourceUrl": "https://example.com/main.jpg"},
+                    "sourceLinks": [{"productUrl": "https://detail.1688.com/offer/1.html"}],
+                    "skuEntries": [{"id": "sku-1", "name": "Black", "componentSkus": []}],
+                },
+                translate_variants=False,
+                user_id="user-1",
+            )
+
+        self.assertIs(optimizer.call_args.kwargs.get("strict"), False)
+
+    def test_template_rows_passes_final_titles_to_product_attributes(self):
+        with (
+            patch(
+                "app.modules.exports.dianxiaomi_temu.optimize_listing_titles",
+                return_value={
+                    "title_cn": "最终中文标题 宠物喂食垫",
+                    "title_en": "Final English Pet Feeding Mat Title",
+                    "source": "ai",
+                },
+            ),
+            patch(
+                "app.modules.exports.dianxiaomi_temu.get_product_attribute_for_export_record",
+                return_value={"category_id": "31075", "product_attribute_text": "[]"},
+            ) as attribute_getter,
+        ):
+            build_template_rows(
+                {
+                    "id": "record-1",
+                    "productId": "p1",
+                    "productTitle": "原始采集标题",
+                    "productTitleEn": "Original scraped title",
+                    "mainImage": {"sourceUrl": "https://example.com/main.jpg"},
+                    "sourceLinks": [{"productUrl": "https://detail.1688.com/offer/1.html"}],
+                    "skuEntries": [{"id": "sku-1", "name": "Black", "componentSkus": []}],
+                },
+                translate_variants=False,
+                user_id="user-1",
+            )
+
+        self.assertEqual(attribute_getter.call_args.kwargs["title_context"]["title_cn"], "最终中文标题 宠物喂食垫")
+        self.assertEqual(attribute_getter.call_args.kwargs["title_context"]["title_en"], "Final English Pet Feeding Mat Title")
+        self.assertIs(attribute_getter.call_args.kwargs["strict"], True)
+
+    def test_template_rows_continue_when_title_generation_returns_fallback(self):
+        with patch(
+            "app.modules.exports.dianxiaomi_temu.optimize_listing_titles",
+            return_value={
+                "title_cn": "Original Title",
+                "title_en": "Original Title",
+                "source": "fallback",
+            },
+        ):
+            rows = build_template_rows(
+                {
+                    "id": "record-1",
+                    "productId": "p1",
+                    "productTitle": "Original Title",
+                    "mainImage": {"sourceUrl": "https://example.com/main.jpg"},
+                    "sourceLinks": [{"productUrl": "https://detail.1688.com/offer/1.html"}],
+                    "skuEntries": [{"id": "sku-1", "name": "Black", "componentSkus": []}],
+                },
+                translate_variants=False,
+                user_id="user-1",
+            )
+
+        self.assertEqual(rows[0]["product_title"], "Original Title")
 
     def test_uses_allowed_variant_name_from_raw_specs(self):
         rows = build_rows_for_record(
@@ -287,6 +405,29 @@ class DianxiaomiExportTest(unittest.TestCase):
         self.assertEqual(len(rows[0][2].split("\n")), 10)
         self.assertEqual(len(rows[0][19].split("\n")), 1)
 
+    def test_carousel_http_images_are_processed_when_oss_processing_is_enabled(self):
+        with (
+            patch("app.modules.exports.dianxiaomi_temu.export_image_processing_enabled", return_value=True),
+            patch(
+                "app.modules.exports.dianxiaomi_temu.mirror_listing_square_image",
+                side_effect=lambda _url, key_hint: f"https://oss.example.com/{key_hint}.jpg",
+            ) as processor,
+        ):
+            rows = build_rows_for_record(
+                {
+                    "productId": "p1",
+                    "productTitle": "Test Product",
+                    "mainImage": {"sourceUrl": "https://img.example.com/main.jpg"},
+                    "productMaterialImages": [{"sourceUrl": "https://img.example.com/material.jpg"}],
+                    "sourceLinks": [{"productUrl": "https://detail.1688.com/offer/1.html"}],
+                    "skuEntries": [{"id": "sku-1", "name": "Default SKU", "componentSkus": []}],
+                }
+            )
+
+        self.assertIn("https://oss.example.com/p1/material-1.jpg", rows[0][18])
+        self.assertNotIn("https://img.example.com/material.jpg", rows[0][18])
+        self.assertGreaterEqual(processor.call_count, 2)
+
     def test_sku_preview_falls_back_to_source_sku_image_before_main_image(self):
         rows = build_rows_for_record(
             {
@@ -357,6 +498,224 @@ class DianxiaomiExportTest(unittest.TestCase):
         self.assertEqual([row[6] for row in rows], ["", "", ""])
         self.assertEqual([row[7] for row in rows], ["", "", ""])
         self.assertTrue(all(row[5] for row in rows))
+
+    def test_combo_sku_uses_model_with_spec_and_source_title(self):
+        with patch(
+            "app.modules.exports.dianxiaomi_temu.get_product_attribute_for_export_record",
+            return_value={"category_id": "31075", "product_attribute_text": "[]"},
+        ):
+            rows = build_template_rows(
+                {
+                    "id": "record-1",
+                    "productId": "p1",
+                    "productTitle": "Combo Product",
+                    "mainImage": {"sourceUrl": "https://example.com/main.jpg"},
+                    "sourceLinks": [
+                        {"id": "source-a", "title": "Pet Bowl", "productUrl": "https://detail.1688.com/offer/1.html"},
+                        {"id": "source-b", "title": "Feeding Mat", "productUrl": "https://detail.1688.com/offer/2.html"},
+                    ],
+                    "skuEntries": [
+                        {
+                            "id": "sku-combo-1",
+                            "kind": "combo",
+                            "name": "1pc+Black",
+                            "componentSkus": [
+                                {
+                                    "name": "1pc",
+                                    "specText": "Spec: 1pc",
+                                    "sourceId": "source-a",
+                                    "sourceTitle": "Supplier A",
+                                    "rawSpecs": {"Spec": "1pc"},
+                                },
+                                {
+                                    "name": "Black",
+                                    "specText": "Color: Black",
+                                    "sourceId": "source-b",
+                                    "sourceTitle": "Supplier B",
+                                    "rawSpecs": {"Color": "Black"},
+                                },
+                            ],
+                        }
+                    ],
+                },
+                optimize_titles=False,
+                translate_variants=False,
+            )
+
+        self.assertEqual(rows[0]["variant_name"], "1pc Pet Bowl+Black Feeding Mat")
+        self.assertEqual(rows[0]["variant_attr_name_1"], "\u578b\u53f7")
+        self.assertEqual(rows[0]["variant_attr_value_1"], "1pc Pet Bowl+Black Feeding Mat")
+        self.assertEqual(rows[0]["variant_attr_name_2"], "")
+        self.assertEqual(rows[0]["variant_attr_value_2"], "")
+
+    def test_combo_sku_strips_promotional_source_title_noise(self):
+        noisy_title = (
+            "1 Pack.IVW Wood Dice Suitable for Valentines Day Gifts, Date Night Games "
+            "& Couples Board - Twelve-Sided D12 Dice with Original Wood Grain for RPGs, "
+            "Tabletop Role-Playing Games, and Activities+6pcsBest Seller341 sold from this store 5.0"
+        )
+
+        with patch(
+            "app.modules.exports.dianxiaomi_temu.get_product_attribute_for_export_record",
+            return_value={"category_id": "31075", "product_attribute_text": "[]"},
+        ):
+            rows = build_template_rows(
+                {
+                    "id": "record-1",
+                    "productId": "p1",
+                    "productTitle": "Wood Dice",
+                    "mainImage": {"sourceUrl": "https://example.com/main.jpg"},
+                    "sourceLinks": [
+                        {"id": "source-a", "title": noisy_title, "productUrl": "https://detail.1688.com/offer/1.html"},
+                    ],
+                    "skuEntries": [
+                        {
+                            "id": "sku-combo-1",
+                            "kind": "combo",
+                            "componentSkus": [
+                                {
+                                    "sourceId": "source-a",
+                                    "rawSpecs": {"Pack": "1 Pack"},
+                                },
+                            ],
+                        }
+                    ],
+                },
+                optimize_titles=False,
+                translate_variants=False,
+            )
+
+        sku_value = rows[0]["variant_attr_value_1"]
+        self.assertIn("IVW Wood Dice", sku_value)
+        self.assertIn("D12 Dice", sku_value)
+        self.assertLessEqual(len(sku_value), 48)
+        self.assertNotIn("Best Seller", sku_value)
+        self.assertNotIn("popular S", sku_value)
+        self.assertNotIn("sold from this store", sku_value)
+        self.assertNotIn("5.0", sku_value)
+        self.assertNotIn("Valentines Day", sku_value)
+        self.assertNotIn("Date Night", sku_value)
+        self.assertFalse(sku_value.startswith("1 Pack1 Pack"))
+
+    def test_combo_sku_translates_model_value_and_variant_name(self):
+        raw_combo_value = "\u4e00\u4ef6\u5ba0\u7269\u7897+\u9ed1\u8272\u5582\u98df\u57ab"
+        translated_combo_value = "1pc Pet Bowl+Black Feeding Mat"
+
+        with (
+            patch(
+                "app.modules.exports.dianxiaomi_temu.get_product_attribute_for_export_record",
+                return_value={"category_id": "31075", "product_attribute_text": "[]"},
+            ),
+            patch(
+                "app.modules.exports.dianxiaomi_temu.translate_variant_values_to_english",
+                return_value={raw_combo_value: translated_combo_value},
+            ) as translator,
+        ):
+            rows = build_template_rows(
+                {
+                    "id": "record-1",
+                    "productId": "p1",
+                    "productTitle": "Combo Product",
+                    "mainImage": {"sourceUrl": "https://example.com/main.jpg"},
+                    "sourceLinks": [
+                        {
+                            "id": "source-a",
+                            "title": "\u5ba0\u7269\u7897",
+                            "productUrl": "https://detail.1688.com/offer/1.html",
+                        },
+                        {
+                            "id": "source-b",
+                            "title": "\u5582\u98df\u57ab",
+                            "productUrl": "https://detail.1688.com/offer/2.html",
+                        },
+                    ],
+                    "skuEntries": [
+                        {
+                            "id": "sku-combo-1",
+                            "kind": "combo",
+                            "componentSkus": [
+                                {
+                                    "sourceId": "source-a",
+                                    "rawSpecs": {"\u89c4\u683c": "\u4e00\u4ef6"},
+                                },
+                                {
+                                    "sourceId": "source-b",
+                                    "rawSpecs": {"\u989c\u8272": "\u9ed1\u8272"},
+                                },
+                            ],
+                        }
+                    ],
+                },
+                optimize_titles=False,
+            )
+
+        translator.assert_called_once()
+        self.assertIn(raw_combo_value, translator.call_args.args[0])
+        self.assertEqual(rows[0]["variant_name"], translated_combo_value)
+        self.assertEqual(rows[0]["variant_attr_name_1"], "\u578b\u53f7")
+        self.assertEqual(rows[0]["variant_attr_value_1"], translated_combo_value)
+
+    def test_sku_generation_uses_title_and_image_context_to_clean_mixed_quantity_option(self):
+        with (
+            patch(
+                "app.modules.exports.dianxiaomi_temu.get_product_attribute_for_export_record",
+                return_value={"category_id": "31075", "product_attribute_text": "[]"},
+            ),
+            patch(
+                "app.modules.exports.dianxiaomi_temu.translate_variant_values_to_english",
+                return_value={
+                    "Mix Quantity 12pcs+Mix": "Mix",
+                    "12pcs": "12pcs",
+                },
+            ) as translator,
+        ):
+            rows = build_template_rows(
+                {
+                    "id": "record-1",
+                    "productId": "p1",
+                    "productTitle": "12/24pcs Random Color Confetti Popper Handheld Party Streamers",
+                    "productTitleEn": "12/24pcs Random Color Confetti Popper Handheld Party Streamers",
+                    "mainImage": {"sourceUrl": "https://img.example.com/main-confetti.jpg"},
+                    "productMaterialImages": [{"sourceUrl": "https://img.example.com/detail-confetti.jpg"}],
+                    "sourceLinks": [
+                        {
+                            "id": "source-a",
+                            "title": "Random Color Confetti Popper",
+                            "imageUrl": "https://img.example.com/source-confetti.jpg",
+                            "productUrl": "https://www.temu.com/confetti.html",
+                        }
+                    ],
+                    "skuEntries": [
+                        {
+                            "id": "sku-1",
+                            "name": "Mix, Quantity: 12pcs",
+                            "imageUrl": "https://img.example.com/sku-confetti.jpg",
+                            "componentSkus": [
+                                {
+                                    "rawSpecs": {"\u989c\u8272": "Mix Quantity 12pcs"},
+                                    "specText": "Quantity: 12pcs",
+                                }
+                            ],
+                            "sourceSkuLinks": [{"optionText": "Color: Mix", "imageUrl": "https://img.example.com/source-sku.jpg"}],
+                        }
+                    ],
+                },
+                optimize_titles=False,
+            )
+
+        self.assertEqual(rows[0]["variant_name"], "Mix, Quantity: 12pcs")
+        self.assertEqual(rows[0]["variant_attr_name_1"], "\u989c\u8272")
+        self.assertEqual(rows[0]["variant_attr_value_1"], "Mix")
+        self.assertEqual(rows[0]["variant_attr_name_2"], "\u6570\u91cf")
+        self.assertEqual(rows[0]["variant_attr_value_2"], "12pcs")
+        translator.assert_called_once()
+        self.assertIn("Mix Quantity 12pcs+Mix", translator.call_args.args[0])
+        context = translator.call_args.kwargs["context"]
+        self.assertEqual(context["title_en"], "12/24pcs Random Color Confetti Popper Handheld Party Streamers")
+        self.assertIn("https://img.example.com/main-confetti.jpg", context["image_urls"])
+        self.assertIn("https://img.example.com/sku-confetti.jpg", context["image_urls"])
+        variant_fields = context["sku_items"][0]["variant_fields"]
+        self.assertIn({"name": "\u989c\u8272", "value": "Mix Quantity 12pcs+Mix"}, variant_fields)
 
     def test_delivery_days_default_is_blank(self):
         rows = build_rows_for_record(
@@ -435,9 +794,88 @@ class DianxiaomiExportTest(unittest.TestCase):
             )
 
         getter.assert_called_once()
+        self.assertIs(getter.call_args.kwargs.get("strict"), True)
         self.assertEqual([row["category_id"] for row in rows], ["31075", "31075"])
         self.assertEqual([row["product_attributes"] for row in rows], [attribute_text, attribute_text])
         self.assertEqual([row["origin"] for row in rows], ["\u4e2d\u56fd-\u6d59\u6c5f\u7701", "\u4e2d\u56fd-\u6d59\u6c5f\u7701"])
+
+    def test_template_rows_fail_when_product_attributes_are_unavailable(self):
+        with patch(
+            "app.modules.exports.dianxiaomi_temu.get_product_attribute_for_export_record",
+            side_effect=ValueError("Product category/attributes unavailable for export: Test Product"),
+        ):
+            with self.assertRaisesRegex(DianxiaomiExportError, "Product category/attributes unavailable"):
+                build_template_rows(
+                    {
+                        "id": "record-1",
+                        "productId": "p1",
+                        "productTitle": "Test Product",
+                        "mainImage": {"sourceUrl": "https://example.com/main.jpg"},
+                        "sourceLinks": [{"productUrl": "https://detail.1688.com/offer/1.html"}],
+                        "skuEntries": [{"id": "sku-1", "name": "Black", "componentSkus": []}],
+                    },
+                    optimize_titles=False,
+                    translate_variants=False,
+                    user_id="user-1",
+                )
+
+    def test_export_records_use_member_concurrency_limit_and_keep_order(self):
+        lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def fake_build(record, **_kwargs):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            return [{"product_title": record["productTitle"]}]
+
+        records = [{"productTitle": f"Product {index}", "skuEntries": [{"id": f"sku-{index}"}]} for index in range(4)]
+        with (
+            patch("app.modules.exports.dianxiaomi_temu.get_runtime_setting", return_value="2"),
+            patch("app.modules.exports.dianxiaomi_temu.build_template_rows_for_export_record", side_effect=fake_build),
+        ):
+            rows = build_template_rows_for_export_records(records, user_id="user-1")
+
+        self.assertEqual(max_active, 2)
+        self.assertEqual([row["product_title"] for row in rows], ["Product 0", "Product 1", "Product 2", "Product 3"])
+
+    def test_export_task_runs_to_completed_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_path = database.DATABASE_PATH
+            database.DATABASE_PATH = Path(tmpdir) / "app.db"
+            export_path = Path(tmpdir) / "export.xlsx"
+            export_path.write_bytes(b"fake-excel")
+            try:
+                database.init_db()
+                task = create_dianxiaomi_export_task(
+                    [
+                        {
+                            "id": "record-1",
+                            "productId": "p1",
+                            "productTitle": "Queued Product",
+                            "skuEntries": [{"id": "sku-1", "name": "Black"}],
+                        }
+                    ],
+                    user_id=DEFAULT_USER_ID,
+                )
+                with patch(
+                    "app.modules.exports.dianxiaomi_export_tasks.export_dianxiaomi_temu_template",
+                    return_value=export_path,
+                ) as exporter:
+                    run_dianxiaomi_export_task(task_id=task["id"], user_id=DEFAULT_USER_ID)
+
+                exporter.assert_called_once()
+                completed = get_dianxiaomi_export_task(task_id=task["id"], user_id=DEFAULT_USER_ID)
+                self.assertEqual(completed["status"], "completed")
+                self.assertEqual(completed["filename"], "export.xlsx")
+                self.assertEqual(get_completed_export_task_path(task_id=task["id"], user_id=DEFAULT_USER_ID), export_path)
+            finally:
+                database.DATABASE_PATH = original_path
 
 
 if __name__ == "__main__":

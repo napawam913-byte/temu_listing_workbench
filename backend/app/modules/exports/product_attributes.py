@@ -10,20 +10,19 @@ from app.core.database import (
     assert_user_api_usage_allowed,
     build_text_vector,
     cosine_similarity,
-    ensure_export_product_attribute_schema,
     get_connection,
     record_api_usage_safe,
-    sync_canonical_categories_from_dxm,
-    utc_now_text,
 )
 from app.modules.visual_generation.clients import (
     build_api_url,
+    extract_response_text,
     get_ai_stage_settings,
+    parse_json_from_text,
+    request_json,
     request_text_json,
 )
 
 QUEUE_STATUSES = ("queued", "running", "done", "failed")
-REUSABLE_JOB_STATUSES = ("queued", "running", "done")
 CHOICE_COMPONENTS = {"ant-select", "checkbox-group", "select-percent"}
 NUMBER_INPUT_PATTERN = re.compile(r"[-+]?\d+(?:\.\d+)?")
 OTHER_FIBER_PERCENT_LIMIT = 5.0
@@ -31,101 +30,61 @@ CATEGORY_LEAF_POOL_LIMIT = 120
 CATEGORY_BRANCH_CANDIDATE_LIMIT = 10
 CATEGORY_AI_CONFIDENCE_FLOOR = 0.25
 CATEGORY_VECTOR_CONFIDENT_SCORE = 0.55
-ATTRIBUTE_GENERATION_VERSION = "complete-visible-fields-v2"
-_CATEGORY_VECTOR_CACHE: dict[str, list[dict[str, Any]]] = {}
+MAX_CATEGORY_REFERENCE_IMAGES = 6
+ATTRIBUTE_GENERATION_VERSION = "complete-visible-fields-v7-red-line-guards"
+NOISY_CATEGORY_PATH_SEGMENTS = {"companyinfo", "categories"}
+
+RED_LINE_CHILD_FIELD_TOKENS = (
+    "\u5de5\u4f5c\u7535\u538b",
+    "\u7535\u538b",
+    "\u63d2\u5934\u89c4\u683c",
+    "\u63d2\u5934",
+    "\u53ef\u5145\u7535\u7535\u6c60",
+    "\u592a\u9633\u80fd\u7535\u6c60",
+    "\u7535\u6c60\u7c7b\u578b",
+    "\u6253\u706b\u673a\u7c7b\u578b",
+    "\u71c3\u6599\u7c7b\u578b",
+    "\u6db2\u4f53\u5bb9\u91cf",
+    "\u6db2\u4f53\u7c7b\u578b",
+    "\u6db2\u4f53\u5f62\u5f0f",
+)
+
+RED_LINE_PARENT_FIELD_TOKENS = (
+    "\u662f\u5426\u5e26\u7535\u6c60",
+    "\u5305\u542b\u7535\u6c60",
+    "\u662f\u5426\u542b\u7535\u6c60",
+    "\u7535\u6e90\u65b9\u5f0f",
+    "\u4f9b\u7535\u65b9\u5f0f",
+    "\u662f\u5426\u5e26\u7535",
+    "\u662f\u5426\u542b\u71c3\u6599",
+    "\u662f\u5426\u542b\u6db2\u4f53",
+)
+
+RED_LINE_NEGATIVE_VALUE_TOKENS = (
+    "\u5426",
+    "\u65e0",
+    "\u6ca1\u6709",
+    "\u4e0d\u5e26",
+    "\u4e0d\u542b",
+    "\u65e0\u9700",
+    "\u4e0d\u9700",
+    "\u4e0d\u9002\u7528",
+    "no",
+    "none",
+    "without",
+    "notapplicable",
+    "batteryfree",
+)
 
 
 def prepare_product_attribute_jobs(records: list[dict[str, Any]], *, user_id: str, process_now: bool = False) -> dict[str, Any]:
-    inserted = 0
-    reused = 0
-    with get_connection() as conn:
-        ensure_export_product_attribute_schema(conn)
-        for record in records:
-            if not isinstance(record, dict) or not record.get("skuEntries"):
-                continue
-            link_record_id = record_identity(record)
-            record_hash = hash_attribute_input(record)
-            delete_failed_product_attribute_jobs(conn, user_id=user_id, link_record_id=link_record_id)
-            existing = conn.execute(
-                """
-                SELECT id, status
-                FROM export_product_attribute_jobs
-                WHERE user_id = ? AND link_record_id = ? AND record_hash = ?
-                ORDER BY updated_at DESC
-                LIMIT 1
-                """,
-                (user_id, link_record_id, record_hash),
-            ).fetchone()
-            now = utc_now_text()
-            if existing and existing["status"] in REUSABLE_JOB_STATUSES:
-                reused += 1
-                continue
-            if existing:
-                conn.execute(
-                    """
-                    UPDATE export_product_attribute_jobs
-                    SET status = 'queued',
-                        category_id = NULL,
-                        category_path = NULL,
-                        product_attribute_text = '',
-                        product_attributes_json = '{}',
-                        error_message = NULL,
-                        record_json = ?,
-                        updated_at = ?,
-                        completed_at = NULL
-                    WHERE id = ? AND user_id = ?
-                    """,
-                    (json.dumps(record, ensure_ascii=False), now, existing["id"], user_id),
-                )
-                inserted += 1
-                continue
-            conn.execute(
-                """
-                INSERT INTO export_product_attribute_jobs (
-                    id, user_id, link_record_id, product_id, product_title,
-                    record_hash, record_json, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
-                """,
-                (
-                    f"attr-{uuid.uuid4().hex}",
-                    user_id,
-                    link_record_id,
-                    clean_text(record.get("productId")),
-                    clean_text(record.get("productTitle")),
-                    record_hash,
-                    json.dumps(record, ensure_ascii=False),
-                    now,
-                    now,
-                ),
-            )
-            inserted += 1
-    if process_now:
-        process_pending_product_attribute_jobs(user_id=user_id, limit=max(inserted, 1))
-    summary = get_product_attribute_queue_summary(user_id=user_id, records=records)
-    summary.update({"queuedNow": inserted, "reused": reused})
+    summary = empty_product_attribute_queue_summary()
+    summary.update({"queuedNow": 0, "reused": 0})
     return summary
 
 
 def get_product_attribute_queue_summary(*, user_id: str, records: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    with get_connection() as conn:
-        ensure_export_product_attribute_schema(conn)
-        if records is not None:
-            return get_product_attribute_queue_summary_for_records(conn, user_id=user_id, records=records)
-        rows = conn.execute(
-            """
-            SELECT status, COUNT(*) AS count
-            FROM export_product_attribute_jobs
-            WHERE user_id = ?
-            GROUP BY status
-            """,
-            (user_id,),
-        ).fetchall()
-    counts = {status: 0 for status in QUEUE_STATUSES}
-    for row in rows:
-        counts[str(row["status"])] = int(row["count"] or 0)
-    counts["pending"] = counts["queued"] + counts["running"]
-    counts["total"] = sum(counts[status] for status in QUEUE_STATUSES)
-    return counts
+    return empty_product_attribute_queue_summary()
 
 
 def get_product_attribute_queue_summary_for_records(
@@ -134,146 +93,86 @@ def get_product_attribute_queue_summary_for_records(
     user_id: str,
     records: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    return empty_product_attribute_queue_summary()
+
+
+def empty_product_attribute_queue_summary(**extra: Any) -> dict[str, Any]:
     counts = {status: 0 for status in QUEUE_STATUSES}
-    seen_keys: set[tuple[str, str]] = set()
-    for record in records:
-        if not isinstance(record, dict) or not record.get("skuEntries"):
-            continue
-        key = (record_identity(record), hash_attribute_input(record))
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-        row = conn.execute(
-            """
-            SELECT status
-            FROM export_product_attribute_jobs
-            WHERE user_id = ? AND link_record_id = ? AND record_hash = ?
-            ORDER BY updated_at DESC
-            LIMIT 1
-            """,
-            (user_id, key[0], key[1]),
-        ).fetchone()
-        if row and str(row["status"]) in counts:
-            counts[str(row["status"])] += 1
-    counts["pending"] = counts["queued"] + counts["running"]
-    counts["total"] = sum(counts[status] for status in QUEUE_STATUSES)
+    counts["pending"] = 0
+    counts["total"] = 0
+    counts.update(extra)
     return counts
 
 
-def process_pending_product_attribute_jobs(*, user_id: str, limit: int = 20) -> dict[str, Any]:
-    processed = 0
-    failed = 0
-    with get_connection() as conn:
-        ensure_export_product_attribute_schema(conn)
-        rows = conn.execute(
-            """
-            SELECT *
-            FROM export_product_attribute_jobs
-            WHERE user_id = ? AND status = 'queued'
-            ORDER BY created_at ASC
-            LIMIT ?
-            """,
-            (user_id, max(1, limit)),
-        ).fetchall()
-
-    for row in rows:
-        job_id = row["id"]
-        mark_job_running(job_id, user_id=user_id)
-        try:
-            record = json.loads(row["record_json"] or "{}")
-            result = generate_product_attribute_for_record(record, user_id=user_id)
-            mark_job_done(job_id, user_id=user_id, result=result)
-            processed += 1
-        except Exception as exc:  # queue captures provider/category failures
-            mark_job_failed(job_id, user_id=user_id, error=str(exc))
-            failed += 1
-    summary = get_product_attribute_queue_summary(user_id=user_id)
-    summary.update({"processedNow": processed, "failedNow": failed})
-    return summary
-
-
-def get_cached_product_attribute_for_record(record: dict[str, Any], *, user_id: str | None = None) -> dict[str, str]:
-    if not isinstance(record, dict):
-        return {}
-    uid = user_id or "default-user"
-    link_record_id = record_identity(record)
-    record_hash = hash_attribute_input(record)
-    with get_connection() as conn:
-        ensure_export_product_attribute_schema(conn)
-        row = conn.execute(
-            """
-            SELECT category_id, category_path, product_attribute_text, product_attributes_json
-            FROM export_product_attribute_jobs
-            WHERE user_id = ? AND link_record_id = ? AND record_hash = ? AND status = 'done'
-            ORDER BY completed_at DESC, updated_at DESC
-            LIMIT 1
-            """,
-            (uid, link_record_id, record_hash),
-        ).fetchone()
-    if not row:
-        return {}
-    return {
-        "category_id": clean_text(row["category_id"]),
-        "category_path": clean_text(row["category_path"]),
-        "product_attribute_text": clean_text(row["product_attribute_text"]),
-        "product_attributes_json": clean_text(row["product_attributes_json"]),
-    }
-
-
-def clear_failed_product_attribute_cache_for_record(record: dict[str, Any], *, user_id: str) -> None:
-    if not isinstance(record, dict):
-        return
-    link_record_id = record_identity(record)
-    try:
-        with get_connection() as conn:
-            ensure_export_product_attribute_schema(conn)
-            delete_failed_product_attribute_jobs(conn, user_id=user_id, link_record_id=link_record_id)
-    except Exception:
-        return
-
-
-def delete_failed_product_attribute_jobs(
-    conn: Any,
+def get_product_attribute_for_export_record(
+    record: dict[str, Any],
     *,
     user_id: str | None = None,
-    link_record_id: str | None = None,
-) -> int:
-    where = ["status = 'failed'"]
-    params: list[Any] = []
-    if user_id is not None:
-        where.append("user_id = ?")
-        params.append(user_id)
-    if link_record_id is not None:
-        where.append("link_record_id = ?")
-        params.append(link_record_id)
-    cursor = conn.execute(
-        f"DELETE FROM export_product_attribute_jobs WHERE {' AND '.join(where)}",
-        tuple(params),
-    )
-    return int(cursor.rowcount or 0)
-
-
-def get_product_attribute_for_export_record(record: dict[str, Any], *, user_id: str | None = None) -> dict[str, str]:
+    strict: bool = False,
+    title_context: dict[str, Any] | None = None,
+) -> dict[str, str]:
     uid = user_id or "default-user"
-    clear_failed_product_attribute_cache_for_record(record, user_id=uid)
-    cached = get_cached_product_attribute_for_record(record, user_id=uid)
-    if cached:
-        return cached
+    attribute_record = apply_product_attribute_title_context(record, title_context)
 
     try:
-        result = generate_product_attribute_for_record(record, user_id=uid)
+        result = generate_product_attribute_for_record(attribute_record, user_id=uid, require_api=strict)
     except Exception as exc:
-        clear_failed_product_attribute_cache_for_record(record, user_id=uid)
+        if strict:
+            title = clean_text(attribute_record.get("productTitle")) or record_identity(attribute_record)
+            raise ValueError(f"Product category/attributes unavailable for export: {title}: {exc}") from exc
         return {}
 
-    try:
-        save_product_attribute_result_for_record(record, user_id=uid, result=result)
-    except Exception:
-        pass
-    return product_attribute_result_to_cache(result)
+    export_payload = product_attribute_result_to_export_payload(result)
+    if strict and not is_export_attribute_payload_complete(export_payload):
+        title = clean_text(attribute_record.get("productTitle")) or record_identity(attribute_record)
+        raise ValueError(f"Product category/attributes unavailable for export: {title}")
+    return export_payload
 
 
-def product_attribute_result_to_cache(result: dict[str, Any]) -> dict[str, str]:
+def apply_product_attribute_title_context(
+    record: dict[str, Any],
+    title_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not title_context:
+        return record
+    title_cn = first_non_empty(
+        title_context.get("title_cn"),
+        title_context.get("productTitle"),
+        title_context.get("title"),
+    )
+    title_en = first_non_empty(
+        title_context.get("title_en"),
+        title_context.get("productTitleEn"),
+        title_context.get("titleEn"),
+    )
+    if not title_cn and not title_en:
+        return record
+
+    next_record = dict(record)
+    original_title_cn = clean_text(record.get("productTitle"))
+    original_title_en = clean_text(record.get("productTitleEn"))
+    if title_cn:
+        if original_title_cn and original_title_cn != title_cn:
+            next_record["originalProductTitle"] = original_title_cn
+        next_record["productTitle"] = title_cn
+        next_record["attributeTitle"] = title_cn
+    if title_en:
+        if original_title_en and original_title_en != title_en:
+            next_record["originalProductTitleEn"] = original_title_en
+        next_record["productTitleEn"] = title_en
+        next_record["attributeTitleEn"] = title_en
+    return next_record
+
+
+def is_export_attribute_payload_complete(payload: dict[str, Any]) -> bool:
+    category_id = clean_text(payload.get("category_id"))
+    attribute_text = clean_text(payload.get("product_attribute_text"))
+    attribute_json = clean_text(payload.get("product_attributes_json"))
+    has_attributes = attribute_text not in ("", "[]", "{}") or attribute_json not in ("", "[]", "{}")
+    return bool(category_id and has_attributes)
+
+
+def product_attribute_result_to_export_payload(result: dict[str, Any]) -> dict[str, str]:
     product_attributes = result.get("product_attributes") or []
     product_attribute_text = clean_text(result.get("product_attribute_text"))
     if not product_attribute_text:
@@ -286,163 +185,22 @@ def product_attribute_result_to_cache(result: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def save_product_attribute_result_for_record(record: dict[str, Any], *, user_id: str, result: dict[str, Any]) -> None:
-    now = utc_now_text()
-    link_record_id = record_identity(record)
-    record_hash = hash_attribute_input(record)
-    product_attributes = result.get("product_attributes") or []
+def ai_result_has_attributes(ai_result: dict[str, Any]) -> bool:
+    raw_items = ai_result.get("attributes") or ai_result.get("product_attributes") or []
+    return isinstance(raw_items, list) and bool(raw_items)
+
+
+def generate_product_attribute_for_record(
+    record: dict[str, Any],
+    *,
+    user_id: str | None = None,
+    require_api: bool = False,
+) -> dict[str, Any]:
+    if require_api and not is_product_attribute_ai_configured(user_id=user_id):
+        raise ValueError("Product attribute API is not configured")
+
     with get_connection() as conn:
-        ensure_export_product_attribute_schema(conn)
-        row = conn.execute(
-            """
-            SELECT id
-            FROM export_product_attribute_jobs
-            WHERE user_id = ? AND link_record_id = ? AND record_hash = ?
-            ORDER BY updated_at DESC
-            LIMIT 1
-            """,
-            (user_id, link_record_id, record_hash),
-        ).fetchone()
-        payload = (
-            clean_text(result.get("category_id")),
-            clean_text(result.get("category_path")),
-            clean_text(result.get("product_attribute_text")) or dump_product_attributes(product_attributes),
-            dump_product_attributes(product_attributes),
-            json.dumps(record, ensure_ascii=False),
-            now,
-            now,
-        )
-        if row:
-            conn.execute(
-                """
-                UPDATE export_product_attribute_jobs
-                SET status = 'done', category_id = ?, category_path = ?, product_attribute_text = ?,
-                    product_attributes_json = ?, record_json = ?, error_message = NULL, updated_at = ?, completed_at = ?
-                WHERE id = ? AND user_id = ?
-                """,
-                (*payload, row["id"], user_id),
-            )
-        else:
-            conn.execute(
-                """
-                INSERT INTO export_product_attribute_jobs (
-                    id, user_id, link_record_id, product_id, product_title, category_id, category_path,
-                    product_attribute_text, product_attributes_json, record_hash, record_json,
-                    status, created_at, updated_at, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'done', ?, ?, ?)
-                """,
-                (
-                    f"attr-{uuid.uuid4().hex}",
-                    user_id,
-                    link_record_id,
-                    clean_text(record.get("productId")),
-                    clean_text(record.get("productTitle")),
-                    clean_text(result.get("category_id")),
-                    clean_text(result.get("category_path")),
-                    clean_text(result.get("product_attribute_text")) or dump_product_attributes(product_attributes),
-                    dump_product_attributes(product_attributes),
-                    record_hash,
-                    json.dumps(record, ensure_ascii=False),
-                    now,
-                    now,
-                    now,
-                ),
-            )
-
-
-def save_product_attribute_failure_for_record(record: dict[str, Any], *, user_id: str, error: str) -> None:
-    now = utc_now_text()
-    link_record_id = record_identity(record)
-    record_hash = hash_attribute_input(record)
-    with get_connection() as conn:
-        ensure_export_product_attribute_schema(conn)
-        row = conn.execute(
-            """
-            SELECT id
-            FROM export_product_attribute_jobs
-            WHERE user_id = ? AND link_record_id = ? AND record_hash = ?
-            ORDER BY updated_at DESC
-            LIMIT 1
-            """,
-            (user_id, link_record_id, record_hash),
-        ).fetchone()
-        if row:
-            conn.execute(
-                """
-                UPDATE export_product_attribute_jobs
-                SET status = 'failed', error_message = ?, record_json = ?, updated_at = ?
-                WHERE id = ? AND user_id = ?
-                """,
-                (clean_text(error)[:1000], json.dumps(record, ensure_ascii=False), now, row["id"], user_id),
-            )
-        else:
-            conn.execute(
-                """
-                INSERT INTO export_product_attribute_jobs (
-                    id, user_id, link_record_id, product_id, product_title, record_hash,
-                    record_json, status, error_message, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'failed', ?, ?, ?)
-                """,
-                (
-                    f"attr-{uuid.uuid4().hex}",
-                    user_id,
-                    link_record_id,
-                    clean_text(record.get("productId")),
-                    clean_text(record.get("productTitle")),
-                    record_hash,
-                    json.dumps(record, ensure_ascii=False),
-                    clean_text(error)[:1000],
-                    now,
-                    now,
-                ),
-            )
-
-
-def mark_job_running(job_id: str, *, user_id: str) -> None:
-    with get_connection() as conn:
-        conn.execute(
-            "UPDATE export_product_attribute_jobs SET status = 'running', updated_at = ? WHERE id = ? AND user_id = ?",
-            (utc_now_text(), job_id, user_id),
-        )
-
-
-def mark_job_done(job_id: str, *, user_id: str, result: dict[str, Any]) -> None:
-    now = utc_now_text()
-    with get_connection() as conn:
-        conn.execute(
-            """
-            UPDATE export_product_attribute_jobs
-            SET status = 'done', category_id = ?, category_path = ?, product_attribute_text = ?,
-                product_attributes_json = ?, error_message = NULL, updated_at = ?, completed_at = ?
-            WHERE id = ? AND user_id = ?
-            """,
-            (
-                clean_text(result.get("category_id")),
-                clean_text(result.get("category_path")),
-                clean_text(result.get("product_attribute_text")),
-                dump_product_attributes(result.get("product_attributes") or []),
-                now,
-                now,
-                job_id,
-                user_id,
-            ),
-        )
-
-
-def mark_job_failed(job_id: str, *, user_id: str, error: str) -> None:
-    with get_connection() as conn:
-        conn.execute(
-            """
-            DELETE FROM export_product_attribute_jobs
-            WHERE id = ? AND user_id = ?
-            """,
-            (job_id, user_id),
-        )
-
-
-def generate_product_attribute_for_record(record: dict[str, Any], *, user_id: str | None = None) -> dict[str, Any]:
-    with get_connection() as conn:
-        category = resolve_category_for_record(conn, record, user_id=user_id)
+        category = resolve_category_for_record(conn, record, user_id=user_id, require_api=require_api)
         if not category:
             raise ValueError("No matching category attribute definition was found for this product")
         fields = load_category_fields(conn, str(category["category_id"]))
@@ -457,6 +215,11 @@ def generate_product_attribute_for_record(record: dict[str, Any], *, user_id: st
             ai_result = request_product_attribute_ai(record, category, fields, user_id=user_id)
         except Exception as exc:
             ai_error = str(exc)
+            if require_api:
+                raise ValueError(f"Product attribute API generation failed: {ai_error}") from exc
+
+    if require_api and not ai_result_has_attributes(ai_result):
+        raise ValueError("Product attribute API did not return product attributes")
 
     product_attributes = generate_complete_product_attributes(record, fields, ai_result)
     if not product_attributes and ai_error:
@@ -469,102 +232,36 @@ def generate_product_attribute_for_record(record: dict[str, Any], *, user_id: st
     }
 
 
-def resolve_category_for_record(conn: Any, record: dict[str, Any], *, user_id: str | None = None) -> dict[str, Any] | None:
+def resolve_category_for_record(
+    conn: Any,
+    record: dict[str, Any],
+    *,
+    user_id: str | None = None,
+    require_api: bool = False,
+) -> dict[str, Any] | None:
     product_context = load_product_context(conn, record)
-    explicit_category_id = first_non_empty(
-        record.get("categoryId"),
-        record.get("category_id"),
-        record.get("temuCategoryId"),
-        record.get("dxmCategoryId"),
+
+    semantic_category = resolve_category_by_ai_vector(
+        conn,
+        record,
+        product_context,
+        user_id=user_id,
+        require_api=require_api,
     )
-    if explicit_category_id:
-        row = conn.execute(
-            """
-            SELECT *
-            FROM dxm_temu_category_attr_snapshots
-            WHERE category_id = ?
-            ORDER BY required_count DESC, attr_count DESC
-            LIMIT 1
-            """,
-            (explicit_category_id,),
-        ).fetchone()
-        if row:
-            return dict(row)
-
-    context_category = resolve_category_by_known_path(conn, record, product_context)
-    if context_category:
-        return context_category
-
-    semantic_category = resolve_category_by_ai_vector(conn, record, product_context, user_id=user_id)
     if semantic_category:
         return semantic_category
-
-    product_id = clean_text(record.get("productId"))
-    if product_id:
-        row = conn.execute(
-            """
-            SELECT snapshot.*
-            FROM product_category_matches match
-            JOIN canonical_categories category
-                ON category.id = match.canonical_category_id
-            JOIN dxm_temu_category_attr_snapshots snapshot
-                ON snapshot.category_id = category.external_category_id
-            WHERE match.product_id = ?
-                AND match.status IN ('auto', 'review')
-                AND category.external_category_id != ''
-            ORDER BY match.match_score DESC, snapshot.required_count DESC, snapshot.attr_count DESC
-            LIMIT 1
-            """,
-            (product_id,),
-        ).fetchone()
-        if row:
-            return dict(row)
-
-    category_path = clean_text(product_context.get("category_path")) or record_category_path(record)
-    title = clean_text(record.get("productTitle"))
-
-    candidate_paths = [category_path]
-    if category_path:
-        candidate_paths.extend(split_search_terms(category_path))
-    candidate_paths.extend([clean_text(product_context.get("category_level2")), clean_text(product_context.get("category_level1"))])
-
-    for value in unique_strings(candidate_paths):
-        row = conn.execute(
-            """
-            SELECT *
-            FROM dxm_temu_category_attr_snapshots
-            WHERE category_path_text = ? OR leaf_name = ? OR category_path_text LIKE ?
-            ORDER BY required_count DESC, attr_count DESC
-            LIMIT 1
-            """,
-            (value, value, f"%{value}%"),
-        ).fetchone()
-        if row:
-            return dict(row)
-
-    title_terms = [term for term in split_search_terms(title) if len(term) >= 2][:8]
-    for term in title_terms:
-        row = conn.execute(
-            """
-            SELECT *
-            FROM dxm_temu_category_attr_snapshots
-            WHERE leaf_name LIKE ? OR category_path_text LIKE ?
-            ORDER BY required_count DESC, attr_count DESC
-            LIMIT 1
-            """,
-            (f"%{term}%", f"%{term}%"),
-        ).fetchone()
-        if row:
-            return dict(row)
     return None
 
 
 def resolve_category_by_known_path(conn: Any, record: dict[str, Any], product_context: dict[str, Any]) -> dict[str, Any] | None:
-    category_path = record_category_path(record) or clean_text(product_context.get("category_path"))
+    category_path = record_category_path(record) or trusted_category_hint(product_context.get("category_path"))
     candidate_paths = [category_path]
     if category_path:
         candidate_paths.extend(split_search_terms(category_path))
-    candidate_paths.extend([clean_text(product_context.get("category_level2")), clean_text(product_context.get("category_level1"))])
+    candidate_paths.extend([
+        trusted_category_hint(product_context.get("category_level2")),
+        trusted_category_hint(product_context.get("category_level1")),
+    ])
 
     for value in unique_strings(candidate_paths):
         row = conn.execute(
@@ -595,11 +292,25 @@ def resolve_category_by_ai_vector(
     product_context: dict[str, Any],
     *,
     user_id: str | None = None,
+    require_api: bool = False,
 ) -> dict[str, Any] | None:
-    categories = load_canonical_categories_for_attribute_match(conn)
+    categories = load_category_snapshots_for_attribute_match(conn)
     leaves = [category for category in categories if clean_text(category.get("external_category_id")) and int(category.get("attr_count") or 0) > 0]
     if not leaves:
         return None
+
+    if require_api:
+        if not is_product_attribute_ai_configured(user_id=user_id):
+            raise ValueError("Product attribute API is not configured")
+        fallback_intent = build_category_intent(record, product_context, use_ai=False, user_id=user_id)
+        ai_result = request_category_intent_ai(record, product_context, user_id=user_id)
+        if not isinstance(ai_result, dict) or not ai_result:
+            raise ValueError("Category intent API did not return usable category signals")
+        intent = merge_category_intent(fallback_intent, ai_result)
+        leaf = resolve_category_leaf_by_vector(record, product_context, leaves, intent, allow_ai_final=True, user_id=user_id)
+        if leaf:
+            return load_snapshot_for_category_leaf(conn, leaf)
+        raise ValueError("Category intent API did not match a category")
 
     intent = build_category_intent(record, product_context, use_ai=False, user_id=user_id)
     leaf = resolve_category_leaf_by_vector(record, product_context, leaves, intent, allow_ai_final=False, user_id=user_id)
@@ -615,6 +326,10 @@ def resolve_category_by_ai_vector(
     if leaf:
         return load_snapshot_for_category_leaf(conn, leaf)
     return None
+
+
+def merge_category_intent(fallback: dict[str, Any], ai_result: dict[str, Any]) -> dict[str, Any]:
+    return {**fallback, **{key: value for key, value in ai_result.items() if value not in (None, "", [])}}
 
 
 def resolve_category_leaf_by_vector(
@@ -657,19 +372,15 @@ def resolve_category_leaf_by_vector(
     return current_leaves[0] if current_leaves else None
 
 
-def load_canonical_categories_for_attribute_match(conn: Any) -> list[dict[str, Any]]:
-    cache_key = category_vector_cache_key(conn)
-    if cache_key in _CATEGORY_VECTOR_CACHE:
-        return _CATEGORY_VECTOR_CACHE[cache_key]
+def load_category_snapshots_for_attribute_match(conn: Any) -> list[dict[str, Any]]:
     try:
-        sync_canonical_categories_from_dxm(conn)
         rows = conn.execute(
             """
-            SELECT id, external_category_id, parent_id, level, name, path_text, path_parts_json,
-                   embedding_text, embedding_json, attr_count, required_count
-            FROM canonical_categories
-            WHERE provider = 'dxm_temu' AND status = 'active'
-            ORDER BY level ASC, path_text ASC
+            SELECT category_id, category_path_text, category_path_json, leaf_name,
+                   category_depth, attr_count, required_count
+            FROM dxm_temu_category_attr_snapshots
+            WHERE category_id != '' AND attr_count > 0
+            ORDER BY category_depth ASC, category_path_text ASC
             """
         ).fetchall()
     except Exception:
@@ -678,43 +389,29 @@ def load_canonical_categories_for_attribute_match(conn: Any) -> list[dict[str, A
     categories: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
-        parts = parse_jsonish(item.get("path_parts_json"), [])
+        parts = parse_jsonish(item.get("category_path_json"), [])
         if not isinstance(parts, list):
-            parts = category_path_parts(item.get("path_text"))
+            parts = category_path_parts(item.get("category_path_text"))
         parts = [clean_text(part) for part in parts if clean_text(part)]
-        vector = parse_jsonish(item.get("embedding_json"), {})
-        if not isinstance(vector, dict) or not vector:
-            vector = build_text_vector(item.get("embedding_text") or item.get("path_text"))
+        path_text = normalize_category_path_for_match(item.get("category_path_text"))
+        vector = build_text_vector(path_text)
         categories.append(
             {
-                "id": clean_text(item.get("id")),
-                "external_category_id": clean_text(item.get("external_category_id")),
-                "parent_id": clean_text(item.get("parent_id")),
-                "level": int_or_zero(item.get("level")) or len(parts),
-                "name": clean_text(item.get("name")) or (parts[-1] if parts else ""),
-                "path_text": normalize_category_path_for_match(item.get("path_text")),
+                "id": clean_text(item.get("category_id")),
+                "external_category_id": clean_text(item.get("category_id")),
+                "parent_id": "",
+                "level": int_or_zero(item.get("category_depth")) or len(parts),
+                "name": clean_text(item.get("leaf_name")) or (parts[-1] if parts else ""),
+                "path_text": path_text,
                 "path_parts": parts,
                 "vector": {str(key): float(value) for key, value in vector.items() if str(key)},
-                "path_terms": set(build_text_vector(item.get("path_text")).keys()),
-                "path_key": normalize_choice_text(item.get("path_text")),
+                "path_terms": set(vector.keys()),
+                "path_key": normalize_choice_text(path_text),
                 "attr_count": int_or_zero(item.get("attr_count")),
                 "required_count": int_or_zero(item.get("required_count")),
             }
         )
-    _CATEGORY_VECTOR_CACHE[cache_key] = categories
     return categories
-
-
-def category_vector_cache_key(conn: Any) -> str:
-    try:
-        rows = conn.execute("PRAGMA database_list").fetchall()
-        for row in rows:
-            values = tuple(row)
-            if len(values) >= 3 and clean_text(values[1]) == "main" and clean_text(values[2]):
-                return clean_text(values[2])
-    except Exception:
-        pass
-    return f"connection:{id(conn)}"
 
 
 def build_category_intent(
@@ -727,12 +424,7 @@ def build_category_intent(
     fallback = {
         "product_type": clean_text(record.get("productTitle")),
         "core_keywords": split_search_terms(category_query_text(record, product_context, {}))[:12],
-        "category_hints": unique_strings([
-            record_category_path(record),
-            clean_text(product_context.get("category_path")),
-            clean_text(product_context.get("category_level1")),
-            clean_text(product_context.get("category_level2")),
-        ]),
+        "category_hints": [],
     }
     if not use_ai or not is_product_attribute_ai_configured(user_id=user_id):
         return fallback
@@ -769,16 +461,17 @@ def request_category_intent_ai(
             "title_en": clean_text(record.get("productTitleEn")),
             "sku_names": sku_names_for_prompt(record)[:20],
             "source_titles": [clean_text(source.get("title")) for source in record.get("sourceLinks") or [] if isinstance(source, dict)],
-            "known_category_path": first_non_empty(record_category_path(record), product_context.get("category_path")),
+            "reference_images": category_reference_images_for_prompt(record),
         },
     }
     assert_user_api_usage_allowed(user_id)
     try:
-        result = request_text_json(
-            api_url=build_api_url(settings["base_url"]),
+        result = request_category_json(
+            api_url=build_api_url(settings["base_url"], "/chat/completions"),
             api_key=settings["api_key"],
             model=settings["model"],
             instruction=json.dumps(instruction, ensure_ascii=False),
+            image_refs=category_reference_image_urls(record),
             temperature=0.05,
         )
         record_product_attribute_usage(settings, user_id=user_id, status="success")
@@ -788,14 +481,166 @@ def request_category_intent_ai(
         raise
 
 
+def request_category_json(
+    *,
+    api_url: str,
+    api_key: str,
+    model: str,
+    instruction: str,
+    image_refs: list[str],
+    temperature: float,
+) -> dict[str, Any]:
+    clean_images = unique_strings([url for url in image_refs if is_image_reference_url(url)])[:MAX_CATEGORY_REFERENCE_IMAGES]
+    if not clean_images:
+        return request_text_json(
+            api_url=api_url,
+            api_key=api_key,
+            model=model,
+            instruction=instruction,
+            temperature=temperature,
+        )
+
+    payload = build_category_multimodal_payload(
+        api_url=api_url,
+        model=model,
+        instruction=instruction,
+        image_refs=clean_images,
+        temperature=temperature,
+    )
+    try:
+        response_json = request_json(api_url, api_key, payload)
+        return parse_json_from_text(extract_response_text(response_json))
+    except Exception:
+        return request_text_json(
+            api_url=api_url,
+            api_key=api_key,
+            model=model,
+            instruction=instruction,
+            temperature=temperature,
+        )
+
+
+def build_category_multimodal_payload(
+    *,
+    api_url: str,
+    model: str,
+    instruction: str,
+    image_refs: list[str],
+    temperature: float,
+) -> dict[str, Any]:
+    if api_url.rstrip("/").endswith("/chat/completions"):
+        content: list[dict[str, Any]] = [{"type": "text", "text": instruction}]
+        content.extend({"type": "image_url", "image_url": {"url": url}} for url in image_refs)
+        return {
+            "model": model,
+            "messages": [{"role": "user", "content": content}],
+            "temperature": temperature,
+        }
+
+    content = [{"type": "input_text", "text": instruction}]
+    content.extend({"type": "input_image", "image_url": url} for url in image_refs)
+    return {
+        "model": model,
+        "input": [{"role": "user", "content": content}],
+        "temperature": temperature,
+    }
+
+
+def category_reference_images_for_prompt(record: dict[str, Any]) -> list[dict[str, str]]:
+    return [
+        {"role": role, "url": url}
+        for role, url in iter_category_reference_images(record)
+    ][:MAX_CATEGORY_REFERENCE_IMAGES]
+
+
+def category_reference_image_urls(record: dict[str, Any]) -> list[str]:
+    return [url for _role, url in iter_category_reference_images(record)][:MAX_CATEGORY_REFERENCE_IMAGES]
+
+
+def iter_category_reference_images(record: dict[str, Any]) -> list[tuple[str, str]]:
+    references: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def add(role: str, value: Any) -> None:
+        url = clean_text(value)
+        if not is_image_reference_url(url) or url in seen:
+            return
+        references.append((role, url))
+        seen.add(url)
+
+    add("main_image", pick_image_asset_url(record.get("mainImage")))
+    for key in ("productImageUrl", "mainImageUrl", "main_image_url", "imageUrl", "image_url", "thumbnailUrl"):
+        add("main_image", record.get(key))
+
+    for url in parse_image_url_list(record.get("galleryImageUrls") or record.get("gallery_image_urls")):
+        add("gallery_image", url)
+
+    for asset in record.get("productMaterialImages") or []:
+        if isinstance(asset, dict):
+            add("material_image", pick_image_asset_url(asset))
+        else:
+            add("material_image", asset)
+
+    for source in record.get("sourceLinks") or []:
+        if not isinstance(source, dict):
+            continue
+        for key in ("imageUrl", "image_url", "mainImageUrl", "main_image_url", "sourceImageUrl", "source_image_url"):
+            add("source_image", source.get(key))
+
+    for sku_entry in record.get("skuEntries") or []:
+        if not isinstance(sku_entry, dict):
+            continue
+        add("sku_image", pick_image_asset_url(sku_entry.get("imageAsset")))
+        for key in ("imageUrl", "image_url", "sourceImageUrl", "source_image_url"):
+            add("sku_image", sku_entry.get(key))
+        for source_sku in sku_entry.get("sourceSkuLinks") or []:
+            if isinstance(source_sku, dict):
+                add("sku_source_image", source_sku.get("imageUrl") or source_sku.get("sourceImageUrl"))
+        for component in sku_entry.get("componentSkus") or []:
+            if isinstance(component, dict):
+                add("combo_component_image", component.get("imageUrl") or component.get("sourceImageUrl"))
+
+    return references[:MAX_CATEGORY_REFERENCE_IMAGES]
+
+
+def pick_image_asset_url(asset: Any) -> str:
+    if isinstance(asset, str):
+        return asset
+    if not isinstance(asset, dict):
+        return ""
+    return first_non_empty(
+        asset.get("editedCloudUrl"),
+        asset.get("editedUrl"),
+        asset.get("displayCloudUrl"),
+        asset.get("displayUrl"),
+        asset.get("sourceCloudUrl"),
+        asset.get("sourceUrl"),
+        asset.get("url"),
+        asset.get("imageUrl"),
+    )
+
+
+def parse_image_url_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [clean_text(item.get("url") if isinstance(item, dict) else item) for item in value]
+    parsed = parse_jsonish(value, None)
+    if isinstance(parsed, list):
+        return [clean_text(item.get("url") if isinstance(item, dict) else item) for item in parsed]
+    text = clean_text(value)
+    if not text:
+        return []
+    return [part for part in re.split(r"[\n,;\s]+", text) if clean_text(part)]
+
+
+def is_image_reference_url(value: Any) -> bool:
+    text = clean_text(value).lower()
+    return text.startswith(("http://", "https://", "data:image/"))
+
+
 def category_query_text(record: dict[str, Any], product_context: dict[str, Any], intent: dict[str, Any]) -> str:
     parts = [
         clean_text(record.get("productTitle")),
         clean_text(record.get("productTitleEn")),
-        record_category_path(record),
-        clean_text(product_context.get("category_path")),
-        clean_text(product_context.get("category_level1")),
-        clean_text(product_context.get("category_level2")),
         clean_text(intent.get("product_type")),
     ]
     for key in ("core_keywords", "materials", "use_scenes", "audience", "category_hints"):
@@ -973,17 +818,19 @@ def request_category_branch_ai(
             "title_en": clean_text(record.get("productTitleEn")),
             "sku_names": sku_names_for_prompt(record)[:20],
             "intent": intent,
+            "reference_images": category_reference_images_for_prompt(record),
         },
         "current_category_path": current_path,
         "candidates": payload_candidates,
     }
     assert_user_api_usage_allowed(user_id)
     try:
-        result = request_text_json(
-            api_url=build_api_url(settings["base_url"]),
+        result = request_category_json(
+            api_url=build_api_url(settings["base_url"], "/chat/completions"),
             api_key=settings["api_key"],
             model=settings["model"],
             instruction=json.dumps(instruction, ensure_ascii=False),
+            image_refs=category_reference_image_urls(record),
             temperature=0.05,
         )
         record_product_attribute_usage(settings, user_id=user_id, status="success")
@@ -1048,6 +895,34 @@ def normalize_category_path_for_match(value: Any) -> str:
     return "/".join(category_path_parts(value))
 
 
+def trusted_category_hint(value: Any) -> str:
+    text = clean_text(value)
+    if not text or is_noisy_source_category_path(text):
+        return ""
+    return text
+
+
+def is_noisy_source_category_path(value: Any) -> bool:
+    text = clean_text(value)
+    if not text:
+        return False
+    lowered = text.lower().replace("\\", "/")
+    if "company_info" in lowered or lowered.endswith("/categories") or "/categories/" in lowered:
+        return True
+    parts = category_path_parts(text)
+    if any("..." in part for part in parts):
+        return True
+    normalized_parts = {normalize_choice_text(part) for part in parts}
+    return bool(normalized_parts & NOISY_CATEGORY_PATH_SEGMENTS)
+
+
+def sanitize_product_context_category_hints(context: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(context)
+    for key in ("category_path", "category_level1", "category_level2"):
+        sanitized[key] = trusted_category_hint(sanitized.get(key))
+    return sanitized
+
+
 def load_product_context(conn: Any, record: dict[str, Any]) -> dict[str, Any]:
     product_id = clean_text(record.get("productId"))
     product_title = clean_text(record.get("productTitle"))
@@ -1065,7 +940,7 @@ def load_product_context(conn: Any, record: dict[str, Any]) -> dict[str, Any]:
                     (product_id, product_id),
                 ).fetchone()
                 if row:
-                    return dict(row)
+                    return sanitize_product_context_category_hints(dict(row))
             if source_urls:
                 placeholders = ",".join("?" for _ in source_urls)
                 row = conn.execute(
@@ -1078,7 +953,7 @@ def load_product_context(conn: Any, record: dict[str, Any]) -> dict[str, Any]:
                     source_urls,
                 ).fetchone()
                 if row:
-                    return dict(row)
+                    return sanitize_product_context_category_hints(dict(row))
             if product_title:
                 row = conn.execute(
                     f"""
@@ -1090,7 +965,7 @@ def load_product_context(conn: Any, record: dict[str, Any]) -> dict[str, Any]:
                     (product_title, product_title, f"%{product_title[:32]}%", f"%{product_title[:32]}%"),
                 ).fetchone()
                 if row:
-                    return dict(row)
+                    return sanitize_product_context_category_hints(dict(row))
         except Exception:
             continue
     return record_category_context(record)
@@ -1160,7 +1035,14 @@ def request_product_attribute_ai(
 
     instruction = {
         "role": "You are a Dianxiaomi TEMU semi-managed product attribute assistant. Return JSON only, no explanations.",
-        "task": "Use the product title, SKU names, category path, and candidate attribute fields to fill every visible product attribute field. For select fields, use exactly one provided option label and return its vid. For checkbox-group fields, choose at least one provided option. If the exact value cannot be confidently inferred, choose the safest generic/neutral option from the provided options, such as no/none/not applicable/generic/other. Do not leave fields blank. Do not invent certifications, brands, medical claims, safety claims, waterproof claims, or unverifiable sensitive attributes.",
+        "task": "Use the product title, SKU names, category path, and candidate attribute fields to fill visible product attribute fields. For select fields, use exactly one provided option label and return its vid. For checkbox-group fields, choose provided options only when clearly applicable. If a safe parent yes/no field is present for batteries, electricity, fuel, or liquid, prefer no/none/not applicable unless the product is explicitly such an item. Do not invent certifications, brands, medical claims, safety claims, waterproof claims, or unverifiable sensitive attributes.",
+        "red_line_rules": [
+            "Do not output child attributes for electricity or plug products unless the product is explicitly electric: working voltage, plug specification, plug type, power voltage.",
+            "Do not output child attributes for batteries unless the product explicitly includes a battery: rechargeable battery, solar battery, battery type, lithium battery.",
+            "Do not output child attributes for fuel, lighter, or liquid unless the product itself is explicitly fuel/liquid. If the product merely says liquid food, wet food, or liquid feeding bowl, it is not a liquid product.",
+            "When a parent field says no battery, no power, no fuel, no liquid, not applicable, or without, do not output the related child fields.",
+            "For red-line parent fields, use objective negative options such as no, none, without, not applicable when the title/SKU/images do not prove the red-line property.",
+        ],
         "output_schema": {
             "attributes": [
                 {
@@ -1176,8 +1058,13 @@ def request_product_attribute_ai(
         "product": {
             "title": clean_text(record.get("productTitle")),
             "title_en": clean_text(record.get("productTitleEn")),
+            "final_export_title_cn": clean_text(record.get("attributeTitle") or record.get("productTitle")),
+            "final_export_title_en": clean_text(record.get("attributeTitleEn") or record.get("productTitleEn")),
+            "source_original_title_cn": clean_text(record.get("originalProductTitle")),
+            "source_original_title_en": clean_text(record.get("originalProductTitleEn")),
             "sku_names": sku_names_for_prompt(record),
             "source_titles": [clean_text(source.get("title")) for source in record.get("sourceLinks") or [] if isinstance(source, dict)],
+            "reference_images": category_reference_images_for_prompt(record),
         },
         "category": {
             "category_id": category.get("category_id"),
@@ -1187,11 +1074,12 @@ def request_product_attribute_ai(
     }
     assert_user_api_usage_allowed(user_id)
     try:
-        result = request_text_json(
+        result = request_category_json(
             api_url=api_url,
             api_key=settings["api_key"],
             model=settings["model"],
             instruction=json.dumps(instruction, ensure_ascii=False),
+            image_refs=category_reference_image_urls(record),
             temperature=0.15,
         )
         record_product_attribute_usage(settings, user_id=user_id, status="success")
@@ -1228,6 +1116,8 @@ def normalize_product_attributes(ai_result: dict[str, Any], fields: list[dict[st
     normalized: list[dict[str, Any]] = []
     selected: list[dict[str, Any]] = []
     for field in fields:
+        if should_skip_red_line_field(field, selected):
+            continue
         label = clean_text(field.get("field_label"))
         item = decisions.get(label) or decisions.get(clean_text(field.get("field_key")))
         if not item:
@@ -1255,6 +1145,8 @@ def generate_complete_product_attributes(
     for field in fields:
         if not field_conditions_match(field, selected):
             continue
+        if should_skip_red_line_field(field, selected):
+            continue
         label = clean_text(field.get("field_label"))
         item = decisions.get(label) or decisions.get(clean_text(field.get("field_key")))
         field_items: list[dict[str, Any]] = []
@@ -1278,6 +1170,8 @@ def generate_rule_based_product_attributes(record: dict[str, Any], fields: list[
             continue
         if not field_conditions_match(field, selected):
             continue
+        if should_skip_red_line_field(field, selected):
+            continue
         component = clean_text(field.get("component"))
         if component not in CHOICE_COMPONENTS:
             continue
@@ -1290,11 +1184,68 @@ def generate_rule_based_product_attributes(record: dict[str, Any], fields: list[
     return normalized
 
 
+def should_skip_red_line_field(field: dict[str, Any], selected: list[dict[str, Any]]) -> bool:
+    if not is_red_line_child_field(field):
+        return False
+    if selected_has_negative_red_line_parent(selected):
+        return True
+    return True
+
+
+def is_red_line_child_field(field: dict[str, Any]) -> bool:
+    label_key = normalize_choice_text(field.get("field_label"))
+    if not label_key:
+        return False
+    if any(normalize_choice_text(token) in label_key for token in RED_LINE_CHILD_FIELD_TOKENS):
+        return True
+    if "\u7535\u6c60" in label_key and not is_red_line_parent_field(field):
+        return True
+    if "\u71c3\u6599" in label_key and not is_red_line_parent_field(field):
+        return True
+    if "\u6db2\u4f53" in label_key and not is_red_line_parent_field(field):
+        return True
+    return False
+
+
+def is_red_line_parent_field(field_or_item: dict[str, Any]) -> bool:
+    label = field_or_item.get("field_label") or field_or_item.get("propName") or field_or_item.get("name")
+    label_key = normalize_choice_text(label)
+    return any(normalize_choice_text(token) in label_key for token in RED_LINE_PARENT_FIELD_TOKENS)
+
+
+def selected_has_negative_red_line_parent(selected: list[dict[str, Any]]) -> bool:
+    for item in selected:
+        if not is_red_line_parent_field(item):
+            continue
+        value_key = normalize_choice_text(item.get("propValue") or item.get("prop_value") or item.get("value"))
+        if any(normalize_choice_text(token) in value_key for token in RED_LINE_NEGATIVE_VALUE_TOKENS):
+            return True
+    return False
+
+
+def red_line_negative_option_candidates() -> list[str]:
+    return [
+        "\u5426",
+        "\u65e0",
+        "\u65e0\u7535\u6c60",
+        "\u4e0d\u5e26\u7535",
+        "\u4e0d\u542b",
+        "\u65e0\u9700\u63a5\u7535\u4f7f\u7528",
+        "\u4e0d\u9002\u7528",
+        "No",
+        "None",
+        "Without",
+        "Not Applicable",
+    ]
+
+
 def generate_default_attribute_for_field(
     field: dict[str, Any],
     selected: list[dict[str, Any]],
     product_text: str,
 ) -> list[dict[str, Any]]:
+    if should_skip_red_line_field(field, selected):
+        return []
     component = clean_text(field.get("component"))
     if component in CHOICE_COMPONENTS or field.get("options"):
         allowed_vids = allowed_option_vids_for_field(field, selected)
@@ -1677,6 +1628,8 @@ def pick_rule_based_option(
                     return option
 
     candidate_groups: list[list[str]] = []
+    if is_red_line_parent_field(field):
+        candidate_groups.append(red_line_negative_option_candidates())
     if any(token in label_key for token in ("品牌", "brand")):
         candidate_groups.append(["无品牌", "没有品牌", "No Brand", "Unbranded", "Generic", "通用", "其他", "其它"])
     if "类型" in label_key:
@@ -1737,6 +1690,8 @@ def default_choice_option(
 
     label_key = normalize_choice_text(field.get("field_label"))
     candidate_groups: list[list[str]] = []
+    if is_red_line_parent_field(field):
+        candidate_groups.append(red_line_negative_option_candidates())
     if any(token in label_key for token in ("品牌", "brand")):
         candidate_groups.append(["无品牌", "没有品牌", "No Brand", "Unbranded", "Generic", "通用", "其他", "其它"])
     if any(token in label_key for token in ("是否", "有无", "is", "has", "with")):
@@ -1819,8 +1774,14 @@ def product_context_text(record: dict[str, Any]) -> str:
 
 def record_category_context(record: dict[str, Any]) -> dict[str, Any]:
     category_path = record_category_path(record)
-    category_level1 = first_non_empty(record.get("categoryLevel1"), record.get("category_level1"))
-    category_level2 = first_non_empty(record.get("categoryLevel2"), record.get("category_level2"))
+    category_level1 = first_non_empty(
+        trusted_category_hint(record.get("categoryLevel1")),
+        trusted_category_hint(record.get("category_level1")),
+    )
+    category_level2 = first_non_empty(
+        trusted_category_hint(record.get("categoryLevel2")),
+        trusted_category_hint(record.get("category_level2")),
+    )
     if not any((category_path, category_level1, category_level2)):
         return {}
     return {
@@ -1834,7 +1795,13 @@ def record_category_context(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def record_category_path(record: dict[str, Any]) -> str:
-    return first_non_empty(record.get("categoryPath"), record.get("category_path"), record.get("category"))
+    return first_non_empty(
+        trusted_category_hint(record.get("dxmCategoryPath")),
+        trusted_category_hint(record.get("dianxiaomiCategoryPath")),
+        trusted_category_hint(record.get("categoryPath")),
+        trusted_category_hint(record.get("category_path")),
+        trusted_category_hint(record.get("category")),
+    )
 
 
 def record_source_urls(record: dict[str, Any]) -> list[str]:
@@ -1863,8 +1830,6 @@ def hash_attribute_input(record: dict[str, Any]) -> str:
         "productId": clean_text(record.get("productId")),
         "productTitle": clean_text(record.get("productTitle")),
         "productTitleEn": clean_text(record.get("productTitleEn")),
-        "categoryId": first_non_empty(record.get("categoryId"), record.get("category_id"), record.get("temuCategoryId"), record.get("dxmCategoryId")),
-        "categoryPath": record_category_path(record),
         "skuNames": sku_names_for_prompt(record),
         "sourceTitles": [clean_text(source.get("title")) for source in record.get("sourceLinks") or [] if isinstance(source, dict)],
     }

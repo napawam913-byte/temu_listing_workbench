@@ -25,7 +25,8 @@ except Exception:  # pragma: no cover - optional runtime dependency guard
     ImageOps = None
 
 
-DEFAULT_OPENAI_BASE_URL = "https://svip.fluapi.com/v1"
+DEFAULT_OPENAI_BASE_URL = "https://api.aicoming.top/v1"
+DEFAULT_IMAGE_GENERATION_TIMEOUT_SECONDS = 900
 REQUEST_TOO_LARGE_MARKERS = (
     "HTTP 413",
     "message_length_exceeds_limit",
@@ -124,7 +125,7 @@ def get_ai_settings(user_id: str | None = None) -> dict[str, str]:
         ),
         "base_url": base_url or DEFAULT_OPENAI_BASE_URL,
         "text_model": get_runtime_setting("OPENAI_TEXT_MODEL", app_config.OPENAI_TEXT_MODEL).strip() or "gpt-5.5",
-        "image_model": get_runtime_setting("OPENAI_IMAGE_MODEL", app_config.OPENAI_IMAGE_MODEL).strip() or "gpt-image-2",
+        "image_model": get_runtime_setting("OPENAI_IMAGE_MODEL", app_config.OPENAI_IMAGE_MODEL).strip() or "gpt-image-2-1k",
         "image_quality": get_runtime_setting("OPENAI_IMAGE_QUALITY", app_config.OPENAI_IMAGE_QUALITY).strip() or "medium",
         "channel_id": (
             str(user_credential.get("channelId") or "")
@@ -182,6 +183,18 @@ def build_api_url(base_url: str, path: str) -> str:
     clean_base = str(base_url or DEFAULT_OPENAI_BASE_URL).strip().rstrip("/")
     clean_path = "/" + str(path or "").strip().lstrip("/")
     return clean_base + clean_path
+
+
+def image_generation_timeout_seconds() -> int:
+    raw_value = get_runtime_setting(
+        "VISUAL_IMAGE_REQUEST_TIMEOUT_SECONDS",
+        str(DEFAULT_IMAGE_GENERATION_TIMEOUT_SECONDS),
+    )
+    try:
+        value = int(str(raw_value or "").strip())
+    except ValueError:
+        return DEFAULT_IMAGE_GENERATION_TIMEOUT_SECONDS
+    return min(max(value, 60), 1800)
 
 
 def request_json(api_url: str, api_key: str, payload: dict[str, Any], *, timeout: int = 300) -> dict[str, Any]:
@@ -547,6 +560,7 @@ def request_generated_image(
     reference_image_quality: int = 86,
 ) -> bytes:
     normalized_api_url = api_url.rstrip("/")
+    request_timeout = image_generation_timeout_seconds()
     if normalized_api_url.endswith("/chat/completions"):
         raise VisualGenerationError("image generation API cannot use /chat/completions")
 
@@ -571,7 +585,7 @@ def request_generated_image(
             "input": [{"role": "user", "content": content}],
             "tools": [{"type": "image_generation"}],
         }
-        response_json = request_json(api_url, api_key, payload)
+        response_json = request_json(api_url, api_key, payload, timeout=request_timeout)
     elif normalized_api_url.endswith("/images/edits"):
         resolved_reference_paths = [path for path in (reference_image_paths or []) if path and path.exists()]
         if not resolved_reference_paths and reference_image_path and reference_image_path.exists():
@@ -590,12 +604,12 @@ def request_generated_image(
                 quality=reference_image_quality,
             )
             files.append((image_field_name, f"reference_{index}_{filename}", content_type, data))
-        response_json = request_multipart(api_url, api_key, fields=fields, files=files)
+        response_json = request_multipart(api_url, api_key, fields=fields, files=files, timeout=request_timeout)
     else:
         payload = {"model": model, "prompt": prompt, "n": 1}
         if size:
             payload["size"] = size
-        response_json = request_json(api_url, api_key, payload)
+        response_json = request_json(api_url, api_key, payload, timeout=request_timeout)
 
     b64_value = find_first_key(response_json, {"b64_json", "base64", "image_base64", "result"})
     image_bytes = decode_base64_image(b64_value)

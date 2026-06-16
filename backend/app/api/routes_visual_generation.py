@@ -18,7 +18,6 @@ from app.modules.visual_generation.service import (
     get_visual_task_status_summary,
     list_visual_tasks,
     plan_visual_task,
-    run_visual_task_pipeline,
     split_mother_image_stateless,
     split_visual_task,
     update_task_status,
@@ -33,7 +32,7 @@ from app.modules.visual_generation.queue import (
     visual_queue_length,
     visual_retry_queue_length,
 )
-from app.modules.visual_generation.worker import run_visual_queue_drain
+from app.modules.visual_generation.worker import run_visual_job, run_visual_queue_drain
 from app.modules.visual_generation.splitter import GridSplitError
 
 router = APIRouter(prefix="/api/visual", tags=["visual-generation"])
@@ -213,13 +212,16 @@ def run_task(
 ):
     user_id = str(current_user["id"])
     try:
-        task = get_visual_task(task_id=task_id, user_id=user_id)
+        get_visual_task(task_id=task_id, user_id=user_id)
     except VisualTaskError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    waiting_for_concurrency = False
+    queue_message = "任务已加入生图队列，将按成员并发设置自动执行。"
     try:
         assert_visual_concurrency_available(user_id, exclude_task_id=task_id)
     except VisualTaskError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        waiting_for_concurrency = True
+        queue_message = f"{exc}；任务已进入等待队列，有空位后会自动执行。"
 
     reference_image_refs = [visual_ref_to_dict(item) for item in payload.referenceImageRefs or []]
     run_payload = {
@@ -244,23 +246,17 @@ def run_task(
         queue_backend = "redis"
     else:
         background_tasks.add_task(
-            run_visual_task_pipeline,
-            task_id=task_id,
-            user_id=user_id,
-            source_image_ref=payload.sourceImageRef,
-            reference_image_refs=reference_image_refs,
-            allow_short_labels=payload.allowShortLabels,
-            analysis_model=payload.analysisModel,
-            prompt_model=payload.promptModel,
-            split_after=run_payload["splitAfter"],
-            upload_to_oss=run_payload["uploadToOss"],
-            image_model=payload.imageModel,
-            image_size=payload.imageSize,
-            use_reference_image=run_payload["useReferenceImage"],
-            apply_to_link_record=run_payload["applyToLinkRecord"],
+            run_visual_job,
+            run_payload,
         )
         queue_backend = "background"
-    return {"item": get_visual_task(task_id=task_id, user_id=user_id), "queued": True, "queueBackend": queue_backend}
+    return {
+        "item": get_visual_task(task_id=task_id, user_id=user_id),
+        "queued": True,
+        "queueBackend": queue_backend,
+        "waitingForConcurrency": waiting_for_concurrency,
+        "message": queue_message,
+    }
 
 
 @router.post("/tasks/{task_id}/split")

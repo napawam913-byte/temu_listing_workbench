@@ -2,19 +2,25 @@ import json
 import os
 import sqlite3
 import unittest
+from unittest.mock import patch
 
 os.environ["OPENAI_API_KEY"] = ""
 
 from app.modules.exports.product_attributes import (
-    delete_failed_product_attribute_jobs,
     generate_complete_product_attributes,
+    generate_product_attribute_for_record,
+    get_product_attribute_for_export_record,
+    get_product_attribute_queue_summary,
     get_product_attribute_queue_summary_for_records,
     hash_attribute_input,
     load_product_context,
     normalize_product_attributes,
+    prepare_product_attribute_jobs,
+    request_category_branch_ai,
+    request_category_intent_ai,
+    request_product_attribute_ai,
     resolve_category_for_record,
 )
-from app.core.database import ensure_export_product_attribute_schema
 
 
 def choice_field(
@@ -307,100 +313,76 @@ class ProductAttributesTest(unittest.TestCase):
         self.assertEqual([item["propValue"] for item in result], ["B", "B1"])
         self.assertEqual([item["vid"] for item in result], ["2", "22"])
 
-    def test_attribute_hash_changes_when_category_changes(self):
+    def test_complete_attributes_skip_red_line_battery_and_plug_child_fields(self):
+        fields = [
+            choice_field(
+                "\u662f\u5426\u5e26\u7535\u6c60",
+                pid=1427,
+                template_pid=525339,
+                ref_pid=1563,
+                options=[option("36639", "\u662f"), option("36640", "\u5426")],
+            ),
+            choice_field(
+                "\u53ef\u5145\u7535\u7535\u6c60",
+                pid=1535,
+                template_pid=958335,
+                ref_pid=2147,
+                options=[option("52045", "\u9502\u7cfb\u7535\u6c60")],
+            ),
+            choice_field(
+                "\u5de5\u4f5c\u7535\u538b",
+                pid=1155,
+                template_pid=1378401,
+                ref_pid=1132,
+                options=[option("28317", "36V\u53ca\u4ee5\u4e0b")],
+            ),
+            choice_field(
+                "\u63d2\u5934\u89c4\u683c",
+                pid=1404,
+                template_pid=1378402,
+                ref_pid=1485,
+                options=[option("36261", "\u7f8e\u89c4")],
+            ),
+        ]
+
+        result = generate_complete_product_attributes(
+            {"productTitle": "\u5ba0\u7269\u7845\u80f6\u9910\u57ab \u4e0d\u5e26\u7535"},
+            fields,
+            {
+                "attributes": [
+                    {"field_label": "\u662f\u5426\u5e26\u7535\u6c60", "prop_value": "\u5426"},
+                    {"field_label": "\u53ef\u5145\u7535\u7535\u6c60", "prop_value": "\u9502\u7cfb\u7535\u6c60"},
+                    {"field_label": "\u5de5\u4f5c\u7535\u538b", "prop_value": "36V\u53ca\u4ee5\u4e0b"},
+                    {"field_label": "\u63d2\u5934\u89c4\u683c", "prop_value": "\u7f8e\u89c4"},
+                ]
+            },
+        )
+
+        self.assertEqual([item["propName"] for item in result], ["\u662f\u5426\u5e26\u7535\u6c60"])
+        self.assertEqual(result[0]["propValue"], "\u5426")
+
+    def test_attribute_hash_ignores_scraped_category_fields(self):
         base = {"productId": "p1", "productTitle": "Test", "skuEntries": [{"name": "Default"}]}
-        self.assertNotEqual(
+        self.assertEqual(
             hash_attribute_input({**base, "categoryPath": "A"}),
             hash_attribute_input({**base, "categoryPath": "B"}),
         )
 
-    def test_queue_summary_for_records_ignores_unrelated_failed_jobs(self):
-        conn = sqlite3.connect(":memory:")
-        self.addCleanup(conn.close)
-        conn.row_factory = sqlite3.Row
-        ensure_export_product_attribute_schema(conn)
-        current = {"id": "current-record", "productId": "p1", "productTitle": "Current", "skuEntries": [{"name": "Default"}]}
-        now = "2026-06-13 12:00:00"
-        conn.execute(
-            """
-            INSERT INTO export_product_attribute_jobs (
-                id, user_id, link_record_id, product_id, product_title,
-                record_hash, record_json, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "job-current",
-                "u1",
-                "current-record",
-                "p1",
-                "Current",
-                hash_attribute_input(current),
-                "{}",
-                "done",
-                now,
-                now,
-            ),
-        )
-        conn.execute(
-            """
-            INSERT INTO export_product_attribute_jobs (
-                id, user_id, link_record_id, product_id, product_title,
-                record_hash, record_json, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "job-old-failed",
-                "u1",
-                "old-record",
-                "p2",
-                "Old",
-                "old-hash",
-                "{}",
-                "failed",
-                now,
-                now,
-            ),
-        )
+    def test_product_attribute_prepare_and_status_are_noop_when_cache_disabled(self):
+        record = {"id": "current-record", "productId": "p1", "productTitle": "Current", "skuEntries": [{"name": "Default"}]}
 
-        summary = get_product_attribute_queue_summary_for_records(conn, user_id="u1", records=[current])
+        prepared = prepare_product_attribute_jobs([record], user_id="u1", process_now=True)
+        summary = get_product_attribute_queue_summary(user_id="u1", records=[record])
+        record_summary = get_product_attribute_queue_summary_for_records(None, user_id="u1", records=[record])
 
-        self.assertEqual(summary["done"], 1)
-        self.assertEqual(summary["failed"], 0)
-        self.assertEqual(summary["total"], 1)
-
-    def test_delete_failed_product_attribute_jobs_keeps_success_cache(self):
-        conn = sqlite3.connect(":memory:")
-        self.addCleanup(conn.close)
-        conn.row_factory = sqlite3.Row
-        ensure_export_product_attribute_schema(conn)
-        now = "2026-06-13 12:00:00"
-        for job_id, status in (("job-done", "done"), ("job-failed", "failed")):
-            conn.execute(
-                """
-                INSERT INTO export_product_attribute_jobs (
-                    id, user_id, link_record_id, product_id, product_title,
-                    record_hash, record_json, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    job_id,
-                    "u1",
-                    "record-1",
-                    "p1",
-                    "Product",
-                    f"{status}-hash",
-                    "{}",
-                    status,
-                    now,
-                    now,
-                ),
-            )
-
-        deleted = delete_failed_product_attribute_jobs(conn, user_id="u1", link_record_id="record-1")
-
-        self.assertEqual(deleted, 1)
-        rows = [dict(row) for row in conn.execute("SELECT id, status FROM export_product_attribute_jobs ORDER BY id")]
-        self.assertEqual(rows, [{"id": "job-done", "status": "done"}])
+        for payload in (prepared, summary, record_summary):
+            self.assertEqual(payload["queued"], 0)
+            self.assertEqual(payload["running"], 0)
+            self.assertEqual(payload["done"], 0)
+            self.assertEqual(payload["failed"], 0)
+            self.assertEqual(payload["total"], 0)
+        self.assertEqual(prepared["queuedNow"], 0)
+        self.assertEqual(prepared["reused"], 0)
 
     def test_load_product_context_falls_back_to_record_category_path(self):
         conn = sqlite3.connect(":memory:")
@@ -522,7 +504,7 @@ class ProductAttributesTest(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result["category_id"], "pet-feeding-mat")
 
-    def test_resolves_existing_category_path_before_vector_guess(self):
+    def test_ignores_existing_category_path_and_uses_title_vector(self):
         conn = sqlite3.connect(":memory:")
         self.addCleanup(conn.close)
         conn.row_factory = sqlite3.Row
@@ -531,11 +513,11 @@ class ProductAttributesTest(unittest.TestCase):
             [
                 (
                     "bonsai",
-                    ["\u5ead\u9662\u3001\u8349\u576a\u548c\u56ed\u827a", "\u7530\u56ed\u5de5\u5177\u548c\u8349\u576a\u62a4\u7406", "\u9c9c\u82b1\u3001\u7eff\u690d", "\u76c6\u683d"],
+                    ["Garden", "Plants", "Bonsai Seeds"],
                 ),
                 (
                     "mailbox-cover",
-                    ["\u5ead\u9662\u3001\u8349\u576a\u548c\u56ed\u827a", "\u6237\u5916\u9970\u54c1", "\u90ae\u7bb1\u7f69"],
+                    ["Garden", "Outdoor Decor", "Mailbox Covers"],
                 ),
             ],
         )
@@ -544,14 +526,358 @@ class ProductAttributesTest(unittest.TestCase):
             conn,
             {
                 "productId": "p1",
-                "productTitle": "\u6a31\u82b1\u76c6\u666f\u6811\u79cd\u5b50 \u5bb6\u5c45\u88c5\u9970 \u56ed\u827a\u793c\u7269",
-                "categoryPath": "\u5ead\u9662\u3001\u8349\u576a\u548c\u56ed\u827a > \u7530\u56ed\u5de5\u5177\u548c\u8349\u576a\u62a4\u7406 > \u9c9c\u82b1\u3001\u7eff\u690d > \u76c6\u683d",
+                "productTitle": "Bonsai seeds garden plant gift",
+                "categoryPath": "Garden > Outdoor Decor > Mailbox Covers",
                 "skuEntries": [{"name": "Default"}],
             },
         )
 
         self.assertIsNotNone(result)
         self.assertEqual(result["category_id"], "bonsai")
+
+    def test_ignores_explicit_category_id_and_uses_title_vector(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.row_factory = sqlite3.Row
+        seed_category_snapshots(
+            conn,
+            [
+                (
+                    "finger-cymbals",
+                    ["Musical Instruments", "Drums & Percussions", "Finger Cymbals"],
+                ),
+                (
+                    "dice",
+                    ["Toys & Games", "Games & Accessories", "Dice"],
+                ),
+            ],
+        )
+
+        result = resolve_category_for_record(
+            conn,
+            {
+                "productId": "wood-dice",
+                "productTitle": "Wood Dice D12 Dice for RPG Tabletop Games",
+                "categoryId": "finger-cymbals",
+                "skuEntries": [{"name": "Wood dice"}],
+            },
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["category_id"], "dice")
+
+    def test_ignores_noisy_source_category_path_before_vector_match(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.row_factory = sqlite3.Row
+        seed_category_snapshots(
+            conn,
+            [
+                (
+                    "finger-cymbals",
+                    ["Musical Instruments", "Drums & Percussions", "Finger Cymbals"],
+                ),
+                (
+                    "dice",
+                    ["Toys & Games", "Games & Accessories", "Dice"],
+                ),
+            ],
+        )
+
+        result = resolve_category_for_record(
+            conn,
+            {
+                "productId": "wood-dice",
+                "productTitle": "Wood Dice D12 Dice for RPG Tabletop Games",
+                "categoryPath": "company_info/Musical Instruments/Drums & Percussions/Set of 6 Shiny Metal Finger.../Categories",
+                "skuEntries": [{"name": "Wood dice"}],
+            },
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["category_id"], "dice")
+
+    def test_export_attribute_lookup_strict_failure_raises(self):
+        record = {
+            "id": "record-1",
+            "productId": "product-1",
+            "productTitle": "Wood Dice",
+            "skuEntries": [{"name": "Default"}],
+        }
+
+        with patch(
+            "app.modules.exports.product_attributes.generate_product_attribute_for_record",
+            side_effect=ValueError("No matching category"),
+        ):
+            with self.assertRaisesRegex(ValueError, "Product category/attributes unavailable"):
+                get_product_attribute_for_export_record(record, user_id="u1", strict=True)
+
+    def test_export_attribute_lookup_generates_fresh_result_with_api_required(self):
+        record = {
+            "id": "record-1",
+            "productId": "product-1",
+            "productTitle": "Wood Dice",
+            "skuEntries": [{"name": "Default"}],
+        }
+
+        with patch(
+            "app.modules.exports.product_attributes.generate_product_attribute_for_record",
+            return_value={
+                "category_id": "fresh-category",
+                "category_path": "Fresh > Category",
+                "product_attributes": [{"propName": "Brand", "propValue": "No Brand"}],
+            },
+        ) as generator:
+            result = get_product_attribute_for_export_record(record, user_id="u1", strict=True)
+
+        self.assertEqual(result["category_id"], "fresh-category")
+        self.assertIn("No Brand", result["product_attribute_text"])
+        self.assertIs(generator.call_args.kwargs.get("require_api"), True)
+
+    def test_export_attribute_lookup_uses_final_export_title_context(self):
+        record = {
+            "id": "record-1",
+            "productId": "product-1",
+            "productTitle": "原始采集标题",
+            "productTitleEn": "Original scraped title",
+            "skuEntries": [{"name": "Default"}],
+        }
+
+        with patch(
+            "app.modules.exports.product_attributes.generate_product_attribute_for_record",
+            return_value={
+                "category_id": "fresh-category",
+                "category_path": "Fresh > Category",
+                "product_attributes": [{"propName": "Material", "propValue": "Silicone"}],
+            },
+        ) as generator:
+            get_product_attribute_for_export_record(
+                record,
+                user_id="u1",
+                strict=True,
+                title_context={
+                    "title_cn": "最终中文标题 硅胶宠物喂食垫",
+                    "title_en": "Final Silicone Pet Feeding Mat Title",
+                },
+            )
+
+        api_record = generator.call_args.args[0]
+        self.assertEqual(api_record["productTitle"], "最终中文标题 硅胶宠物喂食垫")
+        self.assertEqual(api_record["productTitleEn"], "Final Silicone Pet Feeding Mat Title")
+        self.assertEqual(api_record["originalProductTitle"], "原始采集标题")
+        self.assertEqual(api_record["originalProductTitleEn"], "Original scraped title")
+        self.assertEqual(api_record["attributeTitle"], "最终中文标题 硅胶宠物喂食垫")
+
+    def test_strict_attribute_generation_requires_api_configuration(self):
+        with patch(
+            "app.modules.exports.product_attributes.is_product_attribute_ai_configured",
+            return_value=False,
+        ):
+            with self.assertRaisesRegex(ValueError, "Product attribute API is not configured"):
+                generate_product_attribute_for_record(
+                    {"productTitle": "Wood Dice", "skuEntries": [{"name": "Default"}]},
+                    user_id="u1",
+                    require_api=True,
+                )
+
+    def test_strict_category_resolution_calls_category_intent_api(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.row_factory = sqlite3.Row
+        seed_category_snapshots(
+            conn,
+            [
+                ("dice", ["Toys & Games", "Games & Accessories", "Dice"]),
+                ("finger-cymbals", ["Musical Instruments", "Drums & Percussions", "Finger Cymbals"]),
+            ],
+        )
+
+        with (
+            patch("app.modules.exports.product_attributes.is_product_attribute_ai_configured", return_value=True),
+            patch(
+                "app.modules.exports.product_attributes.request_category_intent_ai",
+                return_value={"product_type": "dice", "core_keywords": ["dice", "tabletop game"]},
+            ) as intent_api,
+            patch(
+                "app.modules.exports.product_attributes.request_category_branch_ai",
+                return_value={"selected_index": 1, "confidence": 0.9},
+            ),
+        ):
+            result = resolve_category_for_record(
+                conn,
+                {
+                    "productId": "wood-dice",
+                    "productTitle": "Wood Dice D12 Dice for RPG Tabletop Games",
+                    "skuEntries": [{"name": "Wood dice"}],
+                },
+                user_id="u1",
+                require_api=True,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["category_id"], "dice")
+        intent_api.assert_called_once()
+
+    def test_category_intent_ai_uses_title_and_images_as_multimodal_context(self):
+        with (
+            patch(
+                "app.modules.exports.product_attributes.get_ai_stage_settings",
+                return_value={
+                    "api_key": "test-key",
+                    "base_url": "https://api.example.com/v1",
+                    "model": "vision-model",
+                    "channel_id": "",
+                },
+            ),
+            patch("app.modules.exports.product_attributes.assert_user_api_usage_allowed"),
+            patch("app.modules.exports.product_attributes.record_product_attribute_usage"),
+            patch(
+                "app.modules.exports.product_attributes.request_json",
+                return_value={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {"product_type": "tote bag", "core_keywords": ["tote bag"]},
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                },
+            ) as request_json_mock,
+        ):
+            result = request_category_intent_ai(
+                {
+                    "productTitle": "5pcs pale mini tote bag set with zipper closure",
+                    "productTitleEn": "5PCS Pale Mini Tote Bag Set",
+                    "mainImage": {"sourceUrl": "https://img.example.com/main-tote.jpg"},
+                    "productMaterialImages": [{"sourceUrl": "https://img.example.com/detail-tote.jpg"}],
+                    "sourceLinks": [{"title": "Mini tote bag", "imageUrl": "https://img.example.com/source-tote.jpg"}],
+                    "skuEntries": [{"name": "Pale tote", "imageUrl": "https://img.example.com/sku-tote.jpg"}],
+                },
+                {},
+                user_id="u1",
+            )
+
+        self.assertEqual(result["product_type"], "tote bag")
+        payload = request_json_mock.call_args.args[2]
+        content = payload["messages"][0]["content"]
+        instruction = json.loads(content[0]["text"])
+        self.assertEqual(instruction["product"]["title_en"], "5PCS Pale Mini Tote Bag Set")
+        self.assertIn(
+            {"role": "main_image", "url": "https://img.example.com/main-tote.jpg"},
+            instruction["product"]["reference_images"],
+        )
+        image_urls = [item["image_url"]["url"] for item in content[1:]]
+        self.assertIn("https://img.example.com/main-tote.jpg", image_urls)
+        self.assertIn("https://img.example.com/detail-tote.jpg", image_urls)
+
+    def test_category_branch_ai_uses_images_when_selecting_candidates(self):
+        with (
+            patch(
+                "app.modules.exports.product_attributes.get_ai_stage_settings",
+                return_value={
+                    "api_key": "test-key",
+                    "base_url": "https://api.example.com/v1",
+                    "model": "vision-model",
+                    "channel_id": "",
+                },
+            ),
+            patch("app.modules.exports.product_attributes.assert_user_api_usage_allowed"),
+            patch("app.modules.exports.product_attributes.record_product_attribute_usage"),
+            patch(
+                "app.modules.exports.product_attributes.request_json",
+                return_value={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {"selected_index": 1, "confidence": 0.91},
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                },
+            ) as request_json_mock,
+        ):
+            result = request_category_branch_ai(
+                record={
+                    "productTitle": "5pcs pale mini tote bag set with zipper closure",
+                    "productTitleEn": "5PCS Pale Mini Tote Bag Set",
+                    "mainImage": {"sourceUrl": "https://img.example.com/main-tote.jpg"},
+                },
+                intent={"product_type": "tote bag", "core_keywords": ["bag", "tote"]},
+                current_path=[],
+                candidates=[
+                    {"name": "Tote Bags", "path_text": "Bags > Women Bags > Tote Bags", "score": 0.7},
+                    {"name": "Game Boy Color", "path_text": "Video Games > Game Boy Color", "score": 0.6},
+                ],
+                task="Choose the final leaf category that best fits the product.",
+                user_id="u1",
+            )
+
+        self.assertEqual(result["selected_index"], 1)
+        payload = request_json_mock.call_args.args[2]
+        content = payload["messages"][0]["content"]
+        instruction = json.loads(content[0]["text"])
+        self.assertEqual(instruction["product"]["title_cn"], "5pcs pale mini tote bag set with zipper closure")
+        self.assertEqual(instruction["candidates"][1]["path"], "Video Games > Game Boy Color")
+        self.assertEqual(content[1]["image_url"]["url"], "https://img.example.com/main-tote.jpg")
+
+    def test_product_attribute_ai_uses_final_title_and_images(self):
+        with (
+            patch(
+                "app.modules.exports.product_attributes.get_ai_stage_settings",
+                return_value={
+                    "api_key": "test-key",
+                    "base_url": "https://api.example.com/v1",
+                    "model": "vision-model",
+                    "channel_id": "",
+                },
+            ),
+            patch("app.modules.exports.product_attributes.assert_user_api_usage_allowed"),
+            patch("app.modules.exports.product_attributes.record_product_attribute_usage"),
+            patch(
+                "app.modules.exports.product_attributes.request_category_json",
+                return_value={"attributes": [{"field_label": "Material", "prop_value": "Paper"}]},
+            ) as request_json_mock,
+        ):
+            result = request_product_attribute_ai(
+                {
+                    "productTitle": "彩色派对拉花",
+                    "productTitleEn": "Colorful Confetti Popper",
+                    "attributeTitle": "最终中文标题 彩色派对拉花",
+                    "attributeTitleEn": "Final English Colorful Confetti Popper",
+                    "mainImage": {"sourceUrl": "https://img.example.com/main-confetti.jpg"},
+                    "productMaterialImages": [{"sourceUrl": "https://img.example.com/detail-confetti.jpg"}],
+                    "skuEntries": [{"name": "Mix, Quantity: 12pcs"}],
+                },
+                {"category_id": "party", "category_path_text": "Party Supplies > Confetti Poppers"},
+                [
+                    {
+                        "field_key": "material",
+                        "field_label": "Material",
+                        "component": "ant-select",
+                        "required": True,
+                        "raw": {"pid": "1", "templatePid": "2", "refPid": "3"},
+                        "options": [{"label": "Paper", "vid": "paper"}],
+                    }
+                ],
+                user_id="u1",
+            )
+
+        self.assertEqual(result["attributes"][0]["prop_value"], "Paper")
+        instruction = json.loads(request_json_mock.call_args.kwargs["instruction"])
+        self.assertEqual(instruction["product"]["final_export_title_en"], "Final English Colorful Confetti Popper")
+        self.assertIn(
+            {"role": "main_image", "url": "https://img.example.com/main-confetti.jpg"},
+            instruction["product"]["reference_images"],
+        )
+        self.assertTrue(any("battery" in rule.lower() for rule in instruction["red_line_rules"]))
+        self.assertTrue(any("plug" in rule.lower() for rule in instruction["red_line_rules"]))
+        self.assertIn("https://img.example.com/main-confetti.jpg", request_json_mock.call_args.kwargs["image_refs"])
 
 def seed_category_snapshots(conn: sqlite3.Connection, categories: list[tuple[str, list[str]]]) -> None:
     conn.execute(

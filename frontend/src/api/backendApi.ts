@@ -142,6 +142,20 @@ export type AdminApiChannelBundle = {
   routes: AdminApiRoute[];
 };
 
+export type AdminPromptConfig = {
+  id: string;
+  stage: string;
+  title: string;
+  description: string;
+  modelKey: string;
+  source: string;
+  inputFrom: string;
+  outputTo: string;
+  variables: string[];
+  content: string;
+  readOnly: boolean;
+};
+
 export type AdminApiChannelUpdateItem = {
   id: string;
   name?: string;
@@ -354,6 +368,21 @@ export type DianxiaomiProductAttributeQueueSummary = {
   failedNow?: number;
 };
 
+export type DianxiaomiExportTask = {
+  id: string;
+  userId: string;
+  exportMode: DianxiaomiExportMode;
+  status: 'queued' | 'running' | 'completed' | 'failed' | string;
+  recordCount: number;
+  recordIds: string[];
+  filename?: string | null;
+  downloadUrl?: string | null;
+  errorMessage?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string | null;
+};
+
 export type LinkListRecordsResponse = {
   items: LinkListRecord[];
 };
@@ -453,7 +482,10 @@ export type VisualGenerationTask = {
 export type VisualQueueSummary = {
   counts: Record<string, number>;
   activeCount: number;
+  runningCount?: number;
+  queuedCount?: number;
   teamActiveCount: number;
+  teamRunningCount?: number;
   userConcurrencyLimit: number;
   teamConcurrencyLimit: number;
   team?: Record<string, string>;
@@ -464,6 +496,14 @@ export type VisualQueueSummary = {
   redisRetryQueueLength?: number | null;
   redisDeadQueueName?: string;
   redisDeadQueueLength?: number | null;
+};
+
+export type VisualGenerationRunResponse = {
+  item: VisualGenerationTask;
+  queued: boolean;
+  queueBackend: 'redis' | 'background' | string;
+  waitingForConcurrency?: boolean;
+  message?: string;
 };
 
 export type VisualTaskCreatePayload = {
@@ -539,6 +579,14 @@ export type Smart1688Keyword = {
   intent: string;
   reason: string;
   searchUrl?: string;
+};
+
+export type Title1688KeywordsResponse = {
+  primary_keyword: string;
+  keywords: Smart1688Keyword[];
+  removed_terms: string[];
+  source: string;
+  model: string;
 };
 
 export type ImageSearch1688Item = {
@@ -879,6 +927,58 @@ export async function exportDianxiaomiTemuTemplate(
   return response.blob();
 }
 
+export async function createDianxiaomiExportTask(
+  records: LinkListRecord[],
+  exportMode: DianxiaomiExportMode = 'curated',
+): Promise<DianxiaomiExportTask> {
+  const response = await fetch(`${API_BASE_URL}/api/exports/dianxiaomi/temu-semi-managed/tasks`, withSession({
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ records, export_mode: exportMode }),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.item;
+}
+
+export async function fetchDianxiaomiExportTask(taskId: string): Promise<DianxiaomiExportTask> {
+  const response = await fetch(`${API_BASE_URL}/api/exports/dianxiaomi/temu-semi-managed/tasks/${encodeURIComponent(taskId)}`, withSession({
+    headers: authHeaders(),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.item;
+}
+
+export async function fetchDianxiaomiExportTasks(): Promise<DianxiaomiExportTask[]> {
+  const response = await fetch(`${API_BASE_URL}/api/exports/dianxiaomi/temu-semi-managed/tasks`, withSession({
+    headers: authHeaders(),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.items || [];
+}
+
+export async function downloadDianxiaomiExportTask(taskId: string): Promise<Blob> {
+  const response = await fetch(`${API_BASE_URL}/api/exports/dianxiaomi/temu-semi-managed/tasks/${encodeURIComponent(taskId)}/download`, withSession({
+    headers: authHeaders(),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.blob();
+}
+
 export async function fetchLinkListRecords(): Promise<LinkListRecord[]> {
   const response = await fetch(`${API_BASE_URL}/api/link-records`, withSession({
     headers: authHeaders(),
@@ -966,6 +1066,24 @@ export async function fetchSmart1688Keywords(product: Product): Promise<Omit<Sma
     method: 'POST',
     headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ product, limit: 6 }),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json();
+}
+
+export async function fetch1688TitleKeywords(params: {
+  title: string;
+  category?: string;
+}): Promise<Title1688KeywordsResponse> {
+  const search = new URLSearchParams();
+  search.set('title', params.title);
+  if (params.category) search.set('category', params.category);
+
+  const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/title-keywords?${search.toString()}`, withSession({
+    headers: authHeaders(),
   }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
@@ -1131,7 +1249,7 @@ export async function generateVisualGenerationTask(
 export async function runVisualGenerationTask(
   taskId: string,
   payload: VisualTaskRunPayload = {},
-): Promise<VisualGenerationTask> {
+): Promise<VisualGenerationRunResponse> {
   const response = await fetch(`${API_BASE_URL}/api/visual/tasks/${encodeURIComponent(taskId)}/run`, withSession({
     method: 'POST',
     headers: authHeaders({ 'Content-Type': 'application/json' }),
@@ -1142,7 +1260,7 @@ export async function runVisualGenerationTask(
   }
 
   const body = await response.json();
-  return body.item;
+  return body;
 }
 
 export async function splitVisualGenerationTask(
@@ -1314,6 +1432,18 @@ export async function fetchAdminApiChannels(): Promise<AdminApiChannelBundle> {
     channels: body.channels || [],
     routes: body.routes || [],
   };
+}
+
+export async function fetchAdminPromptConfigs(): Promise<AdminPromptConfig[]> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/prompt-configs`, withSession({
+    headers: authHeaders(),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.items || [];
 }
 
 export async function updateAdminApiChannels(items: AdminApiChannelUpdateItem[]): Promise<AdminApiChannelBundle> {

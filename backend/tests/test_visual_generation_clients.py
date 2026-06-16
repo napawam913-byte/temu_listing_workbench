@@ -13,6 +13,7 @@ from app.modules.visual_generation.clients import (
     VisualGenerationError,
     image_file_to_data_url,
     image_file_to_upload,
+    request_generated_image,
     request_json,
 )
 
@@ -63,6 +64,61 @@ class VisualGenerationClientImageTest(unittest.TestCase):
         self.assertEqual(result, {"ok": True})
         self.assertEqual(urlopen.call_count, 2)
         sleep.assert_called_once_with(3)
+
+    def test_generated_image_uses_extended_image_timeout(self):
+        captured: dict[str, int] = {}
+
+        def fake_request_json(*_args, **kwargs):
+            captured["timeout"] = kwargs.get("timeout")
+            return {"data": [{"b64_json": base64.b64encode(b"image-bytes").decode("ascii")}]}
+
+        with patch(
+            "app.modules.visual_generation.clients.image_generation_timeout_seconds",
+            return_value=900,
+        ):
+            with patch("app.modules.visual_generation.clients.request_json", side_effect=fake_request_json):
+                image_bytes = request_generated_image(
+                    api_url="https://api.aicoming.top/v1/images/generations",
+                    api_key="sk-test",
+                    model="gpt-image-2-1k",
+                    size="",
+                    prompt="test prompt",
+                )
+
+        self.assertEqual(image_bytes, b"image-bytes")
+        self.assertEqual(captured["timeout"], 900)
+
+    def test_image_edits_uploads_multiple_reference_images(self):
+        captured: dict[str, object] = {}
+
+        def fake_request_multipart(*_args, **kwargs):
+            captured["fields"] = kwargs.get("fields")
+            captured["files"] = kwargs.get("files")
+            return {"data": [{"b64_json": base64.b64encode(b"edited-image-bytes").decode("ascii")}]}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first_path = Path(tmpdir) / "first.png"
+            second_path = Path(tmpdir) / "second.png"
+            Image.new("RGB", (16, 16), (255, 0, 0)).save(first_path)
+            Image.new("RGB", (16, 16), (0, 0, 255)).save(second_path)
+
+            with patch("app.modules.visual_generation.clients.request_multipart", side_effect=fake_request_multipart):
+                image_bytes = request_generated_image(
+                    api_url="https://api.aicoming.top/v1/images/edits",
+                    api_key="sk-test",
+                    model="gpt-image-2-1k",
+                    size="",
+                    prompt="combine the product references",
+                    reference_image_paths=[first_path, second_path],
+                )
+
+        self.assertEqual(image_bytes, b"edited-image-bytes")
+        self.assertEqual(captured["fields"], [("model", "gpt-image-2-1k"), ("prompt", "combine the product references")])
+        files = captured["files"]
+        self.assertIsInstance(files, list)
+        self.assertEqual(len(files), 2)
+        self.assertEqual(files[0][0], "image[]")
+        self.assertEqual(files[1][0], "image[]")
 
 
 class FakeResponse:

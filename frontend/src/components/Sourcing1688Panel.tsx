@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   API_BASE_URL,
   deleteCaptured1688Candidate,
+  fetch1688TitleKeywords,
   fetchCaptured1688Candidates,
   fetchSmart1688Keywords,
   fetchSmart1688Recommendations,
@@ -93,13 +94,6 @@ function buildKeyword(product: Product) {
 function build1688KeywordSearchUrl(keyword: string) {
   const search = new URLSearchParams({ keyword });
   return `${API_BASE_URL}/api/sourcing/1688/search?${search.toString()}`;
-}
-
-function build1688TitleSearchUrl(product: Product) {
-  const title = product.title.trim() || product.titleEn?.trim() || product.sourceProductId || product.id;
-  const search = new URLSearchParams({ title });
-  if (product.categoryPath || product.category) search.set('category', product.categoryPath || product.category);
-  return `${API_BASE_URL}/api/sourcing/1688/title-search?${search.toString()}`;
 }
 
 function getSmartRecommendProductKey(product: Product) {
@@ -310,8 +304,18 @@ function getCandidateLabel(candidate: Captured1688Candidate, candidateIndex: num
   return candidate.shop_name || candidate.offer_id || `货源 ${candidateIndex + 1}`;
 }
 
+function getCandidateSourceTitle(candidate: Captured1688Candidate, candidateIndex: number) {
+  return candidate.title || getCandidateLabel(candidate, candidateIndex);
+}
+
 function getSkuCombinationDisplayName(items: SkuCombinationItem[]) {
-  return items.map((item) => item.optionText || item.specText).join('+');
+  return items
+    .map((item) => {
+      const specText = item.optionText || item.specText;
+      const sourceTitle = getCandidateSourceTitle(item.candidate, item.candidateIndex);
+      return `${specText}${sourceTitle}`;
+    })
+    .join('+');
 }
 
 function Smart1688KeywordRecommendations({ product }: { product: Product }) {
@@ -597,6 +601,7 @@ function Smart1688KeywordRecommendations({ product }: { product: Product }) {
 export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Props) {
   const [captureStarted, setCaptureStarted] = useState(false);
   const [loadingCandidates, setLoadingCandidates] = useState(false);
+  const [opening1688, setOpening1688] = useState(false);
   const [capturedCandidates, setCapturedCandidates] = useState<Captured1688Candidate[]>([]);
   const [selectedCandidate, setSelectedCandidate] = useState<Captured1688Candidate | undefined>();
   const [comboSourceId, setComboSourceId] = useState<string | undefined>();
@@ -1333,7 +1338,7 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
           weight: entry.weight,
           sourceSkuLinks: entry.items.map((item) => ({
             sourceId: item.candidate.id,
-            sourceTitle: getCandidateLabel(item.candidate, item.candidateIndex),
+            sourceTitle: getCandidateSourceTitle(item.candidate, item.candidateIndex),
             sourceProductUrl: item.candidate.product_url,
             sourceSkuId: item.sku.sku_id,
             sourceSkuKey: item.key,
@@ -1347,7 +1352,7 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
             sourceId: item.candidate.id,
             sourceSkuId: item.sku.sku_id,
             sourceSkuKey: item.key,
-            sourceTitle: getCandidateLabel(item.candidate, item.candidateIndex),
+            sourceTitle: getCandidateSourceTitle(item.candidate, item.candidateIndex),
             sourceUrl: item.candidate.product_url,
             sourceImageUrl: getCandidateMainImageUrl(item.candidate),
             imageUrl: item.imageUrl,
@@ -1359,8 +1364,44 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
     });
   };
 
-  const open1688 = () => {
-    window.open(build1688TitleSearchUrl(product), '_blank', 'noopener,noreferrer');
+  const open1688 = async () => {
+    const title = product.title.trim() || product.titleEn?.trim() || product.sourceProductId || product.id;
+    if (!title) {
+      message.warning('当前商品没有可用于搜索的标题');
+      return;
+    }
+
+    const pendingWindow = window.open('about:blank', '_blank');
+    if (pendingWindow) {
+      pendingWindow.opener = null;
+      pendingWindow.document.title = '1688 搜索';
+      pendingWindow.document.body.innerHTML = '<p style="font:14px sans-serif;padding:24px;">正在转换中文关键词并打开 1688...</p>';
+    }
+
+    setOpening1688(true);
+    try {
+      const result = await fetch1688TitleKeywords({
+        title,
+        category: product.categoryPath || product.category,
+      });
+      const searchUrl = result.keywords[0]?.searchUrl;
+      if (!searchUrl) {
+        throw new Error('后端没有返回可用的 1688 搜索链接');
+      }
+      if (pendingWindow) {
+        pendingWindow.location.href = searchUrl;
+      } else {
+        window.open(searchUrl, '_blank', 'noopener,noreferrer');
+      }
+      if (result.primary_keyword) {
+        message.success(`已转换为中文关键词：${result.primary_keyword}`);
+      }
+    } catch (error) {
+      if (pendingWindow) pendingWindow.close();
+      message.error(error instanceof Error ? error.message : '1688 搜索关键词转换失败');
+    } finally {
+      setOpening1688(false);
+    }
   };
 
   const selectedCandidateMainImageUrl = selectedCandidate ? getCandidateMainImageUrl(selectedCandidate) : undefined;
@@ -1406,7 +1447,9 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
         <div className="sourcing-search">
           <div className="search-row">
             <Input value={keyword} readOnly />
-            <Button onClick={open1688}>打开 1688</Button>
+            <Button loading={opening1688} onClick={() => void open1688()}>
+              {opening1688 ? '转换中' : '打开 1688'}
+            </Button>
             <Button type="primary" onClick={startCapture}>
               刷新货源素材
             </Button>

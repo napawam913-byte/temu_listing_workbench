@@ -22,6 +22,7 @@ import type { CSSProperties, Key } from 'react';
 import {
   createAdminUser,
   fetchAdminApiChannels,
+  fetchAdminPromptConfigs,
   fetchAdminApiUsage,
   fetchAdminSettings,
   fetchAdminUserApiCredentials,
@@ -40,6 +41,7 @@ import type {
   AdminApiUsageGroup,
   AdminApiUsageItem,
   AdminApiUsageSummary,
+  AdminPromptConfig,
   AdminSetting,
   AdminSettingsUpdateItem,
   AdminUser,
@@ -177,7 +179,7 @@ function categoryLabel(category: string) {
 }
 
 function categoryDescription(category: string) {
-  if (category === 'ai') return '管理各个 AI 阶段实际调用的模型，API Key 和 Base URL 请到渠道管理配置。';
+  if (category === 'ai') return '管理各个 AI 阶段实际调用的模型，API Key 和 Base URL 请到初凡 API 配置。';
   if (category === 'visual') return '管理母图任务、九宫格切图、图生图参考和 OSS 上传默认策略。';
   if (category === '1688') return '管理 1688 搜图 API 服务，用于后续同款或相关货源检索。';
   if (category === 'oss') return '管理阿里云 OSS 图片存储，用于导出模板中的公网图片链接。';
@@ -257,7 +259,7 @@ function apiChannelDraftsFromChannels(channels: AdminApiChannel[]) {
       channel.id,
       {
         name: channel.name,
-        enabled: channel.enabled,
+        enabled: channel.id === 'chufan_ai' ? true : channel.enabled,
         baseUrl: channel.baseUrl,
         apiKey: '',
         clearApiKey: false,
@@ -305,8 +307,9 @@ export function AdminPage() {
   const [settings, setSettings] = useState<AdminSetting[]>([]);
   const [apiUsage, setApiUsage] = useState<AdminApiUsageSummary>(EMPTY_API_USAGE);
   const [apiChannels, setApiChannels] = useState<AdminApiChannel[]>([]);
+  const [promptConfigs, setPromptConfigs] = useState<AdminPromptConfig[]>([]);
   const [apiChannelDrafts, setApiChannelDrafts] = useState<Record<string, ApiChannelDraft>>({});
-  const [activeApiConfigTab, setActiveApiConfigTab] = useState('api-channels');
+  const [activeApiConfigTab, setActiveApiConfigTab] = useState('chufan-api');
   const [settingDrafts, setSettingDrafts] = useState<Record<string, string>>({});
   const [secretEditingKeys, setSecretEditingKeys] = useState<Record<string, boolean>>({});
   const [editingAiStageKey, setEditingAiStageKey] = useState<string | null>(null);
@@ -331,16 +334,18 @@ export function AdminPage() {
   const loadAdminData = useCallback(async () => {
     setLoading(true);
     try {
-      const [nextUsers, nextSettings, nextApiUsage, nextApiChannels] = await Promise.all([
+      const [nextUsers, nextSettings, nextApiUsage, nextApiChannels, nextPromptConfigs] = await Promise.all([
         fetchAdminUsers(),
         fetchAdminSettings(),
         fetchAdminApiUsage(),
         fetchAdminApiChannels(),
+        fetchAdminPromptConfigs(),
       ]);
       setUsers(nextUsers);
       setSettings(nextSettings);
       setApiUsage(nextApiUsage);
       setApiChannels(nextApiChannels.channels);
+      setPromptConfigs(nextPromptConfigs);
       setApiChannelDrafts(apiChannelDraftsFromChannels(nextApiChannels.channels));
       setSettingDrafts(
         Object.fromEntries(nextSettings.map((setting) => [setting.key, setting.isSecret ? '' : setting.value || ''])),
@@ -553,26 +558,28 @@ export function AdminPage() {
   const saveApiChannels = async (options?: { silent?: boolean }) => {
     setSavingSettings(true);
     try {
-      const items: AdminApiChannelUpdateItem[] = apiChannels.map((channel) => {
-        const draft = apiChannelDrafts[channel.id];
-        return {
-          id: channel.id,
-          name: draft?.name,
-          enabled: draft?.enabled,
-          apiKey: draft?.apiKey?.trim() || undefined,
-          clearApiKey: Boolean(draft?.clearApiKey),
-          baseUrl: draft?.baseUrl,
-        };
-      });
+      const items: AdminApiChannelUpdateItem[] = apiChannels
+        .filter((channel) => channel.id === 'chufan_ai')
+        .map((channel) => {
+          const draft = apiChannelDrafts[channel.id];
+          return {
+            id: channel.id,
+            name: draft?.name,
+            enabled: true,
+            apiKey: draft?.apiKey?.trim() || undefined,
+            clearApiKey: Boolean(draft?.clearApiKey),
+            baseUrl: draft?.baseUrl,
+          };
+        });
       const bundle = await updateAdminApiChannels(items);
       syncApiChannelBundle(bundle);
       if (!options?.silent) {
-        message.success('API 渠道已保存');
+        message.success('初凡 API 已保存');
       }
       return bundle;
     } catch (error) {
       if (!options?.silent) {
-        message.error(error instanceof Error ? error.message : 'API 渠道保存失败');
+        message.error(error instanceof Error ? error.message : '初凡 API 保存失败');
       }
       throw error;
     } finally {
@@ -1070,6 +1077,62 @@ export function AdminPage() {
     editingAiStage && editingAiStage.modelFallbackKey
       ? settingDraftValue(editingAiStage.modelFallbackKey, editingStageFallbackModelSetting)
       : '';
+  const promptConfigTab = {
+    key: 'prompt-configs',
+    label: '提示词配置',
+    children: (
+      <div className="admin-prompt-config-tab">
+        <div className="admin-setting-group-head">
+          <Typography.Text strong>提示词配置</Typography.Text>
+          <Typography.Text type="secondary">查看各个 AI 阶段的输入、输出和实际提示词模板。</Typography.Text>
+        </div>
+        {promptConfigs.length ? (
+          <div className="admin-prompt-config-grid">
+            {promptConfigs.map((prompt) => (
+              <div className="admin-prompt-config-card" key={prompt.id}>
+                <div className="admin-prompt-config-card-head">
+                  <div>
+                    <Typography.Text strong>{prompt.title}</Typography.Text>
+                    <Typography.Text type="secondary">{prompt.description}</Typography.Text>
+                  </div>
+                  <Space size={6} wrap>
+                    <Tag color="blue">{prompt.modelKey}</Tag>
+                    <Tag color="green">只读</Tag>
+                  </Space>
+                </div>
+                <div className="admin-prompt-flow-row">
+                  <div>
+                    <span>输入</span>
+                    <Typography.Text>{prompt.inputFrom}</Typography.Text>
+                  </div>
+                  <div>
+                    <span>输出</span>
+                    <Typography.Text>{prompt.outputTo}</Typography.Text>
+                  </div>
+                </div>
+                <Space size={6} wrap>
+                  {prompt.variables.map((variable) => (
+                    <Tag key={variable}>{variable}</Tag>
+                  ))}
+                </Space>
+                <Typography.Text className="admin-prompt-source" type="secondary">
+                  {prompt.source}
+                </Typography.Text>
+                <Input.TextArea
+                  className="admin-prompt-template"
+                  readOnly
+                  value={prompt.content}
+                  autoSize={{ minRows: 8, maxRows: 18 }}
+                />
+              </div>
+            ))}
+          </div>
+        ) : (
+          <Empty description="暂无提示词配置" />
+        )}
+      </div>
+    ),
+  };
 
   return (
     <div className="admin-page">
@@ -1373,79 +1436,36 @@ export function AdminPage() {
                   onChange={setActiveApiConfigTab}
                   items={[
                     {
-                      key: 'api-channels',
-                      label: '渠道管理',
+                      key: 'chufan-api',
+                      label: '初凡 API',
                       children: (
                         <div className="admin-api-channel-tab">
                   <section className="admin-api-channel-panel">
                     <div className="admin-api-section-head">
                       <div>
-                        <Typography.Text strong>渠道管理</Typography.Text>
-                        <Typography.Text type="secondary">管理第三方 API 渠道，接口不稳定时可切换已启用渠道。</Typography.Text>
+                        <Typography.Text strong>初凡 API</Typography.Text>
+                        <Typography.Text type="secondary">配置初凡 AI 的 API Key 和 OpenAI 兼容 Base URL。</Typography.Text>
                       </div>
                       <Button loading={savingSettings} onClick={() => void saveApiChannels()}>
-                        保存渠道
+                        保存初凡 API
                       </Button>
                     </div>
                     <div className="admin-api-channel-grid">
-                      {apiChannels.map((channel) => {
+                      {apiChannels.filter((channel) => channel.id === 'chufan_ai').map((channel) => {
                         const draft = apiChannelDrafts[channel.id] || {
                           name: channel.name,
-                          enabled: channel.enabled,
+                          enabled: true,
                           baseUrl: channel.baseUrl,
                           apiKey: '',
                         };
                         return (
                           <div className="admin-api-channel-card" key={channel.id}>
                             <div className="admin-api-channel-title">
-                              <Input
-                                disabled={channel.isCommon}
-                                value={draft.name}
-                                onChange={(event) =>
-                                  setApiChannelDrafts((current) => ({
-                                    ...current,
-                                    [channel.id]: {
-                                      ...draft,
-                                      name: event.target.value,
-                                    },
-                                  }))
-                                }
-                              />
-                              <Switch
-                                checked={draft.enabled}
-                                disabled={channel.isCommon}
-                                onChange={(enabled) =>
-                                  setApiChannelDrafts((current) => {
-                                    if (!enabled) {
-                                      return {
-                                        ...current,
-                                        [channel.id]: {
-                                          ...draft,
-                                          enabled: false,
-                                        },
-                                      };
-                                    }
-                                    const next = { ...current };
-                                    apiChannels.forEach((item) => {
-                                      const currentDraft = next[item.id] || {
-                                        name: item.name,
-                                        enabled: item.enabled,
-                                        baseUrl: item.baseUrl,
-                                        apiKey: '',
-                                      };
-                                      next[item.id] = {
-                                        ...currentDraft,
-                                        enabled: item.id === channel.id,
-                                      };
-                                    });
-                                    return next;
-                                  })
-                                }
-                              />
+                              <Typography.Text strong>{channel.name}</Typography.Text>
                             </div>
                             <Typography.Text type="secondary">{channel.description}</Typography.Text>
                             <Space size={6} wrap>
-                              <Tag color={draft.enabled ? 'green' : 'default'}>{draft.enabled ? '启用' : '停用'}</Tag>
+                              <Tag color="green">启用</Tag>
                               <Tag color={channel.apiKeyConfigured && !draft.clearApiKey ? 'green' : 'gold'}>
                                 {channel.apiKeyConfigured && !draft.clearApiKey ? channel.maskedApiKey || 'Key 已配置' : 'Key 待配置'}
                               </Tag>
@@ -1509,6 +1529,7 @@ export function AdminPage() {
                         </div>
                       ),
                     },
+                    promptConfigTab,
                     ...settingGroups.map(([category, groupSettings]) => ({
                     key: category,
                     label: categoryLabel(category),
