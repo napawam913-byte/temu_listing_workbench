@@ -127,9 +127,10 @@ def open_1688_search(keyword: str = Query(..., min_length=1)):
 def split_1688_title_keywords(
     title: str = Query(..., min_length=1),
     category: str | None = None,
+    current_user: dict[str, Any] = Depends(require_current_user),
 ):
     try:
-        return split_title_for_1688_search(title, category or "")
+        return split_title_for_1688_search(title, category or "", user_id=str(current_user["id"]))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -138,9 +139,10 @@ def split_1688_title_keywords(
 def open_1688_title_search(
     title: str = Query(..., min_length=1),
     category: str | None = None,
+    current_user: dict[str, Any] = Depends(require_current_user),
 ):
     try:
-        result = split_title_for_1688_search(title, category or "")
+        result = split_title_for_1688_search(title, category or "", user_id=str(current_user["id"]))
         return RedirectResponse(build_1688_search_url(result["primary_keyword"]), status_code=302)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

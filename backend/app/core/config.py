@@ -61,6 +61,8 @@ OPENAI_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-5.5").strip()
 OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2").strip()
 OPENAI_IMAGE_QUALITY = os.getenv("OPENAI_IMAGE_QUALITY", "medium").strip()
 
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+
 VISUAL_DEFAULT_MODE = os.getenv("VISUAL_DEFAULT_MODE", "main-gallery").strip()
 VISUAL_DEFAULT_LAYOUT = os.getenv("VISUAL_DEFAULT_LAYOUT", "3x3").strip()
 VISUAL_DEFAULT_REQUESTED_COUNT = os.getenv("VISUAL_DEFAULT_REQUESTED_COUNT", "9").strip()
@@ -73,6 +75,17 @@ VISUAL_SPLIT_FORMAT = os.getenv("VISUAL_SPLIT_FORMAT", "webp").strip()
 VISUAL_SPLIT_QUALITY = os.getenv("VISUAL_SPLIT_QUALITY", "92").strip()
 VISUAL_SPLIT_SAFE_MARGIN_RATIO = os.getenv("VISUAL_SPLIT_SAFE_MARGIN_RATIO", "0.03").strip()
 VISUAL_SPLIT_SHARPEN = os.getenv("VISUAL_SPLIT_SHARPEN", "0.7").strip()
+VISUAL_QUEUE_REDIS_ENABLED = os.getenv("VISUAL_QUEUE_REDIS_ENABLED", "0").strip()
+VISUAL_QUEUE_NAME = os.getenv("VISUAL_QUEUE_NAME", "visual:tasks:queue").strip()
+VISUAL_QUEUE_DRAIN_MAX_JOBS = os.getenv("VISUAL_QUEUE_DRAIN_MAX_JOBS", "3").strip()
+VISUAL_QUEUE_WORKER_LOCK_SECONDS = os.getenv("VISUAL_QUEUE_WORKER_LOCK_SECONDS", "3600").strip()
+VISUAL_QUEUE_POP_TIMEOUT_SECONDS = os.getenv("VISUAL_QUEUE_POP_TIMEOUT_SECONDS", "1").strip()
+VISUAL_QUEUE_RETRY_NAME = os.getenv("VISUAL_QUEUE_RETRY_NAME", "visual:tasks:retry").strip()
+VISUAL_QUEUE_DEAD_NAME = os.getenv("VISUAL_QUEUE_DEAD_NAME", "visual:tasks:dead").strip()
+VISUAL_QUEUE_MAX_RETRIES = os.getenv("VISUAL_QUEUE_MAX_RETRIES", "2").strip()
+VISUAL_QUEUE_RETRY_DELAY_SECONDS = os.getenv("VISUAL_QUEUE_RETRY_DELAY_SECONDS", "30").strip()
+VISUAL_USER_CONCURRENCY_LIMIT = os.getenv("VISUAL_USER_CONCURRENCY_LIMIT", "1").strip()
+VISUAL_TEAM_CONCURRENCY_LIMIT = os.getenv("VISUAL_TEAM_CONCURRENCY_LIMIT", "3").strip()
 
 TMAPI_API_TOKEN = os.getenv("TMAPI_API_TOKEN", "").strip()
 TMAPI_BASE_URL = os.getenv("TMAPI_BASE_URL", "http://api.tmapi.top").strip().rstrip("/")
@@ -80,6 +93,11 @@ TMAPI_BASE_URL = os.getenv("TMAPI_BASE_URL", "http://api.tmapi.top").strip().rst
 WORKBENCH_SYNC_TOKEN = (
     os.getenv("WORKBENCH_SYNC_TOKEN")
     or os.getenv("TEMU_WORKBENCH_SYNC_TOKEN")
+    or ""
+).strip()
+WORKBENCH_INGEST_TOKEN = (
+    os.getenv("WORKBENCH_INGEST_TOKEN")
+    or os.getenv("TEMU_WORKBENCH_INGEST_TOKEN")
     or ""
 ).strip()
 

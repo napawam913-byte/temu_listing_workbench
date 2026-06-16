@@ -1,10 +1,20 @@
-const DETAIL_URL_PATTERN = /^https?:\/\/(?:detail\.)?1688\.com\//i;
+const PAGE_PATTERNS = [
+  {
+    sourceSite: "1688",
+    pattern: /^https?:\/\/(?:[^/]+\.)?1688\.com\//i,
+  },
+  {
+    sourceSite: "temu",
+    pattern: /^https:\/\/(?:[^/]+\.)?temu\.com\//i,
+  },
+];
 const NOTIFY_COOLDOWN_MS = 250;
 
 const lastNotifyByTab = new Map();
 
-function is1688DetailPage(url) {
-  return DETAIL_URL_PATTERN.test(url || "");
+function detectPage(url) {
+  const match = PAGE_PATTERNS.find((item) => item.pattern.test(url || ""));
+  return match ? { sourceSite: match.sourceSite } : null;
 }
 
 async function enableSidePanel(tabId) {
@@ -20,7 +30,8 @@ async function enableSidePanel(tabId) {
 }
 
 async function notifyPanel(tabId, url) {
-  if (!is1688DetailPage(url)) return;
+  const page = detectPage(url);
+  if (!page) return;
 
   const key = `${tabId}:${url || ""}`;
   const now = Date.now();
@@ -32,9 +43,10 @@ async function notifyPanel(tabId, url) {
 
   try {
     await chrome.runtime.sendMessage({
-      type: "ACTIVE_1688_TAB_CHANGED",
+      type: "ACTIVE_MARKETPLACE_TAB_CHANGED",
       tabId,
       url: url || "",
+      sourceSite: page.sourceSite,
     });
   } catch {
     // The side panel may not be open yet.

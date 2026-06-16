@@ -8,7 +8,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_IMAGE_MODEL, OPENAI_IMAGE_QUALITY, OPENAI_TEXT_MODEL
-from app.core.database import get_app_setting_value
+from app.core.database import (
+    assert_user_api_usage_allowed,
+    get_app_setting_value,
+    get_enabled_admin_api_channel_credential,
+    get_enabled_user_api_credential,
+    record_api_usage_safe,
+)
 from app.modules.creative_generation.safety import find_sensitive_terms, sanitize_marketplace_text
 from app.modules.exports.dianxiaomi_temu import normalize_english_title
 from app.modules.image_storage.aliyun_oss import ImageStorageError, upload_image_bytes
@@ -70,13 +76,19 @@ class OpenAISettings:
     text_model: str
     image_model: str
     image_quality: str
+    channel_id: str = ""
 
 
-def generate_listing_package(record: dict[str, Any], *, generate_images: bool = True) -> dict[str, Any]:
-    title_settings = get_openai_settings("title")
-    image_settings = get_openai_settings("image")
+def generate_listing_package(record: dict[str, Any], *, generate_images: bool = True, user_id: str | None = None) -> dict[str, Any]:
+    title_settings = get_openai_settings("title", user_id=user_id)
+    image_settings = get_openai_settings("image", user_id=user_id)
     safe_title_cn, blocked_terms = sanitize_marketplace_text(record.get("productTitle"))
-    safe_title_en = generate_safe_english_title(record, safe_title_cn, title_settings if title_settings.api_key else None)
+    safe_title_en = generate_safe_english_title(
+        record,
+        safe_title_cn,
+        title_settings if title_settings.api_key else None,
+        user_id=user_id,
+    )
     title_terms = find_sensitive_terms(safe_title_en)
     if title_terms:
         safe_title_en, _ = sanitize_marketplace_text(safe_title_en)
@@ -106,7 +118,7 @@ def generate_listing_package(record: dict[str, Any], *, generate_images: bool = 
     product_id = clean_key_part(record.get("productId") or record.get("id") or "product")
     for index, plan in enumerate(image_plan, start=1):
         prompt = build_image_prompt(record, safe_title_en, plan)
-        image_bytes = generate_image_bytes(prompt, image_settings)
+        image_bytes = generate_image_bytes(prompt, image_settings, user_id=user_id)
         upload = upload_generated_image(image_bytes, product_id, plan["key"])
         generated_images.append(
             {
@@ -156,9 +168,25 @@ def generate_listing_package(record: dict[str, Any], *, generate_images: bool = 
     }
 
 
-def get_openai_settings(stage: str | None = None) -> OpenAISettings:
-    common_api_key = get_runtime_setting("OPENAI_API_KEY", OPENAI_API_KEY).strip()
-    common_base_url = get_runtime_setting("OPENAI_BASE_URL", OPENAI_BASE_URL).strip().rstrip("/")
+def get_openai_settings(stage: str | None = None, *, user_id: str | None = None) -> OpenAISettings:
+    user_credential = get_enabled_user_api_credential(user_id)
+    has_user_credential = bool(user_credential and user_credential.get("apiKey"))
+    admin_credential = None if has_user_credential else get_enabled_admin_api_channel_credential()
+    has_admin_credential = bool(admin_credential and admin_credential.get("apiKey"))
+    common_api_key = (
+        str(user_credential.get("apiKey") or "").strip()
+        if has_user_credential
+        else str(admin_credential.get("apiKey") or "").strip()
+        if has_admin_credential
+        else get_runtime_setting("OPENAI_API_KEY", OPENAI_API_KEY).strip()
+    )
+    common_base_url = (
+        str(user_credential.get("baseUrl") or "").strip().rstrip("/")
+        if has_user_credential
+        else str(admin_credential.get("baseUrl") or "").strip().rstrip("/")
+        if has_admin_credential
+        else get_runtime_setting("OPENAI_BASE_URL", OPENAI_BASE_URL).strip().rstrip("/")
+    )
     common_text_model = get_runtime_setting("OPENAI_TEXT_MODEL", OPENAI_TEXT_MODEL).strip() or "gpt-5.5"
     common_image_model = get_runtime_setting("OPENAI_IMAGE_MODEL", OPENAI_IMAGE_MODEL).strip() or "gpt-image-2"
     stage_prefixes = {
@@ -173,23 +201,35 @@ def get_openai_settings(stage: str | None = None) -> OpenAISettings:
     stage_key = clean_text(stage).lower().replace("-", "_")
     prefix = stage_prefixes.get(stage_key)
     if prefix:
-        api_key = get_runtime_setting(f"{prefix}_API_KEY", "").strip() or common_api_key
-        base_url = get_runtime_setting(f"{prefix}_BASE_URL", "").strip().rstrip("/") or common_base_url
         text_model = get_runtime_setting(f"{prefix}_MODEL", "").strip() or common_text_model
         image_model = get_runtime_setting("OPENAI_IMAGE_MODEL", OPENAI_IMAGE_MODEL).strip() or common_image_model
         if stage_key == "image":
             image_model = get_runtime_setting("OPENAI_IMAGE_MODEL", "").strip() or common_image_model
     else:
-        api_key = common_api_key
-        base_url = common_base_url
         text_model = common_text_model
         image_model = common_image_model
+    if has_user_credential or has_admin_credential:
+        api_key = common_api_key
+        base_url = common_base_url
+    elif prefix:
+        api_key = get_runtime_setting(f"{prefix}_API_KEY", "").strip() or common_api_key
+        base_url = get_runtime_setting(f"{prefix}_BASE_URL", "").strip().rstrip("/") or common_base_url
+    else:
+        api_key = common_api_key
+        base_url = common_base_url
     return OpenAISettings(
         api_key=api_key,
         base_url=base_url,
         text_model=text_model,
         image_model=image_model,
         image_quality=get_runtime_setting("OPENAI_IMAGE_QUALITY", OPENAI_IMAGE_QUALITY).strip() or "medium",
+        channel_id=(
+            str(user_credential.get("channelId") or "")
+            if has_user_credential
+            else str(admin_credential.get("channelId") or "")
+            if has_admin_credential
+            else ""
+        ),
     )
 
 
@@ -200,12 +240,19 @@ def get_runtime_setting(key: str, default: str = "") -> str:
     return os.getenv(key, default).strip()
 
 
-def generate_safe_english_title(record: dict[str, Any], safe_title_cn: str, settings: OpenAISettings | None) -> str:
+def generate_safe_english_title(
+    record: dict[str, Any],
+    safe_title_cn: str,
+    settings: OpenAISettings | None,
+    *,
+    user_id: str | None = None,
+) -> str:
     fallback = normalize_english_title(record.get("productTitleEn"), safe_title_cn or record.get("productTitle", ""))
     fallback, _ = sanitize_marketplace_text(fallback)
     if settings is None:
         return trim_title(fallback)
 
+    assert_user_api_usage_allowed(user_id)
     try:
         from openai import OpenAI
 
@@ -237,7 +284,26 @@ def generate_safe_english_title(record: dict[str, Any], safe_title_cn: str, sett
         text = response.output_text
         parsed = json.loads(text)
         title = parsed.get("title_en") or fallback
-    except Exception:
+        record_api_usage_safe(
+            provider="openai-compatible",
+            api_type="chat",
+            stage="title",
+            model=settings.text_model,
+            user_id=user_id,
+            channel_id=settings.channel_id,
+            status="success",
+        )
+    except Exception as exc:
+        record_api_usage_safe(
+            provider="openai-compatible",
+            api_type="chat",
+            stage="title",
+            model=settings.text_model,
+            user_id=user_id,
+            channel_id=settings.channel_id,
+            status="failed",
+            error_message=str(exc),
+        )
         title = fallback
 
     safe_title, _ = sanitize_marketplace_text(title)
@@ -414,20 +480,43 @@ def summarize_single_sku_sources(sku_entry: dict[str, Any]) -> str:
     return "; ".join(summaries)
 
 
-def generate_image_bytes(prompt: str, settings: OpenAISettings) -> bytes:
+def generate_image_bytes(prompt: str, settings: OpenAISettings, *, user_id: str | None = None) -> bytes:
+    assert_user_api_usage_allowed(user_id)
     try:
         from openai import OpenAI
     except ImportError as exc:
         raise CreativeGenerationError("缺少 Python 依赖 openai；请先执行 pip install -r backend/requirements.txt") from exc
 
     client = build_openai_client(settings)
-    response = client.images.generate(
-        model=settings.image_model,
-        prompt=prompt,
-        size=IMAGE_SIZE,
-        quality=settings.image_quality,
-        n=1,
-    )
+    try:
+        response = client.images.generate(
+            model=settings.image_model,
+            prompt=prompt,
+            size=IMAGE_SIZE,
+            quality=settings.image_quality,
+            n=1,
+        )
+        record_api_usage_safe(
+            provider="openai-compatible",
+            api_type="image",
+            stage="image",
+            model=settings.image_model,
+            user_id=user_id,
+            channel_id=settings.channel_id,
+            status="success",
+        )
+    except Exception as exc:
+        record_api_usage_safe(
+            provider="openai-compatible",
+            api_type="image",
+            stage="image",
+            model=settings.image_model,
+            user_id=user_id,
+            channel_id=settings.channel_id,
+            status="failed",
+            error_message=str(exc),
+        )
+        raise
     b64_json = response.data[0].b64_json
     if not b64_json:
         raise CreativeGenerationError("OpenAI 图片接口没有返回图片数据")

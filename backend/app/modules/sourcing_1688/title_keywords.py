@@ -4,6 +4,7 @@ import json
 import re
 from typing import Any
 
+from app.core.database import assert_user_api_usage_allowed, record_api_usage_safe
 from app.modules.creative_generation.chatgpt_listing import build_openai_client, get_openai_settings
 from app.modules.creative_generation.safety import sanitize_marketplace_text
 from app.modules.sourcing_1688.search_url import build_1688_search_url
@@ -60,18 +61,38 @@ PRODUCT_NOUNS = (
 )
 
 
-def split_title_for_1688_search(title: str, category: str = "") -> dict[str, Any]:
+def split_title_for_1688_search(title: str, category: str = "", *, user_id: str | None = None) -> dict[str, Any]:
     clean_title = clean_text(title)
     clean_category = clean_text(category)
     if not clean_title:
         raise ValueError("商品标题不能为空")
 
-    settings = get_openai_settings(TITLE_SPLIT_STAGE)
+    settings = get_openai_settings(TITLE_SPLIT_STAGE, user_id=user_id)
     if settings.api_key:
+        assert_user_api_usage_allowed(user_id)
         try:
             result = split_title_with_gpt(title=clean_title, category=clean_category, settings=settings)
+            record_api_usage_safe(
+                provider="openai-compatible",
+                api_type="chat",
+                stage=TITLE_SPLIT_STAGE,
+                model=settings.text_model,
+                user_id=user_id,
+                channel_id=settings.channel_id,
+                status="success",
+            )
             return {**result, "source": "gpt", "model": settings.text_model}
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            record_api_usage_safe(
+                provider="openai-compatible",
+                api_type="chat",
+                stage=TITLE_SPLIT_STAGE,
+                model=settings.text_model,
+                user_id=user_id,
+                channel_id=settings.channel_id,
+                status="failed",
+                error_message=str(exc),
+            )
             pass
 
     fallback = build_fallback_title_keywords(clean_title, clean_category)

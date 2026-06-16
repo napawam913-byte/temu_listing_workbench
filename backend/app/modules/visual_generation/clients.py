@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -11,7 +12,11 @@ from pathlib import Path
 from typing import Any
 
 from app.core import config as app_config
-from app.core.database import get_app_setting_value
+from app.core.database import (
+    get_app_setting_value,
+    get_enabled_admin_api_channel_credential,
+    get_enabled_user_api_credential,
+)
 
 try:
     from PIL import Image, ImageOps
@@ -39,6 +44,18 @@ RATE_LIMIT_MARKERS = (
     "concurrency_limit",
     "please retry later",
 )
+TRANSIENT_UPSTREAM_MARKERS = (
+    "HTTP 502",
+    "HTTP 503",
+    "HTTP 504",
+    "upstream_error",
+    "upstream service temporarily unavailable",
+    "temporarily unavailable",
+    "bad gateway",
+    "service unavailable",
+    "gateway timeout",
+)
+AI_UPSTREAM_RETRY_DELAYS_SECONDS = (0, 3, 8, 15)
 
 
 class VisualGenerationError(RuntimeError):
@@ -55,6 +72,11 @@ def is_rate_limit_error(error: BaseException | str) -> bool:
     return any(marker.lower() in text for marker in RATE_LIMIT_MARKERS)
 
 
+def is_transient_ai_error(error: BaseException | str) -> bool:
+    text = str(error or "").lower()
+    return any(marker.lower() in text for marker in TRANSIENT_UPSTREAM_MARKERS)
+
+
 def format_response_error(response_json: object) -> str:
     if not isinstance(response_json, dict):
         return ""
@@ -66,6 +88,8 @@ def format_response_error(response_json: object) -> str:
     error_type = str(error.get("type") or "")
     if error_type == "rate_limit_error" or is_rate_limit_error(f"{code} {message} {error_type}"):
         return f"AI rate limit: {message or error_type or code}"
+    if is_transient_ai_error(f"{code} {message} {error_type}"):
+        return f"AI upstream temporarily unavailable: {message or error_type or code}"
     if code or error_type or message:
         return f"AI API error {code or error_type}: {message}"
     return ""
@@ -78,14 +102,39 @@ def get_runtime_setting(key: str, default: str = "") -> str:
     return os.getenv(key, default).strip()
 
 
-def get_ai_settings() -> dict[str, str]:
-    base_url = get_runtime_setting("OPENAI_BASE_URL", app_config.OPENAI_BASE_URL).strip().rstrip("/")
+def get_ai_settings(user_id: str | None = None) -> dict[str, str]:
+    user_credential = get_enabled_user_api_credential(user_id)
+    has_user_credential = bool(user_credential and user_credential.get("apiKey"))
+    admin_credential = None if has_user_credential else get_enabled_admin_api_channel_credential()
+    has_admin_credential = bool(admin_credential and admin_credential.get("apiKey"))
+    base_url = (
+        str(user_credential.get("baseUrl") or "").strip().rstrip("/")
+        if has_user_credential
+        else str(admin_credential.get("baseUrl") or "").strip().rstrip("/")
+        if has_admin_credential
+        else get_runtime_setting("OPENAI_BASE_URL", app_config.OPENAI_BASE_URL).strip().rstrip("/")
+    )
     return {
-        "api_key": get_runtime_setting("OPENAI_API_KEY", app_config.OPENAI_API_KEY).strip(),
+        "api_key": (
+            str(user_credential.get("apiKey") or "").strip()
+            if has_user_credential
+            else str(admin_credential.get("apiKey") or "").strip()
+            if has_admin_credential
+            else get_runtime_setting("OPENAI_API_KEY", app_config.OPENAI_API_KEY).strip()
+        ),
         "base_url": base_url or DEFAULT_OPENAI_BASE_URL,
         "text_model": get_runtime_setting("OPENAI_TEXT_MODEL", app_config.OPENAI_TEXT_MODEL).strip() or "gpt-5.5",
         "image_model": get_runtime_setting("OPENAI_IMAGE_MODEL", app_config.OPENAI_IMAGE_MODEL).strip() or "gpt-image-2",
         "image_quality": get_runtime_setting("OPENAI_IMAGE_QUALITY", app_config.OPENAI_IMAGE_QUALITY).strip() or "medium",
+        "channel_id": (
+            str(user_credential.get("channelId") or "")
+            if has_user_credential
+            else str(admin_credential.get("channelId") or "")
+            if has_admin_credential
+            else ""
+        ),
+        "has_user_credential": "1" if has_user_credential else "",
+        "has_channel_credential": "1" if has_user_credential or has_admin_credential else "",
     }
 
 
@@ -99,8 +148,8 @@ AI_STAGE_SETTING_PREFIXES = {
 }
 
 
-def get_ai_stage_settings(stage: str) -> dict[str, str]:
-    common = get_ai_settings()
+def get_ai_stage_settings(stage: str, user_id: str | None = None) -> dict[str, str]:
+    common = get_ai_settings(user_id=user_id)
     stage_key = str(stage or "").strip().lower().replace("-", "_")
     prefix = AI_STAGE_SETTING_PREFIXES.get(stage_key)
     if not prefix:
@@ -109,17 +158,23 @@ def get_ai_stage_settings(stage: str) -> dict[str, str]:
             "base_url": common["base_url"],
             "model": common["text_model"],
             "image_quality": common["image_quality"],
+            "channel_id": common.get("channel_id", ""),
         }
 
     fallback_model = common["image_model"] if stage_key == "image" else common["text_model"]
-    api_key = get_runtime_setting(f"{prefix}_API_KEY", "").strip() or common["api_key"]
-    base_url = get_runtime_setting(f"{prefix}_BASE_URL", "").strip().rstrip("/") or common["base_url"]
     model = get_runtime_setting(f"{prefix}_MODEL", "").strip() or fallback_model
+    if common.get("has_channel_credential"):
+        api_key = common["api_key"]
+        base_url = common["base_url"]
+    else:
+        api_key = get_runtime_setting(f"{prefix}_API_KEY", "").strip() or common["api_key"]
+        base_url = get_runtime_setting(f"{prefix}_BASE_URL", "").strip().rstrip("/") or common["base_url"]
     return {
         "api_key": api_key,
         "base_url": base_url or DEFAULT_OPENAI_BASE_URL,
         "model": model,
         "image_quality": common["image_quality"],
+        "channel_id": common.get("channel_id", ""),
     }
 
 
@@ -134,35 +189,49 @@ def request_json(api_url: str, api_key: str, payload: dict[str, Any], *, timeout
         raise VisualGenerationError("AI API Key is not configured")
 
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(
-        api_url,
-        data=body,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            response_body = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace")
-        raise VisualGenerationError(format_http_error(exc.code, error_body)) from exc
-    except urllib.error.URLError as exc:
-        raise VisualGenerationError(f"AI request failed: {exc}") from exc
-    except TimeoutError as exc:
-        raise VisualGenerationError(f"AI request timed out: {exc}") from exc
+    last_error: VisualGenerationError | None = None
+    for attempt, delay_seconds in enumerate(AI_UPSTREAM_RETRY_DELAYS_SECONDS):
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
+        request = urllib.request.Request(
+            api_url,
+            data=body,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                response_body = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            error = VisualGenerationError(format_http_error(exc.code, error_body))
+            if should_retry_transient_error(error, attempt):
+                last_error = error
+                continue
+            raise error from exc
+        except urllib.error.URLError as exc:
+            raise VisualGenerationError(f"AI request failed: {exc}") from exc
+        except TimeoutError as exc:
+            raise VisualGenerationError(f"AI request timed out: {exc}") from exc
 
-    try:
-        parsed = json.loads(response_body)
-    except json.JSONDecodeError as exc:
-        raise VisualGenerationError(f"AI API did not return JSON: {response_body[:500]}") from exc
-    response_error = format_response_error(parsed)
-    if response_error:
-        raise VisualGenerationError(response_error)
-    return parsed
+        try:
+            parsed = json.loads(response_body)
+        except json.JSONDecodeError as exc:
+            raise VisualGenerationError(f"AI API did not return JSON: {response_body[:500]}") from exc
+        response_error = format_response_error(parsed)
+        if response_error:
+            error = VisualGenerationError(response_error)
+            if should_retry_transient_error(error, attempt):
+                last_error = error
+                continue
+            raise error
+        return parsed
+
+    raise last_error or VisualGenerationError("AI request failed")
 
 
 def request_multipart(
@@ -195,35 +264,54 @@ def request_multipart(
         body.extend(b"\r\n")
     body.extend(f"--{boundary}--\r\n".encode("utf-8"))
 
-    request = urllib.request.Request(
-        api_url,
-        data=bytes(body),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "Accept": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            response_body = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace")
-        raise VisualGenerationError(format_http_error(exc.code, error_body)) from exc
-    except urllib.error.URLError as exc:
-        raise VisualGenerationError(f"AI request failed: {exc}") from exc
-    except TimeoutError as exc:
-        raise VisualGenerationError(f"AI request timed out: {exc}") from exc
+    request_body = bytes(body)
+    last_error: VisualGenerationError | None = None
+    for attempt, delay_seconds in enumerate(AI_UPSTREAM_RETRY_DELAYS_SECONDS):
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
+        request = urllib.request.Request(
+            api_url,
+            data=request_body,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                response_body = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            error = VisualGenerationError(format_http_error(exc.code, error_body))
+            if should_retry_transient_error(error, attempt):
+                last_error = error
+                continue
+            raise error from exc
+        except urllib.error.URLError as exc:
+            raise VisualGenerationError(f"AI request failed: {exc}") from exc
+        except TimeoutError as exc:
+            raise VisualGenerationError(f"AI request timed out: {exc}") from exc
 
-    try:
-        parsed = json.loads(response_body)
-    except json.JSONDecodeError as exc:
-        raise VisualGenerationError(f"AI API did not return JSON: {response_body[:500]}") from exc
-    response_error = format_response_error(parsed)
-    if response_error:
-        raise VisualGenerationError(response_error)
-    return parsed
+        try:
+            parsed = json.loads(response_body)
+        except json.JSONDecodeError as exc:
+            raise VisualGenerationError(f"AI API did not return JSON: {response_body[:500]}") from exc
+        response_error = format_response_error(parsed)
+        if response_error:
+            error = VisualGenerationError(response_error)
+            if should_retry_transient_error(error, attempt):
+                last_error = error
+                continue
+            raise error
+        return parsed
+
+    raise last_error or VisualGenerationError("AI request failed")
+
+
+def should_retry_transient_error(error: BaseException | str, attempt: int) -> bool:
+    return is_transient_ai_error(error) and attempt < len(AI_UPSTREAM_RETRY_DELAYS_SECONDS) - 1
 
 
 def format_http_error(status_code: int, error_body: str) -> str:
@@ -303,37 +391,8 @@ def download_image(url: str) -> bytes:
 
 
 def image_file_to_data_url(path: Path, *, max_side: int | None = None, quality: int = 86) -> str:
-    if max_side and Image is not None and ImageOps is not None:
-        try:
-            with Image.open(path) as image:
-                image = ImageOps.exif_transpose(image)
-                resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
-                image.thumbnail((max_side, max_side), resampling)
-                if image.mode not in {"RGB", "L"}:
-                    background = Image.new("RGB", image.size, (255, 255, 255))
-                    if image.mode == "RGBA":
-                        background.paste(image, mask=image.getchannel("A"))
-                    else:
-                        background.paste(image.convert("RGB"))
-                    image = background
-                elif image.mode != "RGB":
-                    image = image.convert("RGB")
-                output = io.BytesIO()
-                image.save(output, format="JPEG", quality=max(45, min(95, quality)), optimize=True)
-                encoded = base64.b64encode(output.getvalue()).decode("ascii")
-                return f"data:image/jpeg;base64,{encoded}"
-        except Exception:
-            pass
-
-    suffix = path.suffix.lower()
-    mime_type = {
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".png": "image/png",
-        ".webp": "image/webp",
-        ".bmp": "image/bmp",
-    }.get(suffix, "image/jpeg")
-    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    _, mime_type, image_bytes = normalize_image_file_for_model(path, max_side=max_side, quality=quality)
+    encoded = base64.b64encode(image_bytes).decode("ascii")
     return f"data:{mime_type};base64,{encoded}"
 
 
@@ -343,37 +402,48 @@ def image_file_to_upload(
     max_side: int | None = None,
     quality: int = 86,
 ) -> tuple[str, str, bytes]:
-    if max_side and Image is not None and ImageOps is not None:
-        try:
-            with Image.open(path) as image:
-                image = ImageOps.exif_transpose(image)
+    return normalize_image_file_for_model(path, max_side=max_side, quality=quality)
+
+
+def normalize_image_file_for_model(
+    path: Path,
+    *,
+    max_side: int | None = None,
+    quality: int = 86,
+) -> tuple[str, str, bytes]:
+    if Image is None or ImageOps is None:
+        raise VisualGenerationError("Pillow is required to validate and normalize reference images")
+
+    try:
+        with Image.open(path) as image:
+            image.load()
+            image = ImageOps.exif_transpose(image)
+            try:
+                if getattr(image, "is_animated", False):
+                    image.seek(0)
+            except Exception:
+                pass
+
+            if max_side:
                 resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
                 image.thumbnail((max_side, max_side), resampling)
-                if image.mode not in {"RGB", "L"}:
-                    background = Image.new("RGB", image.size, (255, 255, 255))
-                    if image.mode == "RGBA":
-                        background.paste(image, mask=image.getchannel("A"))
-                    else:
-                        background.paste(image.convert("RGB"))
-                    image = background
-                elif image.mode != "RGB":
-                    image = image.convert("RGB")
-                output = io.BytesIO()
-                image.save(output, format="JPEG", quality=max(45, min(95, quality)), optimize=True)
-                return (f"{path.stem or 'reference'}.jpg", "image/jpeg", output.getvalue())
-        except Exception:
-            pass
 
-    suffix = path.suffix.lower()
-    mime_type = {
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".png": "image/png",
-        ".webp": "image/webp",
-        ".bmp": "image/bmp",
-    }.get(suffix, "image/jpeg")
-    filename = path.name or "reference.jpg"
-    return (filename, mime_type, path.read_bytes())
+            if image.mode in {"RGBA", "LA"} or (image.mode == "P" and "transparency" in image.info):
+                image = image.convert("RGBA")
+                background = Image.new("RGB", image.size, (255, 255, 255))
+                background.paste(image, mask=image.getchannel("A"))
+                image = background
+            elif image.mode != "RGB":
+                image = image.convert("RGB")
+
+            output = io.BytesIO()
+            image.save(output, format="JPEG", quality=max(45, min(95, quality)), optimize=True)
+            return (f"{path.stem or 'reference'}.jpg", "image/jpeg", output.getvalue())
+    except Exception as exc:
+        raise VisualGenerationError(
+            f"Invalid or unsupported reference image file: {path}. "
+            "Use a valid JPEG, PNG, GIF, or WebP image."
+        ) from exc
 
 
 def extract_response_text(response_json: dict[str, Any]) -> str:

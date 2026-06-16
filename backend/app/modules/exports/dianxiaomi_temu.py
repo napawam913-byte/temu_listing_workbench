@@ -104,6 +104,7 @@ def build_template_rows(
             record,
             fallback_title_cn=product_title,
             fallback_title_en=product_title_en,
+            user_id=user_id,
         )
         product_title = clean_text(optimized_titles.get("title_cn")) or product_title
         product_title_en = clean_text(optimized_titles.get("title_en")) or product_title_en
@@ -143,7 +144,7 @@ def build_template_rows(
     ]
 
     variant_value_translations = (
-        translate_variant_values_to_english(raw_variant_values)
+        translate_variant_values_to_english(raw_variant_values, user_id=user_id)
         if translate_variants
         else {value: fallback_translate_variant_value(value) for value in raw_variant_values}
     )

@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 from app.core.config import UPLOADS_DIR, ensure_runtime_dirs
-from app.core.database import insert_upload_batch, replace_products, utc_now_text
+from app.core.database import PRODUCT_CATALOG_SCOPE_POOL_ONLY, insert_upload_batch, replace_products, utc_now_text
 
 
 class Link1688ImportError(Exception):
@@ -62,7 +62,12 @@ def import_1688_links(
         status="imported",
         error_message="\n".join(errors[:20]) if errors else None,
     )
-    replace_products(batch_id, products, add_to_pool_user_id=add_to_pool_user_id)
+    replace_products(
+        batch_id,
+        products,
+        add_to_pool_user_id=add_to_pool_user_id,
+        catalog_scope=PRODUCT_CATALOG_SCOPE_POOL_ONLY if add_to_pool_user_id else None,
+    )
 
     return {
         "batch_id": batch_id,

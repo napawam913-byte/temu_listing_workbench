@@ -102,6 +102,44 @@ class AuthAndUserIsolationTest(unittest.TestCase):
             finally:
                 database.DATABASE_PATH = original_path
 
+    def test_expired_sessions_are_ignored_by_auth_and_user_counts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_path = database.DATABASE_PATH
+            original_ttl = database.WORKBENCH_SESSION_COOKIE_MAX_AGE_SECONDS
+            database.DATABASE_PATH = Path(tmpdir) / "app.db"
+            database.WORKBENCH_SESSION_COOKIE_MAX_AGE_SECONDS = 1
+            try:
+                database.init_db()
+                user = database.create_user("carol", "secret123")
+                old_session = database.create_user_session(user["id"])
+                old_time = "2000-01-01 00:00:00"
+                with database.get_connection() as conn:
+                    conn.execute(
+                        """
+                        UPDATE user_sessions
+                        SET created_at = ?, updated_at = ?, last_seen_at = ?
+                        WHERE token = ?
+                        """,
+                        (old_time, old_time, old_time, old_session["token"]),
+                    )
+
+                self.assertIsNone(database.get_user_by_session_token(old_session["token"]))
+                with database.get_connection() as conn:
+                    status = conn.execute(
+                        "SELECT status FROM user_sessions WHERE token = ?",
+                        (old_session["token"],),
+                    ).fetchone()["status"]
+                self.assertEqual(status, "expired")
+
+                fresh_session = database.create_user_session(user["id"])
+                self.assertEqual(database.get_user_by_session_token(fresh_session["token"])["username"], "carol")
+
+                users_by_name = {row["username"]: row for row in database.list_users()}
+                self.assertEqual(users_by_name["carol"]["activeSessionCount"], 1)
+            finally:
+                database.WORKBENCH_SESSION_COOKIE_MAX_AGE_SECONDS = original_ttl
+                database.DATABASE_PATH = original_path
+
     def test_link_records_are_user_scoped(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             original_path = database.DATABASE_PATH

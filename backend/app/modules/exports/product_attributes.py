@@ -7,10 +7,12 @@ import uuid
 from typing import Any
 
 from app.core.database import (
+    assert_user_api_usage_allowed,
     build_text_vector,
     cosine_similarity,
     ensure_export_product_attribute_schema,
     get_connection,
+    record_api_usage_safe,
     sync_canonical_categories_from_dxm,
     utc_now_text,
 )
@@ -179,7 +181,7 @@ def process_pending_product_attribute_jobs(*, user_id: str, limit: int = 20) -> 
         mark_job_running(job_id, user_id=user_id)
         try:
             record = json.loads(row["record_json"] or "{}")
-            result = generate_product_attribute_for_record(record)
+            result = generate_product_attribute_for_record(record, user_id=user_id)
             mark_job_done(job_id, user_id=user_id, result=result)
             processed += 1
         except Exception as exc:  # queue captures provider/category failures
@@ -259,7 +261,7 @@ def get_product_attribute_for_export_record(record: dict[str, Any], *, user_id: 
         return cached
 
     try:
-        result = generate_product_attribute_for_record(record)
+        result = generate_product_attribute_for_record(record, user_id=uid)
     except Exception as exc:
         clear_failed_product_attribute_cache_for_record(record, user_id=uid)
         return {}
@@ -438,9 +440,9 @@ def mark_job_failed(job_id: str, *, user_id: str, error: str) -> None:
         )
 
 
-def generate_product_attribute_for_record(record: dict[str, Any]) -> dict[str, Any]:
+def generate_product_attribute_for_record(record: dict[str, Any], *, user_id: str | None = None) -> dict[str, Any]:
     with get_connection() as conn:
-        category = resolve_category_for_record(conn, record)
+        category = resolve_category_for_record(conn, record, user_id=user_id)
         if not category:
             raise ValueError("No matching category attribute definition was found for this product")
         fields = load_category_fields(conn, str(category["category_id"]))
@@ -450,9 +452,9 @@ def generate_product_attribute_for_record(record: dict[str, Any]) -> dict[str, A
 
     ai_result: dict[str, Any] = {}
     ai_error = ""
-    if is_product_attribute_ai_configured():
+    if is_product_attribute_ai_configured(user_id=user_id):
         try:
-            ai_result = request_product_attribute_ai(record, category, fields)
+            ai_result = request_product_attribute_ai(record, category, fields, user_id=user_id)
         except Exception as exc:
             ai_error = str(exc)
 
@@ -467,7 +469,7 @@ def generate_product_attribute_for_record(record: dict[str, Any]) -> dict[str, A
     }
 
 
-def resolve_category_for_record(conn: Any, record: dict[str, Any]) -> dict[str, Any] | None:
+def resolve_category_for_record(conn: Any, record: dict[str, Any], *, user_id: str | None = None) -> dict[str, Any] | None:
     product_context = load_product_context(conn, record)
     explicit_category_id = first_non_empty(
         record.get("categoryId"),
@@ -493,7 +495,7 @@ def resolve_category_for_record(conn: Any, record: dict[str, Any]) -> dict[str, 
     if context_category:
         return context_category
 
-    semantic_category = resolve_category_by_ai_vector(conn, record, product_context)
+    semantic_category = resolve_category_by_ai_vector(conn, record, product_context, user_id=user_id)
     if semantic_category:
         return semantic_category
 
@@ -587,20 +589,26 @@ def resolve_category_by_known_path(conn: Any, record: dict[str, Any], product_co
     return None
 
 
-def resolve_category_by_ai_vector(conn: Any, record: dict[str, Any], product_context: dict[str, Any]) -> dict[str, Any] | None:
+def resolve_category_by_ai_vector(
+    conn: Any,
+    record: dict[str, Any],
+    product_context: dict[str, Any],
+    *,
+    user_id: str | None = None,
+) -> dict[str, Any] | None:
     categories = load_canonical_categories_for_attribute_match(conn)
     leaves = [category for category in categories if clean_text(category.get("external_category_id")) and int(category.get("attr_count") or 0) > 0]
     if not leaves:
         return None
 
-    intent = build_category_intent(record, product_context, use_ai=False)
-    leaf = resolve_category_leaf_by_vector(record, product_context, leaves, intent, allow_ai_final=False)
+    intent = build_category_intent(record, product_context, use_ai=False, user_id=user_id)
+    leaf = resolve_category_leaf_by_vector(record, product_context, leaves, intent, allow_ai_final=False, user_id=user_id)
     if leaf and float(leaf.get("score") or 0) >= CATEGORY_VECTOR_CONFIDENT_SCORE:
         return load_snapshot_for_category_leaf(conn, leaf)
 
-    if is_product_attribute_ai_configured():
-        ai_intent = build_category_intent(record, product_context, use_ai=True)
-        ai_leaf = resolve_category_leaf_by_vector(record, product_context, leaves, ai_intent, allow_ai_final=False)
+    if is_product_attribute_ai_configured(user_id=user_id):
+        ai_intent = build_category_intent(record, product_context, use_ai=True, user_id=user_id)
+        ai_leaf = resolve_category_leaf_by_vector(record, product_context, leaves, ai_intent, allow_ai_final=False, user_id=user_id)
         if ai_leaf:
             return load_snapshot_for_category_leaf(conn, ai_leaf)
 
@@ -616,6 +624,7 @@ def resolve_category_leaf_by_vector(
     intent: dict[str, Any],
     *,
     allow_ai_final: bool,
+    user_id: str | None = None,
 ) -> dict[str, Any] | None:
     query_text = category_query_text(record, product_context, intent)
     query_vector = build_text_vector(query_text)
@@ -639,7 +648,12 @@ def resolve_category_leaf_by_vector(
             break
 
     if allow_ai_final:
-        return choose_final_leaf_with_ai(record=record, intent=intent, leaves=current_leaves[:CATEGORY_BRANCH_CANDIDATE_LIMIT]) or (current_leaves[0] if current_leaves else None)
+        return choose_final_leaf_with_ai(
+            record=record,
+            intent=intent,
+            leaves=current_leaves[:CATEGORY_BRANCH_CANDIDATE_LIMIT],
+            user_id=user_id,
+        ) or (current_leaves[0] if current_leaves else None)
     return current_leaves[0] if current_leaves else None
 
 
@@ -703,7 +717,13 @@ def category_vector_cache_key(conn: Any) -> str:
     return f"connection:{id(conn)}"
 
 
-def build_category_intent(record: dict[str, Any], product_context: dict[str, Any], *, use_ai: bool) -> dict[str, Any]:
+def build_category_intent(
+    record: dict[str, Any],
+    product_context: dict[str, Any],
+    *,
+    use_ai: bool,
+    user_id: str | None = None,
+) -> dict[str, Any]:
     fallback = {
         "product_type": clean_text(record.get("productTitle")),
         "core_keywords": split_search_terms(category_query_text(record, product_context, {}))[:12],
@@ -714,10 +734,10 @@ def build_category_intent(record: dict[str, Any], product_context: dict[str, Any
             clean_text(product_context.get("category_level2")),
         ]),
     }
-    if not use_ai or not is_product_attribute_ai_configured():
+    if not use_ai or not is_product_attribute_ai_configured(user_id=user_id):
         return fallback
     try:
-        ai_result = request_category_intent_ai(record, product_context)
+        ai_result = request_category_intent_ai(record, product_context, user_id=user_id)
     except Exception:
         return fallback
     if not isinstance(ai_result, dict):
@@ -726,8 +746,13 @@ def build_category_intent(record: dict[str, Any], product_context: dict[str, Any
     return merged
 
 
-def request_category_intent_ai(record: dict[str, Any], product_context: dict[str, Any]) -> dict[str, Any]:
-    settings = get_ai_stage_settings("product_attribute")
+def request_category_intent_ai(
+    record: dict[str, Any],
+    product_context: dict[str, Any],
+    *,
+    user_id: str | None = None,
+) -> dict[str, Any]:
+    settings = get_ai_stage_settings("product_attribute", user_id=user_id)
     instruction = {
         "task": "Parse the product title into category matching signals for a Temu/Dianxiaomi category tree. Return concise category terms only, not marketing copy.",
         "output_schema": {
@@ -747,13 +772,20 @@ def request_category_intent_ai(record: dict[str, Any], product_context: dict[str
             "known_category_path": first_non_empty(record_category_path(record), product_context.get("category_path")),
         },
     }
-    return request_text_json(
-        api_url=build_api_url(settings["base_url"]),
-        api_key=settings["api_key"],
-        model=settings["model"],
-        instruction=json.dumps(instruction, ensure_ascii=False),
-        temperature=0.05,
-    )
+    assert_user_api_usage_allowed(user_id)
+    try:
+        result = request_text_json(
+            api_url=build_api_url(settings["base_url"]),
+            api_key=settings["api_key"],
+            model=settings["model"],
+            instruction=json.dumps(instruction, ensure_ascii=False),
+            temperature=0.05,
+        )
+        record_product_attribute_usage(settings, user_id=user_id, status="success")
+        return result
+    except Exception as exc:
+        record_product_attribute_usage(settings, user_id=user_id, status="failed", error_message=str(exc))
+        raise
 
 
 def category_query_text(record: dict[str, Any], product_context: dict[str, Any], intent: dict[str, Any]) -> str:
@@ -860,8 +892,9 @@ def choose_category_branch_with_ai(
     intent: dict[str, Any],
     current_path: list[str],
     branches: list[dict[str, Any]],
+    user_id: str | None = None,
 ) -> dict[str, Any] | None:
-    if not branches or not is_product_attribute_ai_configured():
+    if not branches or not is_product_attribute_ai_configured(user_id=user_id):
         return None
     result = request_category_branch_ai(
         record=record,
@@ -869,14 +902,21 @@ def choose_category_branch_with_ai(
         current_path=current_path,
         candidates=branches,
         task="Choose the next category branch that best fits the product.",
+        user_id=user_id,
     )
     return candidate_from_ai_choice(result, branches)
 
 
-def choose_final_leaf_with_ai(*, record: dict[str, Any], intent: dict[str, Any], leaves: list[dict[str, Any]]) -> dict[str, Any] | None:
+def choose_final_leaf_with_ai(
+    *,
+    record: dict[str, Any],
+    intent: dict[str, Any],
+    leaves: list[dict[str, Any]],
+    user_id: str | None = None,
+) -> dict[str, Any] | None:
     if not leaves:
         return None
-    if len(leaves) == 1 or not is_product_attribute_ai_configured():
+    if len(leaves) == 1 or not is_product_attribute_ai_configured(user_id=user_id):
         return leaves[0]
     result = request_category_branch_ai(
         record=record,
@@ -894,6 +934,7 @@ def choose_final_leaf_with_ai(*, record: dict[str, Any], intent: dict[str, Any],
             for leaf in leaves
         ],
         task="Choose the final leaf category that best fits the product.",
+        user_id=user_id,
     )
     return candidate_from_ai_choice(result, leaves) or leaves[0]
 
@@ -905,8 +946,9 @@ def request_category_branch_ai(
     current_path: list[str],
     candidates: list[dict[str, Any]],
     task: str,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
-    settings = get_ai_stage_settings("product_attribute")
+    settings = get_ai_stage_settings("product_attribute", user_id=user_id)
     payload_candidates = [
         {
             "index": index,
@@ -935,15 +977,19 @@ def request_category_branch_ai(
         "current_category_path": current_path,
         "candidates": payload_candidates,
     }
+    assert_user_api_usage_allowed(user_id)
     try:
-        return request_text_json(
+        result = request_text_json(
             api_url=build_api_url(settings["base_url"]),
             api_key=settings["api_key"],
             model=settings["model"],
             instruction=json.dumps(instruction, ensure_ascii=False),
             temperature=0.05,
         )
-    except Exception:
+        record_product_attribute_usage(settings, user_id=user_id, status="success")
+        return result
+    except Exception as exc:
+        record_product_attribute_usage(settings, user_id=user_id, status="failed", error_message=str(exc))
         return {}
 
 
@@ -1076,8 +1122,14 @@ def load_category_fields(conn: Any, category_id: str) -> list[dict[str, Any]]:
     return result
 
 
-def request_product_attribute_ai(record: dict[str, Any], category: dict[str, Any], fields: list[dict[str, Any]]) -> dict[str, Any]:
-    settings = get_ai_stage_settings("product_attribute")
+def request_product_attribute_ai(
+    record: dict[str, Any],
+    category: dict[str, Any],
+    fields: list[dict[str, Any]],
+    *,
+    user_id: str | None = None,
+) -> dict[str, Any]:
+    settings = get_ai_stage_settings("product_attribute", user_id=user_id)
     api_url = build_api_url(settings["base_url"], "/chat/completions")
     compact_fields = []
     for field in fields[:50]:
@@ -1133,12 +1185,38 @@ def request_product_attribute_ai(record: dict[str, Any], category: dict[str, Any
         },
         "fields": compact_fields,
     }
-    return request_text_json(
-        api_url=api_url,
-        api_key=settings["api_key"],
-        model=settings["model"],
-        instruction=json.dumps(instruction, ensure_ascii=False),
-        temperature=0.15,
+    assert_user_api_usage_allowed(user_id)
+    try:
+        result = request_text_json(
+            api_url=api_url,
+            api_key=settings["api_key"],
+            model=settings["model"],
+            instruction=json.dumps(instruction, ensure_ascii=False),
+            temperature=0.15,
+        )
+        record_product_attribute_usage(settings, user_id=user_id, status="success")
+        return result
+    except Exception as exc:
+        record_product_attribute_usage(settings, user_id=user_id, status="failed", error_message=str(exc))
+        raise
+
+
+def record_product_attribute_usage(
+    settings: dict[str, str],
+    *,
+    user_id: str | None,
+    status: str,
+    error_message: str | None = None,
+) -> None:
+    record_api_usage_safe(
+        provider="openai-compatible",
+        api_type="chat",
+        stage="product_attribute",
+        model=settings.get("model") or "unknown",
+        user_id=user_id,
+        channel_id=settings.get("channel_id"),
+        status=status,
+        error_message=error_message,
     )
 
 
@@ -1804,8 +1882,8 @@ def sku_names_for_prompt(record: dict[str, Any]) -> list[str]:
     return unique_strings(names)[:80]
 
 
-def is_product_attribute_ai_configured() -> bool:
-    settings = get_ai_stage_settings("product_attribute")
+def is_product_attribute_ai_configured(*, user_id: str | None = None) -> bool:
+    settings = get_ai_stage_settings("product_attribute", user_id=user_id)
     return bool(clean_text(settings.get("api_key")))
 
 

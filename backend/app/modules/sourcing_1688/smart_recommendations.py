@@ -6,7 +6,7 @@ import re
 from typing import Any
 from urllib.parse import quote
 
-from app.core.database import get_connection
+from app.core.database import assert_user_api_usage_allowed, get_connection, record_api_usage_safe
 from app.modules.creative_generation.chatgpt_listing import build_openai_client, get_openai_settings
 from app.modules.creative_generation.safety import sanitize_marketplace_text
 from app.modules.recommendation.keyword_index import ensure_recommendation_schema
@@ -117,8 +117,8 @@ STOP_TERMS = {
 }
 
 
-def generate_smart_1688_keywords(product: dict[str, Any]) -> dict[str, Any]:
-    analysis = analyze_product_for_1688(product)
+def generate_smart_1688_keywords(product: dict[str, Any], *, user_id: str | None = None) -> dict[str, Any]:
+    analysis = analyze_product_for_1688(product, user_id=user_id)
     return {**analysis, "keywords": attach_search_urls(analysis["keywords"])}
 
 
@@ -127,6 +127,7 @@ def generate_smart_1688_recommendations(
     *,
     keywords: list[dict[str, Any] | str] | None = None,
     limit: int = DEFAULT_LIMIT,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     safe_limit = max(1, min(12, limit))
     selected_keywords = normalize_selected_keywords(keywords)
@@ -138,7 +139,7 @@ def generate_smart_1688_recommendations(
             "keywords": selected_keywords,
         }
     else:
-        analysis = analyze_product_for_1688(product)
+        analysis = analyze_product_for_1688(product, user_id=user_id)
 
     local_candidates = list_local_product_sources(product, analysis["keywords"])
     scored_candidates = score_local_candidates(local_candidates, product, analysis["keywords"])
@@ -214,8 +215,8 @@ def normalize_selected_keywords(keywords: list[dict[str, Any] | str] | None) -> 
     return unique_keyword_items(normalized_items)[:8]
 
 
-def analyze_product_for_1688(product: dict[str, Any]) -> dict[str, Any]:
-    settings = get_openai_settings("recommendation")
+def analyze_product_for_1688(product: dict[str, Any], *, user_id: str | None = None) -> dict[str, Any]:
+    settings = get_openai_settings("recommendation", user_id=user_id)
     title = clean_text(product.get("title") or product.get("titleEn"))
     category = clean_text(product.get("category") or product.get("categoryPath"))
     main_image_url = clean_text(product.get("mainImageUrl") or product.get("main_image_url"))
@@ -227,11 +228,31 @@ def analyze_product_for_1688(product: dict[str, Any]) -> dict[str, Any]:
         return {**cached_analysis, "cache": {"hit": True, "key": cache_key}}
 
     if settings.api_key:
+        assert_user_api_usage_allowed(user_id)
         try:
             analysis = analyze_with_chatgpt(title=title, category=category, main_image_url=main_image_url, settings=settings)
+            record_api_usage_safe(
+                provider="openai-compatible",
+                api_type="chat",
+                stage="recommendation",
+                model=settings.text_model,
+                user_id=user_id,
+                channel_id=settings.channel_id,
+                status="success",
+            )
             save_cached_analysis(cache_key, title_hash, analysis, model=settings.text_model)
             return {**analysis, "cache": {"hit": False, "key": cache_key}}
-        except Exception:
+        except Exception as exc:
+            record_api_usage_safe(
+                provider="openai-compatible",
+                api_type="chat",
+                stage="recommendation",
+                model=settings.text_model,
+                user_id=user_id,
+                channel_id=settings.channel_id,
+                status="failed",
+                error_message=str(exc),
+            )
             pass
 
     analysis = build_fallback_analysis(title, category)

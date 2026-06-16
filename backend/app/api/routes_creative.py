@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from app.api.auth import require_current_user
 from app.core.database import list_sensitive_terms
 from app.modules.creative_generation.chatgpt_listing import CreativeGenerationError, generate_listing_package
 from app.modules.creative_generation.plugin_jobs import (
@@ -55,25 +56,39 @@ class Smart1688RecommendationsRequest(BaseModel):
 
 
 @router.post("/chatgpt/listing-package")
-def create_chatgpt_listing_package(payload: ChatgptListingPackageRequest):
+def create_chatgpt_listing_package(
+    payload: ChatgptListingPackageRequest,
+    current_user: dict[str, Any] = Depends(require_current_user),
+):
     try:
-        return generate_listing_package(payload.record, generate_images=payload.generate_images)
+        return generate_listing_package(payload.record, generate_images=payload.generate_images, user_id=str(current_user["id"]))
     except CreativeGenerationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/1688-smart-recommendations")
-def create_1688_smart_recommendations(payload: Smart1688RecommendationsRequest):
+def create_1688_smart_recommendations(
+    payload: Smart1688RecommendationsRequest,
+    current_user: dict[str, Any] = Depends(require_current_user),
+):
     try:
-        return generate_smart_1688_recommendations(payload.product, keywords=payload.keywords, limit=payload.limit)
+        return generate_smart_1688_recommendations(
+            payload.product,
+            keywords=payload.keywords,
+            limit=payload.limit,
+            user_id=str(current_user["id"]),
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/1688-smart-keywords")
-def create_1688_smart_keywords(payload: Smart1688RecommendationsRequest):
+def create_1688_smart_keywords(
+    payload: Smart1688RecommendationsRequest,
+    current_user: dict[str, Any] = Depends(require_current_user),
+):
     try:
-        return generate_smart_1688_keywords(payload.product)
+        return generate_smart_1688_keywords(payload.product, user_id=str(current_user["id"]))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

@@ -31,6 +31,10 @@ export type AdminUser = {
   displayName: string;
   role: 'admin' | 'user';
   status: 'active' | 'disabled';
+  managerId?: string;
+  managerName?: string;
+  teamId?: string;
+  teamName?: string;
   createdAt: string;
   updatedAt: string;
   activeSessionCount: number;
@@ -57,6 +61,8 @@ export type AdminSettingsUpdateItem = {
 
 export type AdminApiUsageItem = {
   id: string;
+  userId?: string;
+  channelId?: string;
   provider: string;
   apiType: string;
   stage: string;
@@ -70,11 +76,39 @@ export type AdminApiUsageItem = {
   notes?: string;
 };
 
+export type AdminApiUsageGroup = {
+  userId?: string;
+  username?: string;
+  displayName?: string;
+  role?: string;
+  managerId?: string;
+  managerName?: string;
+  teamId?: string;
+  teamName?: string;
+  adminUserId?: string;
+  adminName?: string;
+  channelId?: string;
+  userCount?: number;
+  callCount: number;
+  successCount: number;
+  failedCount: number;
+  monthlyCallCount?: number;
+  monthlyApiCallLimit?: number;
+  monthlyRemainingCalls?: number | null;
+  monthlyUsageRatio?: number;
+  usageStatus?: 'unlimited' | 'ok' | 'warning' | 'exceeded' | string;
+  periodStart?: string;
+  lastCalledAt?: string | null;
+};
+
 export type AdminApiUsageSummary = {
   items: AdminApiUsageItem[];
   totalCalls: number;
   exactCalls: number;
   inferredCalls: number;
+  byUser: AdminApiUsageGroup[];
+  byTeam: AdminApiUsageGroup[];
+  byChannel: AdminApiUsageGroup[];
 };
 
 export type AdminApiChannel = {
@@ -117,6 +151,41 @@ export type AdminApiChannelUpdateItem = {
   baseUrl?: string;
   textModel?: string;
   imageModel?: string;
+};
+
+export type AdminUserApiCredential = {
+  userId: string;
+  channelId: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  baseUrl: string;
+  textModel: string;
+  imageModel: string;
+  apiKeyConfigured: boolean;
+  maskedApiKey: string;
+  updatedAt?: string | null;
+};
+
+export type AdminUserApiCredentialUpdateItem = {
+  channelId: string;
+  enabled?: boolean;
+  apiKey?: string;
+  clearApiKey?: boolean;
+  baseUrl?: string;
+  textModel?: string;
+  imageModel?: string;
+};
+
+export type AdminUserUsageLimit = {
+  userId: string;
+  monthlyApiCallLimit: number;
+  monthlyCallCount: number;
+  monthlyRemainingCalls: number | null;
+  monthlyUsageRatio: number;
+  usageStatus: 'unlimited' | 'ok' | 'warning' | 'exceeded' | string;
+  periodStart: string;
+  updatedAt?: string | null;
 };
 
 export function clearLegacyAuthToken() {
@@ -381,6 +450,22 @@ export type VisualGenerationTask = {
   updatedAt: string;
 };
 
+export type VisualQueueSummary = {
+  counts: Record<string, number>;
+  activeCount: number;
+  teamActiveCount: number;
+  userConcurrencyLimit: number;
+  teamConcurrencyLimit: number;
+  team?: Record<string, string>;
+  redisEnabled: boolean;
+  redisQueueName: string;
+  redisQueueLength?: number | null;
+  redisRetryQueueName?: string;
+  redisRetryQueueLength?: number | null;
+  redisDeadQueueName?: string;
+  redisDeadQueueLength?: number | null;
+};
+
 export type VisualTaskCreatePayload = {
   record?: LinkListRecord;
   linkRecordId?: string;
@@ -635,8 +720,9 @@ export async function addProductsToPool(productIds: string[]): Promise<AddProduc
   return response.json();
 }
 
-export async function fetchProductCategories(): Promise<ProductCategoryOption[]> {
-  const response = await fetch(`${API_BASE_URL}/api/products/categories`, withSession({
+export async function fetchProductCategories(scope: 'pool' | 'all' = 'pool'): Promise<ProductCategoryOption[]> {
+  const search = new URLSearchParams({ scope });
+  const response = await fetch(`${API_BASE_URL}/api/products/categories?${search.toString()}`, withSession({
     headers: authHeaders(),
   }));
   if (!response.ok) {
@@ -962,6 +1048,17 @@ export async function fetchVisualGenerationTasks(status?: string): Promise<Visua
   return body.items || [];
 }
 
+export async function fetchVisualQueueSummary(): Promise<VisualQueueSummary> {
+  const response = await fetch(`${API_BASE_URL}/api/visual/queue/summary`, withSession({
+    headers: authHeaders(),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json();
+}
+
 export async function createVisualGenerationTask(payload: VisualTaskCreatePayload): Promise<VisualGenerationTask> {
   const response = await fetch(`${API_BASE_URL}/api/visual/tasks`, withSession({
     method: 'POST',
@@ -1097,6 +1194,7 @@ export async function createAdminUser(payload: {
   displayName?: string;
   role: 'admin' | 'user';
   status: 'active' | 'disabled';
+  managerId?: string;
 }): Promise<AdminUser> {
   const response = await fetch(`${API_BASE_URL}/api/admin/users`, withSession({
     method: 'POST',
@@ -1113,7 +1211,7 @@ export async function createAdminUser(payload: {
 
 export async function updateAdminUser(
   userId: string,
-  payload: { displayName?: string; role?: 'admin' | 'user'; status?: 'active' | 'disabled' },
+  payload: { displayName?: string; role?: 'admin' | 'user'; status?: 'active' | 'disabled'; managerId?: string },
 ): Promise<AdminUser> {
   const response = await fetch(`${API_BASE_URL}/api/admin/users/${encodeURIComponent(userId)}`, withSession({
     method: 'PATCH',
@@ -1142,6 +1240,35 @@ export async function resetAdminUserPassword(userId: string, password: string): 
   return body.user;
 }
 
+export async function fetchAdminUserUsageLimit(userId: string): Promise<AdminUserUsageLimit> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/users/${encodeURIComponent(userId)}/usage-limit`, withSession({
+    headers: authHeaders(),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.limit;
+}
+
+export async function updateAdminUserUsageLimit(
+  userId: string,
+  monthlyApiCallLimit: number,
+): Promise<AdminUserUsageLimit> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/users/${encodeURIComponent(userId)}/usage-limit`, withSession({
+    method: 'PUT',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ monthlyApiCallLimit }),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.limit;
+}
+
 export async function fetchAdminSettings(): Promise<AdminSetting[]> {
   const response = await fetch(`${API_BASE_URL}/api/admin/settings`, withSession({
     headers: authHeaders(),
@@ -1168,6 +1295,9 @@ export async function fetchAdminApiUsage(): Promise<AdminApiUsageSummary> {
     totalCalls: body.totalCalls || 0,
     exactCalls: body.exactCalls || 0,
     inferredCalls: body.inferredCalls || 0,
+    byUser: body.byUser || [],
+    byTeam: body.byTeam || [],
+    byChannel: body.byChannel || [],
   };
 }
 
@@ -1201,6 +1331,35 @@ export async function updateAdminApiChannels(items: AdminApiChannelUpdateItem[])
     channels: body.channels || [],
     routes: body.routes || [],
   };
+}
+
+export async function fetchAdminUserApiCredentials(userId: string): Promise<AdminUserApiCredential[]> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/users/${encodeURIComponent(userId)}/api-credentials`, withSession({
+    headers: authHeaders(),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.items || [];
+}
+
+export async function updateAdminUserApiCredentials(
+  userId: string,
+  items: AdminUserApiCredentialUpdateItem[],
+): Promise<AdminUserApiCredential[]> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/users/${encodeURIComponent(userId)}/api-credentials`, withSession({
+    method: 'PUT',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ items }),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.items || [];
 }
 
 export async function applyAdminApiRoute(payload: {

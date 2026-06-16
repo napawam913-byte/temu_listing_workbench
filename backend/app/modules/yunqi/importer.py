@@ -8,7 +8,7 @@ from typing import BinaryIO
 import pandas as pd
 
 from app.core.config import UPLOADS_DIR, ensure_runtime_dirs
-from app.core.database import insert_upload_batch, replace_products
+from app.core.database import PRODUCT_CATALOG_SCOPE_POOL_ONLY, insert_upload_batch, replace_products
 from app.modules.yunqi.cleaner import normalize_yunqi_dataframe
 
 
@@ -40,7 +40,12 @@ def import_yunqi_file(file_obj: BinaryIO, filename: str, *, add_to_pool_user_id:
         status="imported",
         error_message="\n".join(errors[:20]) if errors else None,
     )
-    replace_products(batch_id, products, add_to_pool_user_id=add_to_pool_user_id)
+    replace_products(
+        batch_id,
+        products,
+        add_to_pool_user_id=add_to_pool_user_id,
+        catalog_scope=PRODUCT_CATALOG_SCOPE_POOL_ONLY if add_to_pool_user_id else None,
+    )
 
     return {
         "batch_id": batch_id,

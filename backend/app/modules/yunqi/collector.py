@@ -10,7 +10,15 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import UPLOADS_DIR, ensure_runtime_dirs
-from app.core.database import ensure_product_identity_index, get_connection, utc_now_text
+from app.core.database import (
+    PRODUCT_CATALOG_SCOPE_ADMIN,
+    PRODUCT_CATALOG_SCOPE_POOL_ONLY,
+    ensure_product_identity_index,
+    get_connection,
+    merge_product_catalog_scope,
+    normalize_product_catalog_scope,
+    utc_now_text,
+)
 from app.modules.recommendation.keyword_index import replace_product_keyword_index
 from app.modules.yunqi.cleaner import clean_scalar
 from app.modules.yunqi.importer import detect_file_type, read_yunqi_dataframe
@@ -423,30 +431,46 @@ def upsert_yunqi_products(
         created_count = 0
         updated_count = 0
         indexed_products: list[dict[str, Any]] = []
+        changed_products: list[dict[str, Any]] = []
 
         for product in prepared_products:
             existing_row = existing.get(product["source_product_id"])
+            should_preserve_admin_product = (
+                existing_row is not None
+                and normalize_product_catalog_scope(existing_row["catalog_scope"]) == PRODUCT_CATALOG_SCOPE_ADMIN
+                and normalize_product_catalog_scope(product.get("catalog_scope")) == PRODUCT_CATALOG_SCOPE_POOL_ONLY
+            )
             db_product = {
                 **product,
                 "id": existing_row["id"] if existing_row else product["id"],
                 "upload_batch_id": safe_batch_id,
+                "catalog_scope": merge_product_catalog_scope(
+                    existing_row["catalog_scope"] if existing_row else None,
+                    product.get("catalog_scope"),
+                )
+                if existing_row
+                else product.get("catalog_scope"),
                 "gallery_image_urls_json": json_dumps(product.get("gallery_image_urls", [])),
                 "tags_json": json_dumps(product.get("tags", [])),
                 "raw_data_json": json_dumps(product.get("raw_data", {})),
                 "created_at": now,
                 "updated_at": now,
             }
+            if should_preserve_admin_product:
+                indexed_products.append({**product, "id": db_product["id"]})
+                continue
             if existing_row:
                 update_existing_product(conn, db_product)
                 updated_count += 1
             else:
                 insert_new_product(conn, db_product)
                 created_count += 1
+            changed_products.append({**product, "id": db_product["id"]})
             indexed_products.append({**product, "id": db_product["id"]})
 
         keyword_count = 0
-        if rebuild_keywords:
-            keyword_count = replace_product_keyword_index(conn, indexed_products, now=now)
+        if rebuild_keywords and changed_products:
+            keyword_count = replace_product_keyword_index(conn, changed_products, now=now)
 
     return {
         "batch_id": safe_batch_id,
@@ -462,7 +486,7 @@ def load_existing_yunqi_products(conn: Any, source_product_ids: list[str]) -> di
     for source_product_id in source_product_ids:
         row = conn.execute(
             """
-            SELECT id, source_product_id, created_at
+            SELECT id, source_product_id, catalog_scope, created_at
             FROM products
             WHERE source_type = ? AND source_product_id = ?
             ORDER BY datetime(updated_at) DESC
@@ -478,14 +502,14 @@ def load_existing_yunqi_products(conn: Any, source_product_ids: list[str]) -> di
 def insert_new_product(conn: Any, product: dict[str, Any]) -> None:
     conn.execute(
         """
-        INSERT INTO products (
-            id, upload_batch_id, source_row_index, source_type, source_product_id,
+            INSERT INTO products (
+            id, upload_batch_id, source_row_index, source_type, source_product_id, catalog_scope,
             title_cn, title_en, title, main_image_url, gallery_image_urls_json,
             video_url, source_url, category_path, category_level1, category_level2,
             tags_json, price_usd, gmv_usd, weekly_sales, monthly_sales,
             review_count, listing_time, status, in_product_pool, raw_data_json, created_at, updated_at
         ) VALUES (
-            :id, :upload_batch_id, :source_row_index, :source_type, :source_product_id,
+            :id, :upload_batch_id, :source_row_index, :source_type, :source_product_id, :catalog_scope,
             :title_cn, :title_en, :title, :main_image_url, :gallery_image_urls_json,
             :video_url, :source_url, :category_path, :category_level1, :category_level2,
             :tags_json, :price_usd, :gmv_usd, :weekly_sales, :monthly_sales,
@@ -503,6 +527,7 @@ def update_existing_product(conn: Any, product: dict[str, Any]) -> None:
         SET
             upload_batch_id = :upload_batch_id,
             source_row_index = :source_row_index,
+            catalog_scope = :catalog_scope,
             title_cn = :title_cn,
             title_en = :title_en,
             title = :title,
@@ -546,6 +571,7 @@ def prepare_product_for_db(product: dict[str, Any]) -> dict[str, Any]:
         "source_row_index": to_int(product.get("source_row_index")) or 1,
         "source_type": SOURCE_TYPE,
         "source_product_id": source_product_id,
+        "catalog_scope": normalize_product_catalog_scope(product.get("catalog_scope")),
         "title_cn": to_text(product.get("title_cn")) or None,
         "title_en": to_text(product.get("title_en")) or None,
         "title": title,

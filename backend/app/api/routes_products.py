@@ -71,8 +71,11 @@ def add_to_product_pool(payload: AddProductsToPoolRequest, current_user: dict[st
 
 
 @router.get("/categories")
-def product_categories(current_user: dict[str, Any] = Depends(require_current_user)):
-    return get_product_categories()
+def product_categories(
+    scope: str = Query("pool", pattern="^(pool|all)$"),
+    current_user: dict[str, Any] = Depends(require_current_user),
+):
+    return get_product_categories(scope=scope, user_id=current_user["id"])
 
 
 @router.delete("/{product_id}")

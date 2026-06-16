@@ -8,7 +8,15 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import STORAGE_DIR
-from app.core.database import get_connection, list_link_list_records, upsert_link_list_record, utc_now_text
+from app.core.database import (
+    assert_user_api_usage_allowed,
+    clean_text,
+    get_connection,
+    list_link_list_records,
+    record_api_usage_safe,
+    upsert_link_list_record,
+    utc_now_text,
+)
 from app.modules.image_storage.aliyun_oss import ImageStorageError, read_image_ref, upload_image_bytes
 from app.modules.visual_generation.clients import (
     VisualGenerationError,
@@ -32,11 +40,14 @@ from app.modules.visual_generation.splitter import GridSplitError, split_grid_fi
 
 VISUAL_STORAGE_DIR = STORAGE_DIR / "visual_generation"
 TASK_STATUS_DRAFT = "draft"
+TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_PLANNED = "planned"
 TASK_STATUS_RUNNING = "running"
+TASK_STATUS_RETRY_WAITING = "retry_waiting"
 TASK_STATUS_SPLIT = "split"
 TASK_STATUS_COMPLETED = "completed"
 TASK_STATUS_FAILED = "failed"
+ACTIVE_VISUAL_TASK_STATUSES = (TASK_STATUS_QUEUED, TASK_STATUS_RUNNING, TASK_STATUS_RETRY_WAITING)
 
 BOOL_TRUE_VALUES = {"1", "true", "yes", "on"}
 IMAGE_PAYLOAD_RETRY_PROFILES = [
@@ -46,10 +57,48 @@ IMAGE_PAYLOAD_RETRY_PROFILES = [
     {"max_side": 768, "quality": 74, "label": "compressed-768"},
 ]
 IMAGE_RATE_LIMIT_RETRY_DELAYS_SECONDS = (0, 8, 16, 30)
+CHUFAN_AI_HOST_MARKER = "aicoming.top"
+CHUFAN_AI_DEFAULT_IMAGE_MODEL = "gpt-image-2-1k"
 
 
 class VisualTaskError(ValueError):
     pass
+
+
+def is_chufan_ai_image_target(settings: dict[str, str], model: str) -> bool:
+    channel_id = clean_text(settings.get("channel_id")).lower()
+    base_url = clean_text(settings.get("base_url")).lower()
+    model_name = clean_text(model).lower()
+    return (channel_id == "chufan_ai" or CHUFAN_AI_HOST_MARKER in base_url) and model_name.startswith("gpt-image-2")
+
+
+def normalize_image_model_for_channel(settings: dict[str, str], model: str) -> str:
+    clean_model = clean_text(model)
+    if is_chufan_ai_image_target(settings, clean_model) and clean_model == "gpt-image-2":
+        return CHUFAN_AI_DEFAULT_IMAGE_MODEL
+    return clean_model
+
+
+def record_visual_api_usage(
+    settings: dict[str, str],
+    *,
+    user_id: str,
+    stage: str,
+    api_type: str,
+    model: str,
+    status: str,
+    error_message: str | None = None,
+) -> None:
+    record_api_usage_safe(
+        provider="openai-compatible",
+        api_type=api_type,
+        stage=stage,
+        model=model,
+        user_id=user_id,
+        channel_id=settings.get("channel_id"),
+        status=status,
+        error_message=error_message,
+    )
 
 
 def visual_setting(key: str, default: str) -> str:
@@ -76,6 +125,122 @@ def visual_float_setting(key: str, default: float, *, minimum: float, maximum: f
     except ValueError:
         value = default
     return max(minimum, min(value, maximum))
+
+
+def assert_visual_concurrency_available(user_id: str, *, exclude_task_id: str | None = None) -> None:
+    user_limit = visual_int_setting("VISUAL_USER_CONCURRENCY_LIMIT", 1, minimum=0, maximum=100)
+    team_limit = visual_int_setting("VISUAL_TEAM_CONCURRENCY_LIMIT", 3, minimum=0, maximum=500)
+    if user_limit <= 0 and team_limit <= 0:
+        return
+
+    with get_connection() as conn:
+        ensure_visual_generation_schema(conn)
+        user_count = count_active_visual_tasks_for_user(conn, user_id, exclude_task_id=exclude_task_id)
+        team_scope = resolve_visual_team_scope(conn, user_id)
+        team_count = (
+            count_active_visual_tasks_for_team(conn, team_scope["adminUserId"], exclude_task_id=exclude_task_id)
+            if team_scope["adminUserId"]
+            else user_count
+        )
+
+    if user_limit > 0 and user_count >= user_limit:
+        raise VisualTaskError(f"当前成员已有 {user_count} 个生图任务在排队或运行，成员并发上限为 {user_limit}")
+    if team_limit > 0 and team_count >= team_limit:
+        team_name = team_scope.get("teamName") or "当前团队"
+        raise VisualTaskError(f"{team_name} 已有 {team_count} 个生图任务在排队或运行，团队并发上限为 {team_limit}")
+
+
+def resolve_visual_team_scope(conn, user_id: str) -> dict[str, str]:
+    row = conn.execute(
+        """
+        SELECT
+            users.id,
+            users.role,
+            users.manager_user_id,
+            teams.id AS team_id,
+            teams.name AS team_name
+        FROM users
+        LEFT JOIN teams ON teams.admin_user_id = CASE
+            WHEN users.role = 'admin' THEN users.id
+            ELSE users.manager_user_id
+        END
+        WHERE users.id = ?
+        """,
+        (user_id,),
+    ).fetchone()
+    if not row:
+        return {"adminUserId": "", "teamId": "", "teamName": ""}
+    admin_user_id = row["id"] if row["role"] == "admin" else row["manager_user_id"]
+    return {
+        "adminUserId": clean_text(admin_user_id),
+        "teamId": clean_text(row["team_id"]),
+        "teamName": clean_text(row["team_name"]),
+    }
+
+
+def count_active_visual_tasks_for_user(conn, user_id: str, *, exclude_task_id: str | None = None) -> int:
+    params: list[Any] = [user_id, *ACTIVE_VISUAL_TASK_STATUSES]
+    placeholders = ", ".join("?" for _ in ACTIVE_VISUAL_TASK_STATUSES)
+    where = f"user_id = ? AND status IN ({placeholders})"
+    if exclude_task_id:
+        where += " AND id != ?"
+        params.append(exclude_task_id)
+    return int(conn.execute(f"SELECT COUNT(*) FROM visual_generation_tasks WHERE {where}", params).fetchone()[0] or 0)
+
+
+def count_active_visual_tasks_for_team(conn, admin_user_id: str, *, exclude_task_id: str | None = None) -> int:
+    params: list[Any] = [admin_user_id, admin_user_id, *ACTIVE_VISUAL_TASK_STATUSES]
+    placeholders = ", ".join("?" for _ in ACTIVE_VISUAL_TASK_STATUSES)
+    task_filter = ""
+    if exclude_task_id:
+        task_filter = "AND visual_generation_tasks.id != ?"
+        params.append(exclude_task_id)
+    return int(
+        conn.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM visual_generation_tasks
+            JOIN users ON users.id = visual_generation_tasks.user_id
+            WHERE (users.id = ? OR users.manager_user_id = ?)
+              AND visual_generation_tasks.status IN ({placeholders})
+              {task_filter}
+            """,
+            params,
+        ).fetchone()[0]
+        or 0
+    )
+
+
+def get_visual_task_status_summary(*, user_id: str) -> dict[str, Any]:
+    with get_connection() as conn:
+        ensure_visual_generation_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT status, COUNT(*) AS count
+            FROM visual_generation_tasks
+            WHERE user_id = ?
+            GROUP BY status
+            """,
+            (user_id,),
+        ).fetchall()
+        counts = {clean_text(row["status"]) or TASK_STATUS_DRAFT: int(row["count"] or 0) for row in rows}
+        active_count = sum(counts.get(status, 0) for status in ACTIVE_VISUAL_TASK_STATUSES)
+        team_scope = resolve_visual_team_scope(conn, user_id)
+        team_active_count = (
+            count_active_visual_tasks_for_team(conn, team_scope["adminUserId"])
+            if team_scope.get("adminUserId")
+            else active_count
+        )
+    user_limit = visual_int_setting("VISUAL_USER_CONCURRENCY_LIMIT", 1, minimum=0, maximum=100)
+    team_limit = visual_int_setting("VISUAL_TEAM_CONCURRENCY_LIMIT", 3, minimum=0, maximum=500)
+    return {
+        "counts": counts,
+        "activeCount": active_count,
+        "teamActiveCount": team_active_count,
+        "userConcurrencyLimit": user_limit,
+        "teamConcurrencyLimit": team_limit,
+        "team": team_scope,
+    }
 
 
 def ensure_visual_generation_schema(conn) -> None:
@@ -329,8 +494,8 @@ def plan_visual_task(
     if not source_ref:
         raise VisualTaskError("source image is required before planning")
 
-    analysis_settings = get_ai_stage_settings("visual_analysis")
-    prompt_settings = get_ai_stage_settings("visual_prompt")
+    analysis_settings = get_ai_stage_settings("visual_analysis", user_id=user_id)
+    prompt_settings = get_ai_stage_settings("visual_prompt", user_id=user_id)
     text_model = analysis_model or analysis_settings["model"]
     plan_model = prompt_model or prompt_settings["model"]
     resolved_allow_short_labels = (
@@ -347,39 +512,81 @@ def plan_visual_task(
     requested_count = int(task.get("requestedCount") or task.get("requested_count") or layout_panel_count(task["layout"]))
     update_task_status(task_id, user_id, TASK_STATUS_RUNNING)
     try:
-        product_analysis = request_product_analysis_with_payload_retry(
-            api_url=analysis_url,
-            api_key=analysis_settings["api_key"],
-            model=text_model,
-            product_image_path=source_path,
-            product_image_paths=reference_paths,
-            context=context,
-        )
+        assert_user_api_usage_allowed(user_id)
         try:
-            plan = request_prompt_plan(
-                api_url=prompt_url,
-                api_key=prompt_settings["api_key"],
-                model=plan_model,
-                product_analysis=product_analysis,
-                layout=task["layout"],
-                allow_short_labels=resolved_allow_short_labels,
-                requested_count=requested_count,
+            product_analysis = request_product_analysis_with_payload_retry(
+                api_url=analysis_url,
+                api_key=analysis_settings["api_key"],
+                model=text_model,
+                product_image_path=source_path,
+                product_image_paths=reference_paths,
                 context=context,
+            )
+            record_visual_api_usage(
+                analysis_settings,
+                user_id=user_id,
+                stage="visual_analysis",
+                api_type="chat",
+                model=text_model,
+                status="success",
             )
         except Exception as exc:
-            if not is_request_too_large_error(exc):
-                raise
-            compact_analysis = compact_json_value(product_analysis, max_items=6, max_chars=140)
-            plan = request_prompt_plan(
-                api_url=prompt_url,
-                api_key=prompt_settings["api_key"],
-                model=plan_model,
-                product_analysis=compact_analysis if isinstance(compact_analysis, dict) else product_analysis,
-                layout=task["layout"],
-                allow_short_labels=resolved_allow_short_labels,
-                requested_count=requested_count,
-                context=context,
+            record_visual_api_usage(
+                analysis_settings,
+                user_id=user_id,
+                stage="visual_analysis",
+                api_type="chat",
+                model=text_model,
+                status="failed",
+                error_message=str(exc),
             )
+            raise
+        assert_user_api_usage_allowed(user_id)
+        try:
+            try:
+                plan = request_prompt_plan(
+                    api_url=prompt_url,
+                    api_key=prompt_settings["api_key"],
+                    model=plan_model,
+                    product_analysis=product_analysis,
+                    layout=task["layout"],
+                    allow_short_labels=resolved_allow_short_labels,
+                    requested_count=requested_count,
+                    context=context,
+                )
+            except Exception as exc:
+                if not is_request_too_large_error(exc):
+                    raise
+                compact_analysis = compact_json_value(product_analysis, max_items=6, max_chars=140)
+                plan = request_prompt_plan(
+                    api_url=prompt_url,
+                    api_key=prompt_settings["api_key"],
+                    model=plan_model,
+                    product_analysis=compact_analysis if isinstance(compact_analysis, dict) else product_analysis,
+                    layout=task["layout"],
+                    allow_short_labels=resolved_allow_short_labels,
+                    requested_count=requested_count,
+                    context=context,
+                )
+            record_visual_api_usage(
+                prompt_settings,
+                user_id=user_id,
+                stage="visual_prompt",
+                api_type="chat",
+                model=plan_model,
+                status="success",
+            )
+        except Exception as exc:
+            record_visual_api_usage(
+                prompt_settings,
+                user_id=user_id,
+                stage="visual_prompt",
+                api_type="chat",
+                model=plan_model,
+                status="failed",
+                error_message=str(exc),
+            )
+            raise
         mother_prompt = build_mother_prompt_from_plan(plan, task["layout"], resolved_allow_short_labels)
         persist_plan(task_id, user_id, source_ref, plan, mother_prompt)
     except Exception as exc:
@@ -404,7 +611,7 @@ def generate_visual_task(
     if not prompt_text:
         raise VisualTaskError("task has no mother prompt; run plan first")
 
-    settings = get_ai_stage_settings("image")
+    settings = get_ai_stage_settings("image", user_id=user_id)
     source_ref = clean_text(task.get("sourceImageRef"))
     reference_refs = normalize_reference_image_refs((task.get("record") or {}).get("visualReferenceImages"), fallback_ref=source_ref)
     task_dir = task_output_dir(user_id, task_id)
@@ -417,7 +624,13 @@ def generate_visual_task(
     resolved_use_reference_image = (
         visual_bool_setting("VISUAL_USE_REFERENCE_IMAGE", True) if use_reference_image is None else use_reference_image
     )
-    reference_paths = materialize_reference_image_refs(reference_refs, task_dir) if resolved_use_reference_image else []
+    resolved_image_model = normalize_image_model_for_channel(settings, image_model or settings["model"])
+    use_chufan_generation_mode = is_chufan_ai_image_target(settings, resolved_image_model)
+    reference_paths = (
+        materialize_reference_image_refs(reference_refs, task_dir)
+        if resolved_use_reference_image and not use_chufan_generation_mode
+        else []
+    )
     reference_path = reference_paths[0] if reference_paths else None
     image_endpoint = "/images/edits" if reference_paths else "/images/generations"
     image_url = build_api_url(settings["base_url"], image_endpoint)
@@ -426,19 +639,41 @@ def generate_visual_task(
         clean_text(task.get("layout")) or "3x3",
         visual_bool_setting("VISUAL_ALLOW_SHORT_LABELS", True),
     )
+    request_image_size = "" if use_chufan_generation_mode else resolved_image_size
 
     update_task_status(task_id, user_id, TASK_STATUS_RUNNING)
     try:
-        image_bytes = request_generated_image_with_payload_retry(
-            api_url=image_url,
-            api_key=settings["api_key"],
-            model=image_model or settings["model"],
-            size=resolved_image_size,
-            prompt=prompt_text,
-            compact_prompt=compact_prompt_text,
-            reference_image_path=reference_path,
-            reference_image_paths=reference_paths,
-        )
+        assert_user_api_usage_allowed(user_id)
+        try:
+            image_bytes = request_generated_image_with_payload_retry(
+                api_url=image_url,
+                api_key=settings["api_key"],
+                model=resolved_image_model,
+                size=request_image_size,
+                prompt=prompt_text,
+                compact_prompt=compact_prompt_text,
+                reference_image_path=reference_path,
+                reference_image_paths=reference_paths,
+            )
+            record_visual_api_usage(
+                settings,
+                user_id=user_id,
+                stage="visual_image",
+                api_type="image",
+                model=resolved_image_model,
+                status="success",
+            )
+        except Exception as exc:
+            record_visual_api_usage(
+                settings,
+                user_id=user_id,
+                stage="visual_image",
+                api_type="image",
+                model=resolved_image_model,
+                status="failed",
+                error_message=str(exc),
+            )
+            raise
         mother_path = task_dir / "generated_mother.png"
         mother_path.write_bytes(image_bytes)
         with get_connection() as conn:
@@ -983,6 +1218,19 @@ def mark_task_failed(task_id: str, user_id: str, error_message: str) -> None:
             WHERE id = ? AND user_id = ?
             """,
             (TASK_STATUS_FAILED, error_message[:2000], utc_now_text(), task_id, user_id),
+        )
+
+
+def mark_task_retry_waiting(task_id: str, user_id: str, error_message: str) -> None:
+    with get_connection() as conn:
+        ensure_visual_generation_schema(conn)
+        conn.execute(
+            """
+            UPDATE visual_generation_tasks
+            SET status = ?, error_message = ?, updated_at = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (TASK_STATUS_RETRY_WAITING, error_message[:2000], utc_now_text(), task_id, user_id),
         )
 
 

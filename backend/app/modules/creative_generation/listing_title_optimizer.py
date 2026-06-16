@@ -9,7 +9,13 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import BACKEND_DIR, OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_TEXT_MODEL
-from app.core.database import get_app_setting_value
+from app.core.database import (
+    assert_user_api_usage_allowed,
+    get_app_setting_value,
+    get_enabled_admin_api_channel_credential,
+    get_enabled_user_api_credential,
+    record_api_usage_safe,
+)
 from app.modules.creative_generation.safety import sanitize_marketplace_text
 
 
@@ -84,6 +90,7 @@ class TitleOptimizerSettings:
     api_key: str
     base_url: str
     text_model: str
+    channel_id: str = ""
 
 
 def optimize_listing_titles(
@@ -91,9 +98,10 @@ def optimize_listing_titles(
     *,
     fallback_title_cn: str,
     fallback_title_en: str,
+    user_id: str | None = None,
 ) -> dict[str, str]:
     fallback = build_fallback_titles(fallback_title_cn, fallback_title_en)
-    settings = get_title_optimizer_settings()
+    settings = get_title_optimizer_settings(user_id=user_id)
     cache_key = build_title_cache_key(record, fallback)
     cached = _TITLE_CACHE.get(cache_key)
     if cached:
@@ -103,17 +111,20 @@ def optimize_listing_titles(
         _TITLE_CACHE[cache_key] = fallback
         return fallback
 
+    assert_user_api_usage_allowed(user_id)
     try:
         generated = generate_titles_with_ai(record, fallback, settings)
+        record_title_optimizer_usage(settings, user_id=user_id, stage="title", status="success")
         result = normalize_generated_titles(generated, fallback)
-    except Exception:
+    except Exception as exc:
+        record_title_optimizer_usage(settings, user_id=user_id, stage="title", status="failed", error_message=str(exc))
         result = fallback
 
     _TITLE_CACHE[cache_key] = result
     return result
 
 
-def translate_variant_values_to_english(values: list[str]) -> dict[str, str]:
+def translate_variant_values_to_english(values: list[str], *, user_id: str | None = None) -> dict[str, str]:
     unique_values = []
     for value in values:
         text = clean_text(value)
@@ -134,12 +145,21 @@ def translate_variant_values_to_english(values: list[str]) -> dict[str, str]:
             continue
         missing.append(value)
 
-    settings = get_title_optimizer_settings()
+    settings = get_title_optimizer_settings(user_id=user_id)
     ai_translations: dict[str, str] = {}
     if missing and settings.api_key:
+        assert_user_api_usage_allowed(user_id)
         try:
             ai_translations = generate_variant_values_with_ai(missing, settings)
-        except Exception:
+            record_title_optimizer_usage(settings, user_id=user_id, stage="variant_translation", status="success")
+        except Exception as exc:
+            record_title_optimizer_usage(
+                settings,
+                user_id=user_id,
+                stage="variant_translation",
+                status="failed",
+                error_message=str(exc),
+            )
             ai_translations = {}
 
     for value in missing:
@@ -272,14 +292,57 @@ def has_moq_marker(value: str) -> bool:
     return any(marker.lower() in text for marker in MOQ_MARKERS)
 
 
-def get_title_optimizer_settings() -> TitleOptimizerSettings:
-    common_api_key = get_runtime_setting("OPENAI_API_KEY", OPENAI_API_KEY).strip()
-    common_base_url = get_runtime_setting("OPENAI_BASE_URL", OPENAI_BASE_URL).strip().rstrip("/")
+def get_title_optimizer_settings(*, user_id: str | None = None) -> TitleOptimizerSettings:
+    user_credential = get_enabled_user_api_credential(user_id)
+    has_user_credential = bool(user_credential and user_credential.get("apiKey"))
+    admin_credential = None if has_user_credential else get_enabled_admin_api_channel_credential()
+    has_admin_credential = bool(admin_credential and admin_credential.get("apiKey"))
+    common_api_key = (
+        str(user_credential.get("apiKey") or "").strip()
+        if has_user_credential
+        else str(admin_credential.get("apiKey") or "").strip()
+        if has_admin_credential
+        else get_runtime_setting("OPENAI_API_KEY", OPENAI_API_KEY).strip()
+    )
+    common_base_url = (
+        str(user_credential.get("baseUrl") or "").strip().rstrip("/")
+        if has_user_credential
+        else str(admin_credential.get("baseUrl") or "").strip().rstrip("/")
+        if has_admin_credential
+        else get_runtime_setting("OPENAI_BASE_URL", OPENAI_BASE_URL).strip().rstrip("/")
+    )
     common_text_model = get_runtime_setting("OPENAI_TEXT_MODEL", OPENAI_TEXT_MODEL).strip() or "gpt-5.5"
     return TitleOptimizerSettings(
-        api_key=get_runtime_setting("OPENAI_TITLE_API_KEY", "").strip() or common_api_key,
-        base_url=get_runtime_setting("OPENAI_TITLE_BASE_URL", "").strip().rstrip("/") or common_base_url,
+        api_key=common_api_key if has_user_credential or has_admin_credential else get_runtime_setting("OPENAI_TITLE_API_KEY", "").strip() or common_api_key,
+        base_url=common_base_url if has_user_credential or has_admin_credential else get_runtime_setting("OPENAI_TITLE_BASE_URL", "").strip().rstrip("/") or common_base_url,
         text_model=get_runtime_setting("OPENAI_TITLE_MODEL", "").strip() or common_text_model,
+        channel_id=(
+            str(user_credential.get("channelId") or "")
+            if has_user_credential
+            else str(admin_credential.get("channelId") or "")
+            if has_admin_credential
+            else ""
+        ),
+    )
+
+
+def record_title_optimizer_usage(
+    settings: TitleOptimizerSettings,
+    *,
+    user_id: str | None,
+    stage: str,
+    status: str,
+    error_message: str | None = None,
+) -> None:
+    record_api_usage_safe(
+        provider="openai-compatible",
+        api_type="chat",
+        stage=stage,
+        model=settings.text_model,
+        user_id=user_id,
+        channel_id=settings.channel_id,
+        status=status,
+        error_message=error_message,
     )
 
 

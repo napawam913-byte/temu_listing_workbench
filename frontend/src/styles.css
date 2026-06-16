@@ -6571,6 +6571,209 @@ body {
   border-bottom-color: #eef2f7;
 }
 
+.admin-user-table .ant-table {
+  background: #ffffff;
+}
+
+.admin-user-table .ant-table-title {
+  background: #fbfcfe;
+  border-bottom: 1px solid #eef2f7;
+  padding: 8px 10px;
+}
+
+.admin-user-table-summary {
+  align-items: center;
+  color: #475569;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.admin-user-table-summary span {
+  background: #ffffff;
+  border: 1px solid #dbe5f2;
+  border-radius: 999px;
+  line-height: 22px;
+  padding: 0 9px;
+}
+
+.admin-user-table .ant-table-thead > tr > th {
+  border-bottom-color: #e6edf5 !important;
+  padding: 10px 10px !important;
+  white-space: nowrap;
+}
+
+.admin-user-table .ant-table-tbody > tr > td {
+  padding: 8px 10px !important;
+  vertical-align: middle;
+}
+
+.admin-user-table-row {
+  transition: background-color 0.16s ease;
+}
+
+.admin-user-table-row:hover > td {
+  background: #f8fbff !important;
+}
+
+.admin-user-table-row-admin > td {
+  background: #ffffff;
+}
+
+.admin-user-table-row-member > td {
+  background: #fcfdff;
+}
+
+.admin-user-table-row-member:hover > td {
+  background: #f4f9ff !important;
+}
+
+.admin-user-table-row-unassigned > td {
+  background: #fffdf7;
+}
+
+.admin-user-table .ant-table-row-expand-icon {
+  border-color: #bfdbfe;
+  border-radius: 6px;
+  color: #1677ff;
+  margin-right: 6px;
+}
+
+.admin-user-table .ant-table-row-expand-icon:hover,
+.admin-user-table .ant-table-row-expand-icon:focus {
+  border-color: #1677ff;
+}
+
+.admin-user-table .ant-table-row-indent {
+  padding-left: 14px !important;
+}
+
+.admin-user-cell {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.admin-user-avatar {
+  align-items: center;
+  background: #eef6ff;
+  border: 1px solid #bfdbfe;
+  border-radius: 10px;
+  color: #0958d9;
+  display: inline-flex;
+  flex: 0 0 auto;
+  font-size: 13px;
+  font-weight: 800;
+  height: 30px;
+  justify-content: center;
+  width: 30px;
+}
+
+.admin-user-avatar-user {
+  background: #f8fafc;
+  border-color: #dbe3ef;
+  color: #334155;
+}
+
+.admin-user-meta {
+  align-items: baseline;
+  display: flex;
+  gap: 5px;
+  min-width: 0;
+}
+
+.admin-user-display,
+.admin-user-username {
+  display: block;
+  line-height: 20px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  word-break: keep-all;
+}
+
+.admin-user-display {
+  color: #0f172a;
+  font-size: 13px;
+  max-width: 86px;
+}
+
+.admin-user-username {
+  color: #64748b !important;
+  font-size: 12px;
+  max-width: 68px;
+}
+
+.admin-user-member-count {
+  border-radius: 999px;
+  flex: 0 0 auto;
+  font-size: 11px;
+  line-height: 19px;
+  margin: 0 0 0 2px;
+  padding: 0 7px;
+}
+
+.admin-user-manager-inline {
+  align-items: center;
+  display: inline-flex;
+  flex-wrap: nowrap;
+}
+
+.admin-user-select,
+.admin-user-manager-select {
+  width: 82px;
+}
+
+.admin-user-manager-select {
+  width: 110px;
+}
+
+.admin-user-table .ant-select-selector,
+.admin-user-action-btn {
+  height: 28px !important;
+}
+
+.admin-user-table .ant-select-selection-item,
+.admin-user-table .ant-select-selection-placeholder {
+  line-height: 26px !important;
+}
+
+.admin-user-manager-tag,
+.admin-session-tag {
+  border-radius: 999px;
+  line-height: 20px;
+  margin: 0;
+  padding: 0 9px;
+}
+
+.admin-session-tag {
+  min-width: 30px;
+  text-align: center;
+}
+
+.admin-user-date {
+  color: #334155;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.admin-user-actions {
+  display: inline-flex;
+  flex-wrap: nowrap !important;
+  gap: 6px !important;
+}
+
+.admin-user-action-btn {
+  border-radius: 7px;
+  font-weight: 600;
+  min-width: 58px;
+  padding-inline: 6px;
+}
+
 .admin-api-usage {
   display: grid;
   gap: 14px;
@@ -6890,6 +7093,11 @@ body {
   margin: 0;
 }
 
+.admin-api-member-credentials {
+  display: grid;
+  gap: 12px;
+}
+
 .admin-api-channel-fields {
   display: grid;
   gap: 8px;
@@ -6904,6 +7112,76 @@ body {
   color: #475569;
   font-size: 12px;
   font-weight: 700;
+}
+
+.admin-api-usage-group-card .ant-card-body {
+  padding: 0 14px 14px;
+}
+
+.admin-api-usage-group-card .ant-tabs-nav {
+  margin-bottom: 8px;
+}
+
+.admin-usage-limit-cell {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.admin-usage-limit-head {
+  align-items: baseline;
+  display: flex;
+  gap: 4px;
+  line-height: 1;
+}
+
+.admin-usage-unlimited-bar {
+  background: #eef6ff;
+  border: 1px dashed #bfdbfe;
+  border-radius: 999px;
+  color: #2563eb;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 18px;
+  padding: 0 8px;
+  width: fit-content;
+}
+
+.admin-usage-limit-modal {
+  display: grid;
+  gap: 14px;
+}
+
+.admin-usage-limit-overview {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.admin-usage-limit-overview > div {
+  background: #f8fbff;
+  border: 1px solid #dce8f7;
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.admin-usage-limit-overview .ant-typography {
+  margin: 0;
+}
+
+.admin-usage-limit-input {
+  display: grid;
+  gap: 6px;
+}
+
+.admin-usage-limit-input > span {
+  color: #475569;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.admin-usage-limit-input .ant-input-number {
+  width: 100%;
 }
 
 .admin-settings-list {

@@ -38,6 +38,7 @@ import {
   exportDianxiaomiTemuTemplate,
   fetchVisualGenerationTask,
   fetchVisualGenerationTasks,
+  fetchVisualQueueSummary,
   fetchLinkListRecords,
   fetchProductCategories,
   fetchProductStats,
@@ -51,7 +52,13 @@ import {
   upload1688Links,
   uploadYunqiFile,
 } from '../api/backendApi';
-import type { CurrentUser, ProductCategoryOption, ProductStats, VisualGenerationTask } from '../api/backendApi';
+import type {
+  CurrentUser,
+  ProductCategoryOption,
+  ProductStats,
+  VisualGenerationTask,
+  VisualQueueSummary,
+} from '../api/backendApi';
 import { DataImportModal } from '../components/DataImportModal';
 import { ProductDetailDrawer } from '../components/ProductDetailDrawer';
 import { ProductTable } from '../components/ProductTable';
@@ -1577,6 +1584,7 @@ function getVisualQueueStatusFromBackend(task: VisualGenerationTask, completedCo
   if (task.status === 'completed' || task.status === 'split') {
     return { label: completedCount > 0 ? '\u5df2\u56de\u5199' : '\u5df2\u5b8c\u6210', color: completedCount > 0 ? 'green' : 'gold' };
   }
+  if (task.status === 'queued' || task.status === 'draft') return { label: '\u6392\u961f\u4e2d', color: 'blue' };
   if (task.status === 'running' || task.status === 'planned') return { label: '\u540e\u53f0\u6267\u884c\u4e2d', color: 'processing' };
   return { label: '\u5f85\u6267\u884c', color: 'blue' };
 }
@@ -1967,6 +1975,7 @@ function LinkListPanel({
   const [visualQueueOpen, setVisualQueueOpen] = useState(false);
   const [visualQueueItems, setVisualQueueItems] = useState<VisualQueueItem[]>([]);
   const [visualQueueExecuting, setVisualQueueExecuting] = useState(false);
+  const [visualQueueSummary, setVisualQueueSummary] = useState<VisualQueueSummary>();
   const [activeVisualQueueItemId, setActiveVisualQueueItemId] = useState<string>();
   const [expandedVisualQueueItemIds, setExpandedVisualQueueItemIds] = useState<string[]>([]);
   const [visualWorkflowStageByItemId, setVisualWorkflowStageByItemId] = useState<Record<string, number>>({});
@@ -2179,11 +2188,23 @@ function LinkListPanel({
     });
   }, [records]);
 
+  const refreshVisualQueueSummary = useCallback(async () => {
+    const summary = await fetchVisualQueueSummary();
+    setVisualQueueSummary(summary);
+  }, []);
+
   useEffect(() => {
     void refreshVisualQueueTasks().catch((error) => {
       console.warn('Failed to restore visual queue tasks', error);
     });
   }, [refreshVisualQueueTasks]);
+
+  useEffect(() => {
+    if (!visualQueueOpen) return;
+    void refreshVisualQueueSummary().catch((error) => {
+      console.warn('Failed to refresh visual queue summary', error);
+    });
+  }, [visualQueueOpen, visualQueueItems.length, refreshVisualQueueSummary]);
 
   const openImageManager = (record: LinkListRecord, slotId?: string) => {
     const firstSlotId = getRecordProductImageSlotItems(record)[0]?.slot.id;
@@ -3228,6 +3249,38 @@ function LinkListPanel({
               <span>队列任务</span>
               <strong>{visualQueueItems.length}</strong>
             </div>
+            {visualQueueSummary ? (
+              <>
+                <div>
+                  <span>Backend queued</span>
+                  <strong>{visualQueueSummary.counts.queued || 0}</strong>
+                </div>
+                <div>
+                  <span>Backend running</span>
+                  <strong>{visualQueueSummary.counts.running || 0}</strong>
+                </div>
+                <div>
+                  <span>Retry waiting</span>
+                  <strong>{visualQueueSummary.counts.retry_waiting || 0}</strong>
+                </div>
+                <div>
+                  <span>User limit</span>
+                  <strong>{visualQueueSummary.userConcurrencyLimit || 'unlimited'}</strong>
+                </div>
+                <div>
+                  <span>Redis length</span>
+                  <strong>{visualQueueSummary.redisQueueLength ?? '-'}</strong>
+                </div>
+                <div>
+                  <span>Retry queue</span>
+                  <strong>{visualQueueSummary.redisRetryQueueLength ?? '-'}</strong>
+                </div>
+                <div>
+                  <span>Dead queue</span>
+                  <strong>{visualQueueSummary.redisDeadQueueLength ?? '-'}</strong>
+                </div>
+              </>
+            ) : null}
             <div>
               <span>模块总数</span>
               <strong>{visualQueueItems.reduce((sum, item) => sum + item.moduleCount, 0)}</strong>
@@ -3994,7 +4047,7 @@ function DataDeskPanel({
   useEffect(() => {
     void loadDataDeskProducts(1, pageSize, filters);
     void loadDataDeskStats();
-    fetchProductCategories()
+    fetchProductCategories('all')
       .then(setCategories)
       .catch(() => setCategories([]));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -4280,7 +4333,7 @@ export function SelectProductPage({
     if (isAdminUser) return;
     void loadProducts(1, pageSize, filters);
     void loadStats();
-    fetchProductCategories()
+    fetchProductCategories('pool')
       .then(setCategories)
       .catch(() => setCategories([]));
     setCurrentPage(1);
@@ -4621,6 +4674,9 @@ export function SelectProductPage({
               onProductsAddedToPool={() => {
                 void loadProducts(currentPage, pageSize, filters);
                 void loadStats();
+                fetchProductCategories('pool')
+                  .then(setCategories)
+                  .catch(() => setCategories([]));
               }}
               onViewProduct={(product) => openProduct(product, { drawerMode: 'sales', syncUrl: false })}
             />
