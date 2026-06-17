@@ -780,6 +780,10 @@ def get_user_monthly_api_call_count(conn: sqlite3.Connection, user_id: str) -> i
 
 
 def get_user_usage_limit(user_id: str) -> dict[str, Any]:
+    from app.modules.admin_config import postgres_store
+
+    return postgres_store.get_user_usage_limit(user_id)
+
     clean_user_id = clean_text(user_id)
     if not clean_user_id:
         raise ValueError("缺少成员 ID")
@@ -809,6 +813,14 @@ def upsert_user_usage_limit(
     monthly_api_call_limit: int,
     updated_by: str | None = None,
 ) -> dict[str, Any]:
+    from app.modules.admin_config import postgres_store
+
+    return postgres_store.upsert_user_usage_limit(
+        user_id=user_id,
+        monthly_api_call_limit=monthly_api_call_limit,
+        updated_by=updated_by,
+    )
+
     clean_user_id = clean_text(user_id)
     if not clean_user_id:
         raise ValueError("缺少成员 ID")
@@ -852,6 +864,10 @@ def upsert_user_usage_limit(
 
 
 def assert_user_api_usage_allowed(user_id: str | None, requested_calls: int = 1) -> None:
+    from app.modules.admin_config import postgres_store
+
+    return postgres_store.assert_user_api_usage_allowed(user_id, requested_calls)
+
     clean_user_id = clean_text(user_id)
     if not clean_user_id:
         return
@@ -886,6 +902,23 @@ def record_api_usage(
     error_message: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    from app.modules.admin_config import postgres_store
+
+    return postgres_store.record_api_usage(
+        provider=provider,
+        api_type=api_type,
+        stage=stage,
+        model=model,
+        user_id=user_id,
+        channel_id=channel_id,
+        call_count=call_count,
+        status=status,
+        source=source,
+        related_id=related_id,
+        error_message=error_message,
+        metadata=metadata,
+    )
+
     now = utc_now_text()
     usage_id = uuid.uuid4().hex
     clean_status = str(status or "success").strip().lower()
@@ -930,6 +963,10 @@ def record_api_usage_safe(**kwargs: Any) -> None:
 
 
 def get_user_api_credentials_map(user_id: str) -> dict[str, dict[str, Any]]:
+    from app.modules.admin_config import postgres_store
+
+    return postgres_store.get_user_api_credentials_map(user_id)
+
     clean_user_id = clean_text(user_id)
     if not clean_user_id:
         return {}
@@ -948,6 +985,10 @@ def get_user_api_credentials_map(user_id: str) -> dict[str, dict[str, Any]]:
 
 
 def get_enabled_user_api_credential(user_id: str | None) -> dict[str, Any] | None:
+    from app.modules.admin_config import postgres_store
+
+    return postgres_store.get_enabled_user_api_credential(user_id)
+
     clean_user_id = clean_text(user_id)
     if not clean_user_id:
         return None
@@ -978,6 +1019,20 @@ def upsert_user_api_credential(
     enabled: bool | None = None,
     updated_by: str | None = None,
 ) -> dict[str, Any]:
+    from app.modules.admin_config import postgres_store
+
+    return postgres_store.upsert_user_api_credential(
+        user_id=user_id,
+        channel_id=channel_id,
+        api_key=api_key,
+        clear_api_key=clear_api_key,
+        base_url=base_url,
+        text_model=text_model,
+        image_model=image_model,
+        enabled=enabled,
+        updated_by=updated_by,
+    )
+
     clean_user_id = clean_text(user_id)
     clean_channel_id = clean_text(channel_id)
     if not clean_user_id:
@@ -1080,6 +1135,10 @@ def upsert_user_api_credential(
 
 
 def get_api_usage_summary() -> dict[str, Any]:
+    from app.modules.admin_config import postgres_store
+
+    return postgres_store.get_api_usage_summary()
+
     with get_connection() as conn:
         ensure_api_usage_schema(conn)
         ensure_user_team_schema(conn)
@@ -1531,6 +1590,10 @@ def sqlite_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
 
 
 def read_setting_values(conn: sqlite3.Connection) -> dict[str, str]:
+    from app.modules.admin_config import postgres_store
+
+    return postgres_store.read_setting_values()
+
     if not sqlite_table_exists(conn, "app_settings"):
         return {}
     rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
@@ -2516,6 +2579,10 @@ def normalize_user_status(value: str) -> str:
 
 
 def get_app_settings_map() -> dict[str, dict[str, Any]]:
+    from app.modules.admin_config import postgres_store
+
+    return postgres_store.get_app_settings_map()
+
     with get_connection() as conn:
         rows = conn.execute("SELECT * FROM app_settings").fetchall()
     return {
@@ -2534,6 +2601,10 @@ def get_app_settings_map() -> dict[str, dict[str, Any]]:
 
 
 def get_app_setting_value(key: str, default: str = "") -> str:
+    from app.modules.admin_config import postgres_store
+
+    return postgres_store.get_app_setting_value(key, default)
+
     clean_key = str(key or "").strip()
     if not clean_key:
         return default
@@ -2577,6 +2648,18 @@ def upsert_app_setting(
     is_secret: bool = False,
     updated_by: str | None = None,
 ) -> dict[str, Any]:
+    from app.modules.admin_config import postgres_store
+
+    return postgres_store.upsert_app_setting(
+        key=key,
+        value=value,
+        category=category,
+        label=label,
+        description=description,
+        is_secret=is_secret,
+        updated_by=updated_by,
+    )
+
     clean_key = str(key or "").strip()
     if not clean_key:
         raise ValueError("缺少配置 key")

@@ -1578,11 +1578,6 @@ export function AdminPage() {
                                       编辑模型
                                     </Button>
                                   </div>
-                                  <Space size={6} wrap>
-                                    <Tag color={modelTagColor}>
-                                      {hasStageModel ? modelValue : `模型继承 ${modelValue}`}
-                                    </Tag>
-                                  </Space>
                                 </div>
                               );
                             })}
