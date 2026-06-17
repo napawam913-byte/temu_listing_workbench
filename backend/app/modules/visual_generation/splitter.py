@@ -5,6 +5,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
+from app.core.image_plugins import register_optional_image_plugins
+
+register_optional_image_plugins()
+
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
 
@@ -248,4 +252,3 @@ def split_grid_file(
     }
     (output_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return manifest
-

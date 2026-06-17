@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from app.core.image_plugins import register_optional_image_plugins
 from app.core import config as app_config
 from app.core.database import (
     get_app_setting_value,
@@ -18,6 +19,8 @@ from app.core.database import (
     get_enabled_user_api_credential,
     get_user_role,
 )
+
+register_optional_image_plugins()
 
 try:
     from PIL import Image, ImageOps

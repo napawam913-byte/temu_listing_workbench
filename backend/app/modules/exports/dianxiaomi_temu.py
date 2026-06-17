@@ -13,6 +13,7 @@ from typing import Any
 from openpyxl import load_workbook
 
 from app.core.config import DIANXIAOMI_TEMU_TEMPLATE_PATH, EXPORTS_DIR, ensure_runtime_dirs
+from app.core.image_plugins import register_optional_image_plugins
 from app.modules.creative_generation.listing_title_optimizer import (
     fallback_translate_variant_value,
     optimize_listing_titles,
@@ -21,6 +22,8 @@ from app.modules.creative_generation.listing_title_optimizer import (
 from app.modules.exports.product_attributes import get_product_attribute_for_export_record
 from app.modules.image_storage.aliyun_oss import ImageStorageError, mirror_export_image, read_image_ref, upload_image_bytes
 from app.modules.visual_generation.clients import get_runtime_setting
+
+register_optional_image_plugins()
 
 try:
     from PIL import Image, ImageOps
