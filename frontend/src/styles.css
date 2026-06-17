@@ -2409,6 +2409,52 @@ body {
   line-height: 18px;
 }
 
+.visual-queue-filterbar {
+  align-items: center;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+}
+
+.visual-queue-filterbar .ant-segmented {
+  background: #f1f5f9;
+  border-radius: 8px;
+  padding: 3px;
+}
+
+.visual-queue-filterbar .ant-segmented-item {
+  border-radius: 7px;
+}
+
+.visual-queue-filter-label {
+  align-items: center;
+  display: inline-flex;
+  gap: 6px;
+  min-width: 86px;
+  justify-content: center;
+}
+
+.visual-queue-filter-label strong {
+  background: #ffffff;
+  border: 1px solid #dbeafe;
+  border-radius: 999px;
+  color: #2563eb;
+  font-size: 12px;
+  line-height: 16px;
+  min-width: 22px;
+  padding: 0 6px;
+}
+
+.visual-queue-filter-hint {
+  color: #64748b;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 .visual-queue-list {
   display: grid;
   gap: 10px;
@@ -2555,6 +2601,7 @@ body {
   }
 
   .visual-queue-summary,
+  .visual-queue-filterbar,
   .visual-queue-meta,
   .visual-queue-card-head,
   .visual-publish-mode-grid,
@@ -6628,12 +6675,12 @@ body {
 
 .admin-user-table .ant-table-thead > tr > th {
   border-bottom-color: #e6edf5 !important;
-  padding: 10px 10px !important;
+  padding: 8px 8px !important;
   white-space: nowrap;
 }
 
 .admin-user-table .ant-table-tbody > tr > td {
-  padding: 8px 10px !important;
+  padding: 5px 8px !important;
   vertical-align: middle;
 }
 
@@ -6665,7 +6712,10 @@ body {
   border-color: #bfdbfe;
   border-radius: 6px;
   color: #1677ff;
-  margin-right: 6px;
+  height: 16px;
+  line-height: 14px;
+  margin-right: 4px;
+  width: 16px;
 }
 
 .admin-user-table .ant-table-row-expand-icon:hover,
@@ -6674,30 +6724,30 @@ body {
 }
 
 .admin-user-table .ant-table-row-indent {
-  padding-left: 14px !important;
+  padding-left: 10px !important;
 }
 
 .admin-user-cell {
   align-items: center;
   display: flex;
-  gap: 8px;
+  gap: 7px;
   min-width: 0;
-  white-space: nowrap;
+  width: 100%;
 }
 
 .admin-user-avatar {
   align-items: center;
   background: #eef6ff;
   border: 1px solid #bfdbfe;
-  border-radius: 10px;
+  border-radius: 8px;
   color: #0958d9;
   display: inline-flex;
   flex: 0 0 auto;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 800;
-  height: 30px;
+  height: 28px;
   justify-content: center;
-  width: 30px;
+  width: 28px;
 }
 
 .admin-user-avatar-user {
@@ -6707,16 +6757,18 @@ body {
 }
 
 .admin-user-meta {
-  align-items: baseline;
+  align-items: stretch;
   display: flex;
-  gap: 5px;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 0;
   min-width: 0;
 }
 
 .admin-user-display,
 .admin-user-username {
   display: block;
-  line-height: 20px;
+  line-height: 16px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -6726,13 +6778,13 @@ body {
 .admin-user-display {
   color: #0f172a;
   font-size: 13px;
-  max-width: 86px;
+  max-width: 180px;
 }
 
 .admin-user-username {
   color: #64748b !important;
   font-size: 12px;
-  max-width: 68px;
+  max-width: 180px;
 }
 
 .admin-user-member-count {
@@ -6752,29 +6804,29 @@ body {
 
 .admin-user-select,
 .admin-user-manager-select {
-  width: 82px;
+  width: 76px;
 }
 
 .admin-user-manager-select {
-  width: 110px;
+  width: 108px;
 }
 
 .admin-user-table .ant-select-selector,
 .admin-user-action-btn {
-  height: 28px !important;
+  height: 26px !important;
 }
 
 .admin-user-table .ant-select-selection-item,
 .admin-user-table .ant-select-selection-placeholder {
-  line-height: 26px !important;
+  line-height: 24px !important;
 }
 
 .admin-user-manager-tag,
 .admin-session-tag {
   border-radius: 999px;
-  line-height: 20px;
+  line-height: 18px;
   margin: 0;
-  padding: 0 9px;
+  padding: 0 7px;
 }
 
 .admin-session-tag {
@@ -6784,6 +6836,7 @@ body {
 
 .admin-user-date {
   color: #334155;
+  font-size: 12px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
@@ -6795,10 +6848,11 @@ body {
 }
 
 .admin-user-action-btn {
-  border-radius: 7px;
+  border-radius: 6px;
+  font-size: 12px;
   font-weight: 600;
-  min-width: 58px;
-  padding-inline: 6px;
+  min-width: 54px;
+  padding-inline: 5px;
 }
 
 .admin-api-usage {

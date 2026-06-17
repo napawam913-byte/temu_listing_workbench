@@ -12,6 +12,7 @@ import {
   Popover,
   Progress,
   Select,
+  Segmented,
   Space,
   Statistic,
   Tag,
@@ -21,6 +22,7 @@ import {
 import {
   CheckCircleOutlined,
   ClockCircleOutlined,
+  FileExcelOutlined,
   PictureOutlined,
   ReloadOutlined,
   SwapOutlined,
@@ -38,7 +40,7 @@ import {
   deleteProduct as deleteBackendProduct,
   deleteLinkListRecord,
   downloadDianxiaomiExportTask,
-  fetchDianxiaomiExportTask,
+  fetchDianxiaomiExportTasks,
   fetchVisualGenerationTask,
   fetchVisualGenerationTasks,
   fetchVisualQueueSummary,
@@ -99,6 +101,7 @@ type ProductRoute = {
 
 type WorkbenchTab = 'data' | 'sourcing' | 'links' | 'admin';
 type VisualPublishMode = 'main_multi' | 'sku_adapt' | 'single_refine';
+type QueueTaskFilter = 'all' | 'visual' | 'excel';
 
 type VisualQueueItem = {
   id: string;
@@ -1992,23 +1995,25 @@ async function waitForVisualGenerationTask(
   throw new Error(lastTask?.errorMessage || '生图任务仍在执行，请稍后打开任务队列查看');
 }
 
-async function waitForDianxiaomiExportTask(
-  taskId: string,
-  maxAttempts = 1200,
-  onProgress?: (task: DianxiaomiExportTask) => void,
-): Promise<DianxiaomiExportTask> {
-  let lastTask: DianxiaomiExportTask | undefined;
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    const task = await fetchDianxiaomiExportTask(taskId);
-    lastTask = task;
-    onProgress?.(task);
-    if (task.status === 'completed') return task;
-    if (task.status === 'failed') {
-      throw new Error(task.errorMessage || 'Excel 导出任务执行失败');
-    }
-    await waitForMs(3000);
+function getDianxiaomiExportTaskStatusMeta(task: DianxiaomiExportTask) {
+  if (task.status === 'completed') {
+    return { label: '已完成', color: 'green', progress: 100, progressStatus: 'success' as const };
   }
-  throw new Error(lastTask?.errorMessage || 'Excel 导出任务仍在执行，请稍后重试下载');
+  if (task.status === 'failed') {
+    return { label: '执行失败', color: 'red', progress: 100, progressStatus: 'exception' as const };
+  }
+  if (task.status === 'running') {
+    return { label: '执行中', color: 'processing', progress: 58, progressStatus: 'active' as const };
+  }
+  return { label: '排队中', color: 'blue', progress: 18, progressStatus: 'active' as const };
+}
+
+function sortDianxiaomiExportTasks(tasks: DianxiaomiExportTask[]) {
+  return [...tasks].sort((left, right) => {
+    const leftTime = new Date(left.createdAt || left.updatedAt || 0).getTime();
+    const rightTime = new Date(right.createdAt || right.updatedAt || 0).getTime();
+    return rightTime - leftTime;
+  });
 }
 
 function downloadBlob(blob: Blob, filename: string) {
@@ -2033,7 +2038,7 @@ function LinkListPanel({
   records: LinkListRecord[];
   onDelete: (recordId: string) => void;
   onDeleteMany?: (recordIds: string[]) => void;
-  onExportRecords?: (records: LinkListRecord[]) => Promise<void>;
+  onExportRecords?: (records: LinkListRecord[]) => Promise<DianxiaomiExportTask | void>;
   onUpdate: (record: LinkListRecord) => void;
   exporting?: boolean;
 }) {
@@ -2061,6 +2066,16 @@ function LinkListPanel({
   const [activeVisualQueueItemId, setActiveVisualQueueItemId] = useState<string>();
   const [expandedVisualQueueItemIds, setExpandedVisualQueueItemIds] = useState<string[]>([]);
   const [visualWorkflowStageByItemId, setVisualWorkflowStageByItemId] = useState<Record<string, number>>({});
+  const [exportQueueTasks, setExportQueueTasks] = useState<DianxiaomiExportTask[]>([]);
+  const [visualQueueFilter, setVisualQueueFilter] = useState<QueueTaskFilter>('all');
+  const exportQueuePendingCount = useMemo(
+    () => exportQueueTasks.filter((task) => task.status === 'queued' || task.status === 'running').length,
+    [exportQueueTasks],
+  );
+  const totalQueueTaskCount = visualQueueItems.length + exportQueueTasks.length;
+  const visibleVisualQueueItems = visualQueueFilter === 'excel' ? [] : visualQueueItems;
+  const visibleExportQueueTasks = visualQueueFilter === 'visual' ? [] : exportQueueTasks;
+  const visibleQueueTaskCount = visibleVisualQueueItems.length + visibleExportQueueTasks.length;
   const previewGalleryItems = useMemo(() => getRecordPreviewGalleryItems(previewRecord), [previewRecord]);
   const previewImageAssetOptions = useMemo(() => getImageAssetOptions(previewRecord), [previewRecord]);
   const imageManagerSlotItems = useMemo(
@@ -2284,6 +2299,26 @@ function LinkListPanel({
     setVisualQueueSummary(summary);
   }, []);
 
+  const refreshExportQueueTasks = useCallback(async () => {
+    const tasks = await fetchDianxiaomiExportTasks();
+    setExportQueueTasks(sortDianxiaomiExportTasks(tasks));
+  }, []);
+
+  const openUnifiedQueue = useCallback(() => {
+    setVisualQueueOpen(true);
+    void refreshVisualQueueTasks();
+    void refreshExportQueueTasks();
+  }, [refreshExportQueueTasks, refreshVisualQueueTasks]);
+
+  const downloadExportQueueTask = useCallback(async (task: DianxiaomiExportTask) => {
+    try {
+      const blob = await downloadDianxiaomiExportTask(task.id);
+      downloadBlob(blob, task.filename || `dianxiaomi_temu_export_${task.id}.xlsx`);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'Excel 下载失败');
+    }
+  }, []);
+
   useEffect(() => {
     void refreshVisualQueueTasks().catch((error) => {
       console.warn('Failed to restore visual queue tasks', error);
@@ -2291,11 +2326,29 @@ function LinkListPanel({
   }, [refreshVisualQueueTasks]);
 
   useEffect(() => {
+    void refreshExportQueueTasks().catch((error) => {
+      console.warn('Failed to restore export queue tasks', error);
+    });
+  }, [refreshExportQueueTasks]);
+
+  useEffect(() => {
     if (!visualQueueOpen) return;
     void refreshVisualQueueSummary().catch((error) => {
       console.warn('Failed to refresh visual queue summary', error);
     });
   }, [visualQueueOpen, visualQueueItems.length, refreshVisualQueueSummary]);
+
+  useEffect(() => {
+    if (!visualQueueOpen) return undefined;
+    const refresh = () => {
+      void refreshExportQueueTasks().catch((error) => {
+        console.warn('Failed to refresh export queue tasks', error);
+      });
+    };
+    refresh();
+    const timer = window.setInterval(refresh, exportQueuePendingCount > 0 ? 3000 : 8000);
+    return () => window.clearInterval(timer);
+  }, [exportQueuePendingCount, refreshExportQueueTasks, visualQueueOpen]);
 
   const toggleLinkRecordSelection = (recordId: string, checked: boolean) => {
     setSelectedRecordIds((current) =>
@@ -2311,7 +2364,14 @@ function LinkListPanel({
     if (!onExportRecords) return;
     const exportedIdSet = new Set(selectedRecords.map((record) => record.id));
     setSelectedRecordIds((current) => current.filter((id) => !exportedIdSet.has(id)));
-    await onExportRecords(selectedRecords);
+    const task = await onExportRecords(selectedRecords);
+    if (task) {
+      setExportQueueTasks((current) =>
+        sortDianxiaomiExportTasks([task, ...current.filter((item) => item.id !== task.id)]),
+      );
+      setVisualQueueOpen(true);
+      message.success(`导出任务已加入队列：${task.recordCount} 个商品链接`);
+    }
   };
 
   const deleteSelectedRecords = () => {
@@ -3047,9 +3107,9 @@ function LinkListPanel({
               >
                 导出选中
               </Button>
-              <Button icon={<ClockCircleOutlined />} onClick={() => { setVisualQueueOpen(true); void refreshVisualQueueTasks(); }}>
+              <Button icon={<ClockCircleOutlined />} onClick={openUnifiedQueue}>
                 任务队列
-                {visualQueueItems.length > 0 ? ` ${visualQueueItems.length}` : ''}
+                {totalQueueTaskCount > 0 ? ` ${totalQueueTaskCount}` : ''}
               </Button>
               <Button loading={syncingAll} onClick={() => void syncAllCreative(false)}>
                 同步生成结果
@@ -3423,7 +3483,15 @@ function LinkListPanel({
           <div className="visual-queue-summary">
             <div>
               <span>队列任务</span>
-              <strong>{visualQueueItems.length}</strong>
+              <strong>{totalQueueTaskCount}</strong>
+            </div>
+            <div>
+              <span>Excel 导出</span>
+              <strong>{exportQueueTasks.length}</strong>
+            </div>
+            <div>
+              <span>Excel 等待/执行</span>
+              <strong>{exportQueuePendingCount}</strong>
             </div>
             {visualQueueSummary ? (
               <>
@@ -3480,9 +3548,48 @@ function LinkListPanel({
               </strong>
             </div>
           </div>
-          {visualQueueItems.length > 0 ? (
+          <div className="visual-queue-filterbar">
+            <Segmented
+              value={visualQueueFilter}
+              options={[
+                {
+                  label: (
+                    <span className="visual-queue-filter-label">
+                      <SyncOutlined />
+                      <span>全部</span>
+                      <strong>{totalQueueTaskCount}</strong>
+                    </span>
+                  ),
+                  value: 'all',
+                },
+                {
+                  label: (
+                    <span className="visual-queue-filter-label">
+                      <PictureOutlined />
+                      <span>图片导出</span>
+                      <strong>{visualQueueItems.length}</strong>
+                    </span>
+                  ),
+                  value: 'visual',
+                },
+                {
+                  label: (
+                    <span className="visual-queue-filter-label">
+                      <FileExcelOutlined />
+                      <span>Excel 导出</span>
+                      <strong>{exportQueueTasks.length}</strong>
+                    </span>
+                  ),
+                  value: 'excel',
+                },
+              ]}
+              onChange={(value) => setVisualQueueFilter(value as QueueTaskFilter)}
+            />
+            <span className="visual-queue-filter-hint">当前显示 {visibleQueueTaskCount} 个任务</span>
+          </div>
+          {visibleQueueTaskCount > 0 ? (
             <div className="visual-queue-accordion">
-              {visualQueueItems.map((item) => {
+              {visibleVisualQueueItems.map((item) => {
                 const active = activeVisualQueueItem?.id === item.id;
                 const progress = getVisualQueueProgress(item);
                 const referencePreviewRefs = getVisualReferenceImageRefs(item);
@@ -3573,9 +3680,69 @@ function LinkListPanel({
                   </details>
                 );
               })}
+              {visibleExportQueueTasks.map((task) => {
+                const statusMeta = getDianxiaomiExportTaskStatusMeta(task);
+                return (
+                  <details className="visual-queue-panel visual-queue-export-panel" key={`export-${task.id}`} open={task.status !== 'completed'}>
+                    <summary className="visual-queue-panel-summary">
+                      <span className="visual-queue-reference-thumb visual-queue-export-thumb">
+                        <FileExcelOutlined />
+                      </span>
+                      <span className="visual-queue-panel-main">
+                        <span className="visual-queue-panel-title">
+                          <strong>Excel 导出</strong>
+                          <Text ellipsis>{task.filename || `店小秘导出任务 ${task.id}`}</Text>
+                        </span>
+                        <span className="visual-queue-panel-meta">
+                          <Tag color={statusMeta.color}>{statusMeta.label}</Tag>
+                          <Tag color="blue">{task.recordCount} 条链接</Tag>
+                          <span>{task.exportMode}</span>
+                          <span>{formatRecordTime(task.createdAt)}</span>
+                        </span>
+                      </span>
+                      <span className="visual-queue-panel-progress">
+                        <Progress percent={statusMeta.progress} showInfo={false} size="small" status={statusMeta.progressStatus} />
+                        <strong>{statusMeta.progress}%</strong>
+                      </span>
+                      <Button
+                        disabled={task.status !== 'completed'}
+                        size="small"
+                        type={task.status === 'completed' ? 'primary' : 'default'}
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          void downloadExportQueueTask(task);
+                        }}
+                      >
+                        下载
+                      </Button>
+                    </summary>
+                    <div className="visual-queue-panel-body">
+                      <div className="visual-queue-panel-facts">
+                        <div><span>任务 ID</span><strong>{task.id}</strong></div>
+                        <div><span>商品链接</span><strong>{task.recordCount}</strong></div>
+                        <div><span>状态</span><strong>{statusMeta.label}</strong></div>
+                        <div><span>更新时间</span><strong>{formatRecordTime(task.updatedAt)}</strong></div>
+                      </div>
+                      {task.filename ? (
+                        <div className="visual-queue-panel-facts">
+                          <div><span>文件名</span><strong>{task.filename}</strong></div>
+                        </div>
+                      ) : null}
+                      {task.errorMessage ? <div className="visual-queue-panel-error">{task.errorMessage}</div> : null}
+                    </div>
+                  </details>
+                );
+              })}
             </div>
           ) : (
-            <Empty description="暂无任务。请在某个商品链接的图片管理中发布任务包。" />
+            <Empty
+              description={
+                totalQueueTaskCount > 0
+                  ? '当前分类暂无任务'
+                  : '暂无任务。请在图片管理中发布生图任务，或在链接列表中导出 Excel。'
+              }
+            />
           )}
         </div>
       </Modal>
@@ -3613,8 +3780,8 @@ function LinkListPanel({
                   <Button icon={<PictureOutlined />} type="primary" onClick={() => setImageEditorOpen(true)}>
                     编辑图片
                   </Button>
-                  <Button icon={<ClockCircleOutlined />} onClick={() => { setVisualQueueOpen(true); void refreshVisualQueueTasks(); }}>
-                    任务队列{visualQueueItems.length > 0 ? ` ${visualQueueItems.length}` : ''}
+                  <Button icon={<ClockCircleOutlined />} onClick={openUnifiedQueue}>
+                    任务队列{totalQueueTaskCount > 0 ? ` ${totalQueueTaskCount}` : ''}
                   </Button>
                 </Space>
                 <Space size={6} wrap>
@@ -3885,8 +4052,8 @@ function LinkListPanel({
                 >
                   当前图精修
                 </Button>
-                <Button icon={<ClockCircleOutlined />} onClick={() => { setVisualQueueOpen(true); void refreshVisualQueueTasks(); }}>
-                  任务队列{visualQueueItems.length > 0 ? ` ${visualQueueItems.length}` : ''}
+                <Button icon={<ClockCircleOutlined />} onClick={openUnifiedQueue}>
+                  任务队列{totalQueueTaskCount > 0 ? ` ${totalQueueTaskCount}` : ''}
                 </Button>
               </Space>
             </section>
@@ -4719,28 +4886,11 @@ export function SelectProductPage({
       const task = await createDianxiaomiExportTask(recordsForExport);
       message.open({
         key: EXPORT_TEMPLATE_MESSAGE_KEY,
-        type: 'loading',
-        content: `导出任务已入队：${task.recordCount} 个商品链接`,
-        duration: 0,
-      });
-
-      const completedTask = await waitForDianxiaomiExportTask(task.id, 1200, (progressTask) => {
-        if (progressTask.status !== 'queued' && progressTask.status !== 'running') return;
-        message.open({
-          key: EXPORT_TEMPLATE_MESSAGE_KEY,
-          type: 'loading',
-          content: `导出任务${progressTask.status === 'queued' ? '排队中' : '执行中'}：${progressTask.recordCount} 个商品链接`,
-          duration: 0,
-        });
-      });
-      const blob = await downloadDianxiaomiExportTask(completedTask.id);
-      downloadBlob(blob, completedTask.filename || `店小秘_TEMU半托管_${new Date().toISOString().slice(0, 10)}.xlsx`);
-      message.open({
-        key: EXPORT_TEMPLATE_MESSAGE_KEY,
         type: 'success',
-        content: 'Excel 已生成并开始下载，请手动导入店小秘',
-        duration: 4,
+        content: `导出任务已加入队列：${task.recordCount} 个商品链接`,
+        duration: 3,
       });
+      return task;
     } catch (error) {
       message.open({
         key: EXPORT_TEMPLATE_MESSAGE_KEY,

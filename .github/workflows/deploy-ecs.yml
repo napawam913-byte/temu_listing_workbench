@@ -1,10 +1,12 @@
 name: Deploy ECS
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
+    inputs:
+      deploy_ref:
+        description: Branch, tag, or commit to deploy
+        required: true
+        default: main
 
 concurrency:
   group: deploy-ecs-main
@@ -19,6 +21,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.deploy_ref || 'main' }}
 
       - name: Configure SSH
         shell: bash
@@ -69,7 +73,7 @@ jobs:
           ECS_USER="${ECS_USER:-root}"
           DEPLOY_PATH="${DEPLOY_PATH:-/opt/temu_listing_workbench}"
           ssh -i ~/.ssh/ecs_key -p "${ECS_PORT}" "${ECS_USER}@${ECS_HOST}" \
-            "mkdir -p '${DEPLOY_PATH}'"
+            "mkdir -p '${DEPLOY_PATH}' '${DEPLOY_PATH}/releases' '${DEPLOY_PATH}/shared'"
           scp -i ~/.ssh/ecs_key -P "${ECS_PORT}" /tmp/temu_listing_workbench_release.tgz \
             "${ECS_USER}@${ECS_HOST}:/tmp/temu_listing_workbench_release.tgz"
 
@@ -85,5 +89,13 @@ jobs:
           ECS_PORT="${ECS_PORT:-22}"
           ECS_USER="${ECS_USER:-root}"
           DEPLOY_PATH="${DEPLOY_PATH:-/opt/temu_listing_workbench}"
+          RELEASE_ID="$(date -u +'%Y%m%d%H%M%S')-${GITHUB_SHA::7}"
           ssh -i ~/.ssh/ecs_key -p "${ECS_PORT}" "${ECS_USER}@${ECS_HOST}" \
-            "tar -xzf /tmp/temu_listing_workbench_release.tgz -C '${DEPLOY_PATH}' && rm -f /tmp/temu_listing_workbench_release.tgz && DEPLOY_PATH='${DEPLOY_PATH}' SKIP_GIT_PULL=1 bash '${DEPLOY_PATH}/scripts/deploy_server.sh'"
+            "set -euo pipefail
+            DEPLOY_ROOT='${DEPLOY_PATH}'
+            RELEASE_ID='${RELEASE_ID}'
+            RELEASE_DIR=\"\${DEPLOY_ROOT}/releases/\${RELEASE_ID}\"
+            mkdir -p \"\${RELEASE_DIR}\"
+            tar -xzf /tmp/temu_listing_workbench_release.tgz -C \"\${RELEASE_DIR}\"
+            rm -f /tmp/temu_listing_workbench_release.tgz
+            DEPLOY_ROOT=\"\${DEPLOY_ROOT}\" DEPLOY_PATH=\"\${RELEASE_DIR}\" RELEASE_ID=\"\${RELEASE_ID}\" SOURCE_SHA='${GITHUB_SHA}' SKIP_GIT_PULL=1 bash \"\${RELEASE_DIR}/scripts/deploy_server.sh\""

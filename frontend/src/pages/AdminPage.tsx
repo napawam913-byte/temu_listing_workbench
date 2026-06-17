@@ -13,6 +13,7 @@ import {
   Table,
   Tabs,
   Tag,
+  Tooltip,
   Typography,
   message,
 } from 'antd';
@@ -758,25 +759,31 @@ export function AdminPage() {
     {
       title: '用户',
       dataIndex: 'username',
-      width: 190,
-      render: (_, user) => (
-        <div className="admin-user-cell">
-          <span className={`admin-user-avatar admin-user-avatar-${user.role}`}>{adminUserInitial(user)}</span>
-          <div className="admin-user-meta">
-            <Typography.Text className="admin-user-display" strong>
-              {user.displayName || user.username}
-            </Typography.Text>
-            <Typography.Text className="admin-user-username" type="secondary">
-              @{user.username}
-            </Typography.Text>
-          </div>
-        </div>
-      ),
+      width: 245,
+      render: (_, user) => {
+        const displayName = user.displayName || user.username;
+        const fullName = user.displayName && user.displayName !== user.username ? `${user.displayName} / @${user.username}` : `@${user.username}`;
+        return (
+          <Tooltip title={fullName} placement="topLeft">
+            <div className="admin-user-cell">
+              <span className={`admin-user-avatar admin-user-avatar-${user.role}`}>{adminUserInitial(user)}</span>
+              <div className="admin-user-meta">
+                <Typography.Text className="admin-user-display" strong>
+                  {displayName}
+                </Typography.Text>
+                <Typography.Text className="admin-user-username" type="secondary">
+                  @{user.username}
+                </Typography.Text>
+              </div>
+            </div>
+          </Tooltip>
+        );
+      },
     },
     {
       title: '角色',
       dataIndex: 'role',
-      width: 100,
+      width: 88,
       render: (_, user) => (
         <Select
           className="admin-user-select"
@@ -792,7 +799,7 @@ export function AdminPage() {
     {
       title: '状态',
       dataIndex: 'status',
-      width: 100,
+      width: 88,
       render: (_, user) => (
         <Select
           className="admin-user-select"
@@ -808,7 +815,7 @@ export function AdminPage() {
     {
       title: '归属管理员',
       dataIndex: 'managerId',
-      width: 140,
+      width: 132,
       render: (_, user) =>
         user.role === 'admin' ? (
           <Space className="admin-user-manager-inline" size={6}>
@@ -844,13 +851,13 @@ export function AdminPage() {
     {
       title: '创建时间',
       dataIndex: 'createdAt',
-      width: 128,
+      width: 124,
       render: (value: string) => <span className="admin-user-date">{value}</span>,
     },
     {
       title: '操作',
       key: 'action',
-      width: 132,
+      width: 124,
       render: (_, user) => (
         <Space className="admin-user-actions" size={8} wrap={false}>
           <Button className="admin-user-action-btn" size="small" onClick={() => void openMemberApiCredentials(user)}>
@@ -1230,10 +1237,12 @@ export function AdminPage() {
                     columns={userColumns}
                     dataSource={userTableRows}
                     rowSelection={{
+                      columnWidth: 34,
                       selectedRowKeys: selectedUserRowKeys,
                       onChange: (keys) => setSelectedUserRowKeys([...keys]),
                     }}
                     expandable={{
+                      columnWidth: 30,
                       expandedRowKeys: expandedUserRowKeys,
                       indentSize: 18,
                       onExpandedRowsChange: (keys) => setExpandedUserRowKeys([...keys]),
@@ -1249,8 +1258,8 @@ export function AdminPage() {
                         .filter(Boolean)
                         .join(' ')
                     }
-                    scroll={{ x: 876 }}
-                    size="middle"
+                    scroll={{ x: 890 }}
+                    size="small"
                     title={() => (
                       <div className="admin-user-table-summary">
                         <Space className="admin-user-summary-tags" size={10} wrap>
