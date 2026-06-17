@@ -4,13 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from app.api.auth import require_current_user
-from app.core.database import (
-    add_products_to_pool,
-    get_product_categories,
-    get_product_stats,
-    list_products,
-    soft_delete_product,
-)
+from app.modules.products import postgres_store
 
 router = APIRouter(prefix="/api/products", tags=["products"])
 
@@ -37,7 +31,7 @@ def get_products(
     sort_order: str | None = Query(None, pattern="^(asc|desc)$"),
     current_user: dict[str, Any] = Depends(require_current_user),
 ):
-    return list_products(
+    return postgres_store.list_products(
         page=page,
         page_size=page_size,
         keyword=keyword,
@@ -61,12 +55,12 @@ def product_stats(
     scope: str = Query("pool", pattern="^(pool|all)$"),
     current_user: dict[str, Any] = Depends(require_current_user),
 ):
-    return get_product_stats(scope=scope, user_id=current_user["id"])
+    return postgres_store.get_product_stats(scope=scope, user_id=current_user["id"])
 
 
 @router.post("/pool")
 def add_to_product_pool(payload: AddProductsToPoolRequest, current_user: dict[str, Any] = Depends(require_current_user)):
-    added_count = add_products_to_pool(payload.product_ids, user_id=current_user["id"])
+    added_count = postgres_store.add_products_to_pool(payload.product_ids, user_id=current_user["id"])
     return {"ok": True, "added_count": added_count}
 
 
@@ -75,7 +69,7 @@ def product_categories(
     scope: str = Query("pool", pattern="^(pool|all)$"),
     current_user: dict[str, Any] = Depends(require_current_user),
 ):
-    return get_product_categories(scope=scope, user_id=current_user["id"])
+    return postgres_store.get_product_categories(scope=scope, user_id=current_user["id"])
 
 
 @router.delete("/{product_id}")
@@ -84,7 +78,7 @@ def delete_product(
     scope: str = Query("pool", pattern="^(pool|all)$"),
     current_user: dict[str, Any] = Depends(require_current_user),
 ):
-    deleted = soft_delete_product(product_id, scope=scope, user_id=current_user["id"])
+    deleted = postgres_store.soft_delete_product(product_id, scope=scope, user_id=current_user["id"])
     if not deleted:
         raise HTTPException(status_code=404, detail="商品不存在")
     return {"ok": True}

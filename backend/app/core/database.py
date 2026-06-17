@@ -2178,6 +2178,11 @@ def public_user(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
 
 
 def create_user(username: str, password: str, display_name: str | None = None) -> dict[str, Any]:
+    from app.modules.identity import postgres_store
+
+    # Migrated identity writes must use PostgreSQL only.
+    return postgres_store.create_user(username, password, display_name)
+
     clean_username = " ".join(str(username or "").split()).strip()
     if len(clean_username) < 2:
         raise ValueError("用户名至少需要 2 个字符")
@@ -2213,6 +2218,11 @@ def create_user(username: str, password: str, display_name: str | None = None) -
 
 
 def list_users() -> list[dict[str, Any]]:
+    from app.modules.identity import postgres_store
+
+    # Migrated identity reads must use PostgreSQL only.
+    return postgres_store.list_users()
+
     with get_connection() as conn:
         ensure_user_team_schema(conn)
         expire_stale_user_sessions(conn)
@@ -2266,6 +2276,18 @@ def create_managed_user(
     status: str = "active",
     manager_user_id: str | None = None,
 ) -> dict[str, Any]:
+    from app.modules.identity import postgres_store
+
+    # Migrated identity writes must use PostgreSQL only.
+    return postgres_store.create_managed_user(
+        username=username,
+        password=password,
+        display_name=display_name,
+        role=role,
+        status=status,
+        manager_user_id=manager_user_id,
+    )
+
     clean_username = " ".join(str(username or "").split()).strip()
     if len(clean_username) < 2:
         raise ValueError("用户名至少需要 2 个字符")
@@ -2328,6 +2350,17 @@ def update_managed_user(
     status: str | None = None,
     manager_user_id: str | None = None,
 ) -> dict[str, Any]:
+    from app.modules.identity import postgres_store
+
+    # Migrated identity writes must use PostgreSQL only.
+    return postgres_store.update_managed_user(
+        user_id,
+        display_name=display_name,
+        role=role,
+        status=status,
+        manager_user_id=manager_user_id,
+    )
+
     clean_user_id = str(user_id or "").strip()
     if not clean_user_id:
         raise ValueError("缺少用户 ID")
@@ -2387,6 +2420,11 @@ def update_managed_user(
 
 
 def reset_managed_user_password(user_id: str, password: str) -> dict[str, Any]:
+    from app.modules.identity import postgres_store
+
+    # Migrated identity writes must use PostgreSQL only.
+    return postgres_store.reset_managed_user_password(user_id, password)
+
     clean_user_id = str(user_id or "").strip()
     if len(str(password or "")) < 6:
         raise ValueError("密码至少需要 6 个字符")
@@ -2583,6 +2621,11 @@ def upsert_app_setting(
 
 
 def authenticate_user(username: str, password: str) -> dict[str, Any] | None:
+    from app.modules.identity import postgres_store
+
+    # Migrated identity reads must use PostgreSQL only.
+    return postgres_store.authenticate_user(username, password)
+
     clean_username = " ".join(str(username or "").split()).strip()
     with get_connection() as conn:
         row = conn.execute(
@@ -2603,6 +2646,11 @@ def session_expiry_cutoff_text() -> str:
 
 
 def expire_stale_user_sessions(conn: sqlite3.Connection | None = None) -> int:
+    from app.modules.identity import postgres_store
+
+    if conn is None:
+        return postgres_store.expire_stale_user_sessions()
+
     cutoff = session_expiry_cutoff_text()
     now = utc_now_text()
 
@@ -2626,6 +2674,11 @@ def expire_stale_user_sessions(conn: sqlite3.Connection | None = None) -> int:
 
 
 def create_user_session(user_id: str) -> dict[str, Any]:
+    from app.modules.identity import postgres_store
+
+    # Migrated identity writes must use PostgreSQL only.
+    return postgres_store.create_user_session(user_id)
+
     token = secrets.token_urlsafe(32)
     now = utc_now_text()
     with get_connection() as conn:
@@ -2647,6 +2700,11 @@ def create_user_session(user_id: str) -> dict[str, Any]:
 
 
 def get_user_by_session_token(token: str) -> dict[str, Any] | None:
+    from app.modules.identity import postgres_store
+
+    # Migrated identity reads must use PostgreSQL only.
+    return postgres_store.get_user_by_session_token(token)
+
     clean_token = str(token or "").strip()
     if not clean_token:
         return None
@@ -2678,6 +2736,11 @@ def get_user_by_session_token(token: str) -> dict[str, Any] | None:
 
 
 def revoke_user_session(token: str) -> bool:
+    from app.modules.identity import postgres_store
+
+    # Migrated identity writes must use PostgreSQL only.
+    return postgres_store.revoke_user_session(token)
+
     clean_token = str(token or "").strip()
     if not clean_token:
         return False

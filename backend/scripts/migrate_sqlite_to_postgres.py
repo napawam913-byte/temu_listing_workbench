@@ -82,6 +82,13 @@ def migratable_table_names(conn: sqlite3.Connection) -> list[str]:
     ]
 
 
+def sqlite_fts_shadow_table_names(conn: sqlite3.Connection) -> list[str]:
+    all_tables = sqlite_table_names(conn)
+    virtual_tables = sqlite_virtual_table_names(conn)
+    skipped_prefixes = tuple(f"{name}_" for name in virtual_tables)
+    return sorted(table for table in all_tables if table.startswith(skipped_prefixes))
+
+
 def sqlite_table_info(conn: sqlite3.Connection, table: str) -> list[sqlite3.Row]:
     return conn.execute(f"PRAGMA table_info({quote_ident(table)})").fetchall()
 
@@ -210,11 +217,82 @@ def read_sqlite_rows(
         yield tuple(row[column] for column in columns)
 
 
+def print_copy_progress(table: str, copied: int, source_count: int, *, done: bool = False) -> None:
+    percent = 100.0 if source_count <= 0 else min(100.0, copied * 100.0 / source_count)
+    text = f"  {table}: {copied}/{source_count} ({percent:.1f}%)"
+    if done:
+        print(text)
+    else:
+        print(text, end="\r", flush=True)
+
+
 def drop_existing_tables(pg_conn: Any, tables: list[str]) -> None:
     with pg_conn.cursor() as cur:
         for table in reversed(tables):
             cur.execute(f"DROP TABLE IF EXISTS {quote_ident(table)} CASCADE")
     pg_conn.commit()
+
+
+def postgres_table_exists(pg_conn: Any, table: str) -> bool:
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_name = %s
+            """,
+            (table,),
+        )
+        return cur.fetchone() is not None
+
+
+def verify_migration(
+    *,
+    sqlite_path: Path,
+    postgres_url: str,
+    only_tables: set[str] | None,
+) -> None:
+    if psycopg is None:
+        raise RuntimeError(
+            "Missing PostgreSQL driver. Run: python -m pip install \"psycopg[binary]>=3.2.3,<3.3.0\""
+        ) from _PSYCOPG_IMPORT_ERROR
+    if not sqlite_path.exists():
+        raise FileNotFoundError(f"SQLite database not found: {sqlite_path}")
+
+    sqlite_conn = sqlite3.connect(f"file:{sqlite_path}?mode=ro", uri=True)
+    sqlite_conn.row_factory = sqlite3.Row
+    try:
+        tables = migratable_table_names(sqlite_conn)
+        if only_tables is not None:
+            tables = [table for table in tables if table in only_tables]
+        if not tables:
+            print("No migratable tables found.")
+            return
+
+        failures: list[str] = []
+        print(f"Verifying {len(tables)} normal business tables...")
+        with psycopg.connect(postgres_url) as pg_conn:
+            for table in tables:
+                source_count = int(sqlite_conn.execute(table_count_sql(table)).fetchone()[0])
+                if not postgres_table_exists(pg_conn, table):
+                    print(f"  {table}: sqlite={source_count}, postgres=MISSING, status=missing")
+                    failures.append(f"{table}: missing in PostgreSQL")
+                    continue
+
+                with pg_conn.cursor() as cur:
+                    cur.execute(table_count_sql(table))
+                    target_count = int(cur.fetchone()[0])
+                delta = target_count - source_count
+                status = "ok" if delta == 0 else "mismatch"
+                print(f"  {table}: sqlite={source_count}, postgres={target_count}, delta={delta}, status={status}")
+                if delta != 0:
+                    failures.append(f"{table}: sqlite={source_count}, postgres={target_count}, delta={delta}")
+
+        if failures:
+            raise RuntimeError("Migration verification failed:\n" + "\n".join(failures))
+        print("Migration verification passed.")
+    finally:
+        sqlite_conn.close()
 
 
 def migrate(
@@ -237,15 +315,27 @@ def migrate(
     sqlite_conn.row_factory = sqlite3.Row
     try:
         tables = migratable_table_names(sqlite_conn)
+        all_user_tables = sqlite_table_names(sqlite_conn)
+        skipped_virtual = sorted(sqlite_virtual_table_names(sqlite_conn))
+        skipped_shadow = sqlite_fts_shadow_table_names(sqlite_conn)
         if only_tables is not None:
             tables = [table for table in tables if table in only_tables]
         if not tables:
             print("No migratable tables found.")
             return
 
-        skipped_virtual = sorted(sqlite_virtual_table_names(sqlite_conn))
+        print(
+            "SQLite table plan: "
+            f"{len(all_user_tables)} user tables, "
+            f"{len(migratable_table_names(sqlite_conn))} normal business tables, "
+            f"{len(skipped_virtual)} FTS virtual tables skipped, "
+            f"{len(skipped_shadow)} FTS shadow tables skipped, "
+            f"{len(tables)} tables selected for this run."
+        )
         if skipped_virtual:
             print("Skipping SQLite virtual tables:", ", ".join(skipped_virtual))
+        if skipped_shadow:
+            print("Skipping SQLite FTS shadow tables:", ", ".join(skipped_shadow))
 
         with psycopg.connect(postgres_url) as pg_conn:
             if reset:
@@ -273,9 +363,10 @@ def migrate(
                     for batch in chunked(read_sqlite_rows(sqlite_conn, table, columns), batch_size):
                         cur.executemany(sql, batch)
                         copied += len(batch)
-                pg_conn.commit()
+                        pg_conn.commit()
+                        print_copy_progress(table, copied, source_count)
                 summary.append((table, source_count, copied))
-                print(f"  {table}: {copied}/{source_count}")
+                print_copy_progress(table, copied, source_count, done=True)
 
             if create_indexes:
                 print("Creating indexes...")
@@ -320,7 +411,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Drop existing PostgreSQL tables before copying data.",
     )
-    parser.add_argument("--batch-size", type=int, default=500)
+    parser.add_argument("--batch-size", type=int, default=100)
+    parser.add_argument("--verify-only", action="store_true", help="Only compare SQLite/PostgreSQL row counts; do not write data.")
     parser.add_argument("--no-indexes", action="store_true", help="Skip index creation.")
     parser.add_argument(
         "--only-table",
@@ -345,6 +437,13 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+    if args.verify_only:
+        verify_migration(
+            sqlite_path=Path(args.sqlite_path).expanduser().resolve(),
+            postgres_url=postgres_url,
+            only_tables=set(args.only_tables) if args.only_tables else None,
+        )
+        return 0
     migrate(
         sqlite_path=Path(args.sqlite_path).expanduser().resolve(),
         postgres_url=postgres_url,
