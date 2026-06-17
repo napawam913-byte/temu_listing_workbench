@@ -3203,6 +3203,14 @@ def list_link_list_records(
     include_deleted: bool = False,
     limit: int = 500,
 ) -> list[dict[str, Any]]:
+    from app.modules.link_records import postgres_store
+
+    return postgres_store.list_link_list_records(
+        user_id=user_id,
+        include_deleted=include_deleted,
+        limit=limit,
+    )
+
     safe_limit = max(1, min(int(limit or 500), 1000))
     where = ["user_id = ?"]
     params: list[Any] = [user_id]
@@ -3226,6 +3234,10 @@ def list_link_list_records(
 
 
 def upsert_link_list_record(record: dict[str, Any], *, user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
+    from app.modules.link_records import postgres_store
+
+    return postgres_store.upsert_link_list_record(record, user_id=user_id)
+
     if not isinstance(record, dict):
         raise ValueError("链接记录格式不正确")
 
@@ -3281,12 +3293,20 @@ def upsert_link_list_record(record: dict[str, Any], *, user_id: str = DEFAULT_US
 
 
 def upsert_link_list_records(records: list[dict[str, Any]], *, user_id: str = DEFAULT_USER_ID) -> list[dict[str, Any]]:
+    from app.modules.link_records import postgres_store
+
+    return postgres_store.upsert_link_list_records(records, user_id=user_id)
+
     if not isinstance(records, list):
         raise ValueError("链接记录列表格式不正确")
     return [upsert_link_list_record(record, user_id=user_id) for record in records if isinstance(record, dict)]
 
 
 def soft_delete_link_list_record(record_id: str, *, user_id: str = DEFAULT_USER_ID) -> bool:
+    from app.modules.link_records import postgres_store
+
+    return postgres_store.soft_delete_link_list_record(record_id, user_id=user_id)
+
     clean_id = _clean_record_text(record_id)
     if not clean_id:
         return False
@@ -4222,6 +4242,10 @@ def add_range_filter(
 
 
 def set_active_sourcing_product(temu_product_id: str) -> dict[str, Any]:
+    from app.modules.sourcing_1688 import postgres_store
+
+    return postgres_store.set_active_sourcing_product(temu_product_id)
+
     now = utc_now_text()
     with get_connection() as conn:
         product = conn.execute(
@@ -4251,6 +4275,10 @@ def set_active_sourcing_product(temu_product_id: str) -> dict[str, Any]:
 
 
 def get_active_sourcing_product() -> dict[str, Any] | None:
+    from app.modules.sourcing_1688 import postgres_store
+
+    return postgres_store.get_active_sourcing_product()
+
     with get_connection() as conn:
         row = conn.execute(
             """
@@ -4277,6 +4305,10 @@ def get_active_sourcing_product() -> dict[str, Any] | None:
 
 
 def create_sourcing_candidate_1688(payload: dict[str, Any]) -> dict[str, Any]:
+    from app.modules.sourcing_1688 import postgres_store
+
+    return postgres_store.create_sourcing_candidate_1688(payload)
+
     temu_product_id = payload.get("temu_product_id")
     if not temu_product_id:
         active_session = get_active_sourcing_product()
@@ -4352,6 +4384,14 @@ def upsert_sourcing_candidate_from_material(
     *,
     source_role: str = "product_self_sku",
 ) -> dict[str, Any] | None:
+    from app.modules.sourcing_1688 import postgres_store
+
+    return postgres_store.upsert_sourcing_candidate_from_material(
+        material,
+        temu_product_id,
+        source_role=source_role,
+    )
+
     product_url = str(material.get("product_url") or "").strip()
     raw_data = material.get("raw_data") if isinstance(material.get("raw_data"), dict) else {}
     title = str(material.get("title") or "").strip()
@@ -4445,6 +4485,10 @@ def upsert_sourcing_candidate_from_material(
 
 
 def get_sourcing_candidate_1688(candidate_id: str) -> dict[str, Any]:
+    from app.modules.sourcing_1688 import postgres_store
+
+    return postgres_store.get_sourcing_candidate_1688(candidate_id)
+
     with get_connection() as conn:
         row = conn.execute(
             "SELECT * FROM sourcing_candidates_1688 WHERE id = ?",
@@ -4458,6 +4502,10 @@ def get_sourcing_candidate_1688(candidate_id: str) -> dict[str, Any]:
 
 
 def list_sourcing_candidates_1688(temu_product_id: str) -> list[dict[str, Any]]:
+    from app.modules.sourcing_1688 import postgres_store
+
+    return postgres_store.list_sourcing_candidates_1688(temu_product_id)
+
     with get_connection() as conn:
         rows = conn.execute(
             """
@@ -4473,6 +4521,10 @@ def list_sourcing_candidates_1688(temu_product_id: str) -> list[dict[str, Any]]:
 
 
 def delete_sourcing_candidate_1688(candidate_id: str) -> bool:
+    from app.modules.sourcing_1688 import postgres_store
+
+    return postgres_store.delete_sourcing_candidate_1688(candidate_id)
+
     with get_connection() as conn:
         cursor = conn.execute(
             "DELETE FROM sourcing_candidates_1688 WHERE id = ?",
@@ -4482,6 +4534,10 @@ def delete_sourcing_candidate_1688(candidate_id: str) -> bool:
 
 
 def create_sourcing_material_1688(payload: dict[str, Any]) -> dict[str, Any]:
+    from app.modules.sourcing_1688 import postgres_store
+
+    return postgres_store.create_sourcing_material_1688(payload)
+
     product_url = str(payload.get("product_url") or "").strip()
     title = str(payload.get("title") or "").strip()
     if not product_url:
@@ -4557,6 +4613,10 @@ def create_sourcing_material_1688(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def get_sourcing_material_1688(material_id: str) -> dict[str, Any]:
+    from app.modules.sourcing_1688 import postgres_store
+
+    return postgres_store.get_sourcing_material_1688(material_id)
+
     with get_connection() as conn:
         row = conn.execute(
             "SELECT * FROM sourcing_materials_1688 WHERE id = ?",
@@ -4570,6 +4630,10 @@ def get_sourcing_material_1688(material_id: str) -> dict[str, Any]:
 
 
 def list_sourcing_materials_1688(limit: int = 100) -> list[dict[str, Any]]:
+    from app.modules.sourcing_1688 import postgres_store
+
+    return postgres_store.list_sourcing_materials_1688(limit)
+
     safe_limit = max(1, min(300, limit))
     with get_connection() as conn:
         rows = conn.execute(
@@ -4586,6 +4650,10 @@ def list_sourcing_materials_1688(limit: int = 100) -> list[dict[str, Any]]:
 
 
 def delete_sourcing_material_1688(material_id: str) -> bool:
+    from app.modules.sourcing_1688 import postgres_store
+
+    return postgres_store.delete_sourcing_material_1688(material_id)
+
     with get_connection() as conn:
         cursor = conn.execute(
             "DELETE FROM sourcing_materials_1688 WHERE id = ?",
@@ -4595,6 +4663,10 @@ def delete_sourcing_material_1688(material_id: str) -> bool:
 
 
 def assign_sourcing_material_1688(material_id: str, temu_product_id: str) -> dict[str, Any]:
+    from app.modules.sourcing_1688 import postgres_store
+
+    return postgres_store.assign_sourcing_material_1688(material_id, temu_product_id)
+
     material = get_sourcing_material_1688(material_id)
     candidate = create_sourcing_candidate_1688({**material, "temu_product_id": temu_product_id})
     now = utc_now_text()
@@ -4688,6 +4760,13 @@ def create_product_from_sourcing_material_1688(
     *,
     add_to_pool_user_id: str | None = DEFAULT_USER_ID,
 ) -> dict[str, Any]:
+    from app.modules.sourcing_1688 import postgres_store
+
+    return postgres_store.create_product_from_sourcing_material_1688(
+        material_id,
+        add_to_pool_user_id=add_to_pool_user_id,
+    )
+
     material = get_sourcing_material_1688(material_id)
     offer_id = material.get("offer_id")
     product_url = material["product_url"]
