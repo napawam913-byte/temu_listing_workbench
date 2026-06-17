@@ -47,7 +47,13 @@ jobs:
             --exclude='frontend/node_modules' \
             --exclude='frontend/dist' \
             --exclude='node_modules' \
-            --exclude='storage' \
+            --exclude='storage/dxm_category_attrs_runs' \
+            --exclude='storage/exports' \
+            --exclude='storage/processed' \
+            --exclude='storage/screenshots' \
+            --exclude='storage/uploads' \
+            --exclude='storage/visual_generation' \
+            --exclude='storage/yunqi_exports' \
             -czf /tmp/temu_listing_workbench_release.tgz .
 
       - name: Upload release
