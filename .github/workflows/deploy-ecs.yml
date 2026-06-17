@@ -1,0 +1,83 @@
+name: Deploy ECS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-ecs-main
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Deploy to Aliyun ECS
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        shell: bash
+        env:
+          ECS_HOST: ${{ secrets.ECS_HOST }}
+          ECS_PORT: ${{ secrets.ECS_PORT }}
+          ECS_SSH_PRIVATE_KEY: ${{ secrets.ECS_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${ECS_HOST}" || (echo "Missing secret ECS_HOST" && exit 1)
+          test -n "${ECS_SSH_PRIVATE_KEY}" || (echo "Missing secret ECS_SSH_PRIVATE_KEY" && exit 1)
+          mkdir -p ~/.ssh
+          printf '%s\n' "${ECS_SSH_PRIVATE_KEY}" > ~/.ssh/ecs_key
+          chmod 600 ~/.ssh/ecs_key
+          ssh-keyscan -p "${ECS_PORT:-22}" "${ECS_HOST}" >> ~/.ssh/known_hosts
+
+      - name: Package release
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar \
+            --exclude='.git' \
+            --exclude='.env' \
+            --exclude='backend/.venv' \
+            --exclude='backend/runtime' \
+            --exclude='frontend/node_modules' \
+            --exclude='frontend/dist' \
+            --exclude='node_modules' \
+            --exclude='storage' \
+            -czf /tmp/temu_listing_workbench_release.tgz .
+
+      - name: Upload release
+        shell: bash
+        env:
+          ECS_HOST: ${{ secrets.ECS_HOST }}
+          ECS_PORT: ${{ secrets.ECS_PORT }}
+          ECS_USER: ${{ secrets.ECS_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          ECS_PORT="${ECS_PORT:-22}"
+          ECS_USER="${ECS_USER:-root}"
+          DEPLOY_PATH="${DEPLOY_PATH:-/opt/temu_listing_workbench}"
+          ssh -i ~/.ssh/ecs_key -p "${ECS_PORT}" "${ECS_USER}@${ECS_HOST}" \
+            "mkdir -p '${DEPLOY_PATH}'"
+          scp -i ~/.ssh/ecs_key -P "${ECS_PORT}" /tmp/temu_listing_workbench_release.tgz \
+            "${ECS_USER}@${ECS_HOST}:/tmp/temu_listing_workbench_release.tgz"
+
+      - name: Deploy
+        shell: bash
+        env:
+          ECS_HOST: ${{ secrets.ECS_HOST }}
+          ECS_PORT: ${{ secrets.ECS_PORT }}
+          ECS_USER: ${{ secrets.ECS_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+        run: |
+          set -euo pipefail
+          ECS_PORT="${ECS_PORT:-22}"
+          ECS_USER="${ECS_USER:-root}"
+          DEPLOY_PATH="${DEPLOY_PATH:-/opt/temu_listing_workbench}"
+          ssh -i ~/.ssh/ecs_key -p "${ECS_PORT}" "${ECS_USER}@${ECS_HOST}" \
+            "tar -xzf /tmp/temu_listing_workbench_release.tgz -C '${DEPLOY_PATH}' && rm -f /tmp/temu_listing_workbench_release.tgz && DEPLOY_PATH='${DEPLOY_PATH}' SKIP_GIT_PULL=1 bash '${DEPLOY_PATH}/scripts/deploy_server.sh'"

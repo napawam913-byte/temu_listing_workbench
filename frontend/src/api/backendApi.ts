@@ -5,6 +5,9 @@ function resolveApiBaseUrl() {
   const configured = import.meta.env.VITE_API_BASE_URL?.trim();
   if (configured) return configured.replace(/\/$/, '');
   if (typeof window !== 'undefined') {
+    if (!import.meta.env.DEV) {
+      return window.location.origin;
+    }
     return `${window.location.protocol}//${window.location.hostname}:8000`;
   }
   return 'http://localhost:8000';
