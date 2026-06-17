@@ -1358,6 +1358,23 @@ export async function resetAdminUserPassword(userId: string, password: string): 
   return body.user;
 }
 
+export async function deleteAdminUsers(userIds: string[]): Promise<{ deletedCount: number; deletedIds: string[] }> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/users/batch-delete`, withSession({
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ userIds }),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return {
+    deletedCount: body.deletedCount || 0,
+    deletedIds: body.deletedIds || [],
+  };
+}
+
 export async function fetchAdminUserUsageLimit(userId: string): Promise<AdminUserUsageLimit> {
   const response = await fetch(`${API_BASE_URL}/api/admin/users/${encodeURIComponent(userId)}/usage-limit`, withSession({
     headers: authHeaders(),

@@ -10,9 +10,9 @@ from app.core.database import (
     assert_user_api_usage_allowed,
     build_text_vector,
     cosine_similarity,
-    get_connection,
     record_api_usage_safe,
 )
+from app.modules.exports.postgres_store import get_export_connection as get_connection
 from app.modules.visual_generation.clients import (
     build_api_url,
     extract_response_text,
@@ -28,6 +28,7 @@ NUMBER_INPUT_PATTERN = re.compile(r"[-+]?\d+(?:\.\d+)?")
 OTHER_FIBER_PERCENT_LIMIT = 5.0
 CATEGORY_LEAF_POOL_LIMIT = 120
 CATEGORY_BRANCH_CANDIDATE_LIMIT = 10
+CATEGORY_FINAL_CANDIDATE_LIMIT = 20
 CATEGORY_AI_CONFIDENCE_FLOOR = 0.25
 CATEGORY_VECTOR_CONFIDENT_SCORE = 0.55
 MAX_CATEGORY_REFERENCE_IMAGES = 6
@@ -347,6 +348,15 @@ def resolve_category_leaf_by_vector(
     if not scored_leaves:
         return None
 
+    if allow_ai_final:
+        top_leaves = scored_leaves[:CATEGORY_FINAL_CANDIDATE_LIMIT]
+        return choose_final_leaf_with_ai(
+            record=record,
+            intent=intent,
+            leaves=top_leaves,
+            user_id=user_id,
+        ) or top_leaves[0]
+
     selected_parts: list[str] = []
     current_leaves = scored_leaves[:CATEGORY_LEAF_POOL_LIMIT]
     for _depth in range(8):
@@ -362,13 +372,6 @@ def resolve_category_leaf_by_vector(
         if len(current_leaves) == 1 and len(current_leaves[0].get("path_parts") or []) == len(selected_parts):
             break
 
-    if allow_ai_final:
-        return choose_final_leaf_with_ai(
-            record=record,
-            intent=intent,
-            leaves=current_leaves[:CATEGORY_BRANCH_CANDIDATE_LIMIT],
-            user_id=user_id,
-        ) or (current_leaves[0] if current_leaves else None)
     return current_leaves[0] if current_leaves else None
 
 
@@ -446,9 +449,22 @@ def request_category_intent_ai(
 ) -> dict[str, Any]:
     settings = get_ai_stage_settings("product_attribute", user_id=user_id)
     instruction = {
-        "task": "Parse the product title into category matching signals for a Temu/Dianxiaomi category tree. Return concise category terms only, not marketing copy.",
+        "task": (
+            "First identify the real product from the final export title and reference images, then convert that identity "
+            "into category matching signals for a Temu/Dianxiaomi category tree. Return concise category terms only, not marketing copy."
+        ),
+        "rules": [
+            "Use the attached product images and final export title as primary evidence; source titles and SKU names are secondary hints.",
+            "Decide what the physical product actually is before matching any category.",
+            "Do not classify by container/storage/organizer words unless the image and title show the product is actually a storage container.",
+            "Ignore logistics text, promotions, use-scene marketing, gift occasion words, shop metrics, ratings, and generic package words.",
+            "If the product is a party favor bag, party gift bag, favor box, pinata, confetti popper, balloon, garland, or other party supply, keep party-supply category terms explicit.",
+            "If title text conflicts with the image, trust the image for product identity and material/shape.",
+        ],
         "output_schema": {
+            "product_identity": "short concrete identity from title and image, e.g. kids party favor gift bag",
             "product_type": "short noun phrase",
+            "visual_subject": "what the reference image actually shows",
             "core_keywords": ["category keyword"],
             "materials": ["material if useful"],
             "use_scenes": ["use scene"],
@@ -641,7 +657,10 @@ def category_query_text(record: dict[str, Any], product_context: dict[str, Any],
     parts = [
         clean_text(record.get("productTitle")),
         clean_text(record.get("productTitleEn")),
+        clean_text(intent.get("product_identity")),
         clean_text(intent.get("product_type")),
+        clean_text(intent.get("visual_subject")),
+        clean_text(intent.get("product_function")),
     ]
     for key in ("core_keywords", "materials", "use_scenes", "audience", "category_hints"):
         value = intent.get(key)
@@ -650,9 +669,14 @@ def category_query_text(record: dict[str, Any], product_context: dict[str, Any],
         else:
             parts.append(clean_text(value))
     parts.extend(sku_names_for_prompt(record)[:20])
-    for source in record.get("sourceLinks") or []:
-        if isinstance(source, dict):
-            parts.append(clean_text(source.get("title")))
+    has_identity = any(
+        clean_text(intent.get(key))
+        for key in ("product_identity", "product_type", "visual_subject")
+    ) or bool(intent.get("core_keywords"))
+    if not has_identity:
+        for source in record.get("sourceLinks") or []:
+            if isinstance(source, dict):
+                parts.append(clean_text(source.get("title")))
     return " ".join(part for part in parts if part)
 
 
@@ -778,7 +802,7 @@ def choose_final_leaf_with_ai(
             }
             for leaf in leaves
         ],
-        task="Choose the final leaf category that best fits the product.",
+        task="Choose the final leaf category that best fits the product from the local vector Top 20 candidates.",
         user_id=user_id,
     )
     return candidate_from_ai_choice(result, leaves) or leaves[0]
@@ -809,7 +833,10 @@ def request_category_branch_ai(
         "task": task,
         "rules": [
             "Select exactly one candidate index from the provided list.",
-            "Prefer the real product type over use scenario or decorative words.",
+            "First identify the real product from final title and reference images, then choose the closest category path.",
+            "Prefer the real product type over use scenario, decorative words, packaging words, or generic container/storage words.",
+            "Do not choose storage/organizer/container categories unless the image and title show the product is actually a storage container.",
+            "If the product identity is party favor bag, party gift bag, favor box, pinata, confetti popper, balloon, garland, or party supply, prefer party-supply branches over home storage branches.",
             "Do not invent categories outside the candidate list.",
         ],
         "output_schema": {"selected_index": 1, "confidence": 0.0, "reason": "short reason"},

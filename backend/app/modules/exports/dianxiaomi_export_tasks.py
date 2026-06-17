@@ -7,13 +7,14 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from app.core.database import clean_text, get_connection, utc_now_text
+from app.core.database import clean_text, utc_now_text
 from app.modules.exports.dianxiaomi_temu import (
     EXPORT_MODE_CURATED,
     DianxiaomiExportError,
     export_dianxiaomi_temu_template,
     normalize_export_mode,
 )
+from app.modules.exports.postgres_store import get_export_connection as get_connection
 
 EXPORT_TASK_STATUS_QUEUED = "queued"
 EXPORT_TASK_STATUS_RUNNING = "running"
@@ -35,28 +36,7 @@ class DianxiaomiExportTaskError(ValueError):
 
 
 def ensure_dianxiaomi_export_task_schema(conn) -> None:
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS dianxiaomi_export_tasks (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            export_mode TEXT NOT NULL DEFAULT 'curated',
-            status TEXT NOT NULL DEFAULT 'queued',
-            record_count INTEGER NOT NULL DEFAULT 0,
-            record_ids_json TEXT NOT NULL DEFAULT '[]',
-            records_json TEXT NOT NULL DEFAULT '[]',
-            file_path TEXT,
-            filename TEXT,
-            error_message TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            completed_at TEXT
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_dianxiaomi_export_tasks_user_status
-            ON dianxiaomi_export_tasks(user_id, status, updated_at);
-        """
-    )
+    return
 
 
 def create_dianxiaomi_export_task(
@@ -258,4 +238,3 @@ def parse_json_list(raw_value: Any) -> list[Any]:
     except json.JSONDecodeError:
         return []
     return parsed if isinstance(parsed, list) else []
-

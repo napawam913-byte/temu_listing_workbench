@@ -53,6 +53,73 @@ def pg_table_exists(conn: Any, table_name: str) -> bool:
     return bool(row and row["table_name"])
 
 
+def ensure_admin_config_schema() -> None:
+    now = utc_now_text()
+    with get_pg_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_api_settings (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                api_key TEXT NOT NULL DEFAULT '',
+                base_url TEXT NOT NULL DEFAULT '',
+                text_model TEXT NOT NULL DEFAULT '',
+                image_model TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                updated_by TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            UPDATE user_api_settings
+            SET
+                id = COALESCE(NULLIF(id, ''), md5(random()::text || clock_timestamp()::text)),
+                api_key = COALESCE(api_key, ''),
+                base_url = COALESCE(base_url, ''),
+                text_model = COALESCE(text_model, ''),
+                image_model = COALESCE(image_model, ''),
+                enabled = COALESCE(enabled, 0),
+                created_at = COALESCE(NULLIF(created_at, ''), %s),
+                updated_at = COALESCE(NULLIF(updated_at, ''), %s)
+            """,
+            (now, now),
+        )
+        conn.execute(
+            """
+            DELETE FROM user_api_settings
+            WHERE id IN (
+                SELECT id
+                FROM (
+                    SELECT
+                        id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY user_id, channel_id
+                            ORDER BY updated_at DESC, created_at DESC, id DESC
+                        ) AS row_num
+                    FROM user_api_settings
+                ) ranked
+                WHERE ranked.row_num > 1
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_user_api_settings_user_channel
+                ON user_api_settings(user_id, channel_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_user_api_settings_user
+                ON user_api_settings(user_id, enabled)
+            """
+        )
+
+
 def app_setting_row_to_api(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "key": row["key"],
@@ -367,6 +434,7 @@ def upsert_user_api_credential(
         raise ValueError("缺少 API 渠道")
 
     now = utc_now_text()
+    ensure_admin_config_schema()
     with get_pg_connection() as conn:
         user_row = conn.execute("SELECT id FROM users WHERE id = %s", (clean_user_id,)).fetchone()
         if not user_row:

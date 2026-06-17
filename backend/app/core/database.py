@@ -989,22 +989,16 @@ def get_enabled_user_api_credential(user_id: str | None) -> dict[str, Any] | Non
 
     return postgres_store.get_enabled_user_api_credential(user_id)
 
+
+def get_user_role(user_id: str | None) -> str:
     clean_user_id = clean_text(user_id)
     if not clean_user_id:
-        return None
-    with get_connection() as conn:
-        ensure_user_api_settings_schema(conn)
-        row = conn.execute(
-            """
-            SELECT *
-            FROM user_api_settings
-            WHERE user_id = ? AND enabled = 1 AND api_key != ''
-            ORDER BY updated_at DESC
-            LIMIT 1
-            """,
-            (clean_user_id,),
-        ).fetchone()
-    return user_api_credential_row_to_api(row) if row else None
+        return ""
+    from app.modules.admin_config import postgres_store
+
+    with postgres_store.get_pg_connection() as conn:
+        row = conn.execute("SELECT role FROM users WHERE id = %s", (clean_user_id,)).fetchone()
+    return clean_text(row["role"]) if row else ""
 
 
 def upsert_user_api_credential(
@@ -2424,6 +2418,21 @@ def update_managed_user(
         manager_user_id=manager_user_id,
     )
 
+
+def delete_managed_users(user_ids: list[str], *, requested_by_user_id: str) -> dict[str, Any]:
+    from app.modules.identity import postgres_store
+
+    return postgres_store.delete_managed_users(user_ids, requested_by_user_id=requested_by_user_id)
+
+
+def _legacy_update_managed_user_unreachable(
+    user_id: str,
+    *,
+    display_name: str | None = None,
+    role: str | None = None,
+    status: str | None = None,
+    manager_user_id: str | None = None,
+) -> dict[str, Any]:
     clean_user_id = str(user_id or "").strip()
     if not clean_user_id:
         raise ValueError("缺少用户 ID")
@@ -2629,11 +2638,15 @@ def get_enabled_admin_api_channel_credential() -> dict[str, str] | None:
             continue
         api_key = get_app_setting_value(f"{setting_prefix}_API_KEY", "").strip()
         base_url = get_app_setting_value(f"{setting_prefix}_BASE_URL", default_base_url).strip().rstrip("/")
+        text_model = get_app_setting_value(f"{setting_prefix}_TEXT_MODEL", "").strip()
+        image_model = get_app_setting_value(f"{setting_prefix}_IMAGE_MODEL", "").strip()
         if api_key and base_url:
             return {
                 "channelId": channel_id,
                 "apiKey": api_key,
                 "baseUrl": base_url,
+                "textModel": text_model,
+                "imageModel": image_model,
             }
     return None
 

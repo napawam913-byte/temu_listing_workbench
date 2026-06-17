@@ -7,6 +7,7 @@ from typing import Any
 from app.core.database import assert_user_api_usage_allowed, record_api_usage_safe
 from app.modules.creative_generation.chatgpt_listing import build_openai_client, get_openai_settings
 from app.modules.creative_generation.safety import sanitize_marketplace_text
+from app.modules.sourcing_1688.ai_response import contains_cjk, parse_ai_response_json
 from app.modules.sourcing_1688.search_url import build_1688_search_url
 
 TITLE_SPLIT_STAGE = "title_split"
@@ -93,7 +94,7 @@ def split_title_for_1688_search(title: str, category: str = "", *, user_id: str 
                 status="failed",
                 error_message=str(exc),
             )
-            pass
+            raise ValueError(f"1688 中文关键词转换失败：{exc}") from exc
 
     fallback = build_fallback_title_keywords(clean_title, clean_category)
     return {**fallback, "source": "rule-fallback", "model": "rule-fallback"}
@@ -107,10 +108,16 @@ def split_title_with_gpt(title: str, category: str, settings: Any) -> dict[str, 
             {
                 "role": "system",
                 "content": (
-                    "You convert noisy marketplace product titles into concise Chinese 1688 sourcing keywords. "
-                    "Return strict JSON only. Keep the core product subject and necessary attributes. "
-                    "Remove quantity, marketing copy, target users, scenes, gift wording, platform names, and broad usage claims. "
-                    "Prefer supplier/search terms a 1688 buyer would type. Do not output English unless the product noun is normally English."
+                    "You convert noisy marketplace product titles into concise Simplified Chinese 1688 sourcing keywords. "
+                    "If the title is English or mixed-language, first translate the real product subject, material, shape, "
+                    "structure, and key attributes into Chinese supplier search terms. Return strict JSON only. "
+                    "Every keyword must be suitable for 1688 supplier search in Simplified Chinese. "
+                    "Do not output raw English title fragments, SKU/model codes, logistics text, quantity, marketing copy, "
+                    "target users, scenes, gift wording, platform names, or broad usage claims. "
+                    "Examples: '3DPaperAirplaneF' -> '纸飞机玩具'; 'Mini Tote Bags' -> '迷你托特包'; "
+                    "'Wood D12 Dice' -> '木质十二面骰子'. "
+                    "Only keep universal English abbreviations when paired with a Chinese product noun, such as '3D纸飞机模型', "
+                    "'LED灯', or 'USB充电线'."
                 ),
             },
             {
@@ -119,11 +126,19 @@ def split_title_with_gpt(title: str, category: str, settings: Any) -> dict[str, 
                     {
                         "title": title,
                         "category": category,
+                        "translation_requirement": (
+                            "英文或中英混合标题必须先转成简体中文 1688 采购搜索词，不能原样输出英文连写词、型号词、物流词或营销词。"
+                        ),
+                        "must_translate_examples": {
+                            "3DPaperAirplaneF": "纸飞机玩具",
+                            "Pale Mini Tote Bags": "迷你托特包",
+                            "Wood D12 Dice": "木质十二面骰子",
+                        },
                         "required_json": {
-                            "primary_keyword": "best precise 1688 search keyword, Chinese, usually 4-12 chars",
+                            "primary_keyword": "最精准的简体中文 1688 采购搜索词，通常 4-12 个中文字符；英文标题必须翻译成中文，不要原样输出英文",
                             "keywords": [
                                 {
-                                    "keyword": "alternative 1688 search keyword",
+                                    "keyword": "简体中文 1688 采购搜索词，不要英文原词",
                                     "intent": "precise/core/attribute/broaden",
                                     "reason": "short Chinese reason",
                                 }
@@ -136,7 +151,10 @@ def split_title_with_gpt(title: str, category: str, settings: Any) -> dict[str, 
             },
         ],
     )
-    return normalize_title_keyword_response(json.loads(response.output_text), title, category)
+    result = normalize_title_keyword_response(parse_ai_response_json(response), title, category)
+    if not contains_cjk(result.get("primary_keyword")):
+        raise ValueError("模型没有返回中文 1688 搜索词")
+    return result
 
 
 def build_fallback_title_keywords(title: str, category: str = "") -> dict[str, Any]:
@@ -163,7 +181,11 @@ def build_fallback_title_keywords(title: str, category: str = "") -> dict[str, A
 
     if not keywords:
         fallback_terms = re.findall(r"[\u4e00-\u9fffA-Za-z0-9]+", clean_title_value)
-        fallback_keyword = "".join(fallback_terms)[:16] or clean_text(category)[:16] or title[:16]
+        fallback_keyword = (
+            "".join(fallback_terms)[:16]
+            or clean_text(category)[:16]
+            or title[:16]
+        )
         keywords.append(keyword_item(fallback_keyword, "兜底关键词", "未配置 GPT 时使用标题主体片段。"))
 
     return normalize_title_keyword_response(

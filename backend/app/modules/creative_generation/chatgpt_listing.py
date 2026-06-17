@@ -13,6 +13,7 @@ from app.core.database import (
     get_app_setting_value,
     get_enabled_admin_api_channel_credential,
     get_enabled_user_api_credential,
+    get_user_role,
     record_api_usage_safe,
 )
 from app.modules.creative_generation.safety import find_sensitive_terms, sanitize_marketplace_text
@@ -171,7 +172,12 @@ def generate_listing_package(record: dict[str, Any], *, generate_images: bool = 
 def get_openai_settings(stage: str | None = None, *, user_id: str | None = None) -> OpenAISettings:
     user_credential = get_enabled_user_api_credential(user_id)
     has_user_credential = bool(user_credential and user_credential.get("apiKey"))
-    admin_credential = None if has_user_credential else get_enabled_admin_api_channel_credential()
+    user_role = get_user_role(user_id)
+    requires_member_credential = bool(str(user_id or "").strip()) and user_role != "admin"
+    if requires_member_credential and not has_user_credential:
+        raise CreativeGenerationError("当前成员未配置可用 API Key，请管理员在后台为该成员配置 API Key 后再执行。")
+
+    admin_credential = None if has_user_credential or requires_member_credential else get_enabled_admin_api_channel_credential()
     has_admin_credential = bool(admin_credential and admin_credential.get("apiKey"))
     common_api_key = (
         str(user_credential.get("apiKey") or "").strip()
@@ -187,8 +193,22 @@ def get_openai_settings(stage: str | None = None, *, user_id: str | None = None)
         if has_admin_credential
         else get_runtime_setting("OPENAI_BASE_URL", OPENAI_BASE_URL).strip().rstrip("/")
     )
-    common_text_model = get_runtime_setting("OPENAI_TEXT_MODEL", OPENAI_TEXT_MODEL).strip() or "gpt-5.5"
-    common_image_model = get_runtime_setting("OPENAI_IMAGE_MODEL", OPENAI_IMAGE_MODEL).strip() or "gpt-image-2"
+    credential_text_model = (
+        str(user_credential.get("textModel") or "").strip()
+        if has_user_credential
+        else str(admin_credential.get("textModel") or "").strip()
+        if has_admin_credential
+        else ""
+    )
+    credential_image_model = (
+        str(user_credential.get("imageModel") or "").strip()
+        if has_user_credential
+        else str(admin_credential.get("imageModel") or "").strip()
+        if has_admin_credential
+        else ""
+    )
+    common_text_model = credential_text_model or get_runtime_setting("OPENAI_TEXT_MODEL", OPENAI_TEXT_MODEL).strip() or "gpt-5.5"
+    common_image_model = credential_image_model or get_runtime_setting("OPENAI_IMAGE_MODEL", OPENAI_IMAGE_MODEL).strip() or "gpt-image-2"
     stage_prefixes = {
         "title": "OPENAI_TITLE",
         "title_split": "OPENAI_TITLE_SPLIT",

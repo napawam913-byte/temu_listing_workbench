@@ -21,6 +21,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { CSSProperties, Key } from 'react';
 import {
   createAdminUser,
+  deleteAdminUsers,
   fetchAdminApiChannels,
   fetchAdminPromptConfigs,
   fetchAdminApiUsage,
@@ -317,6 +318,8 @@ export function AdminPage() {
   const [loading, setLoading] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
   const [creatingUser, setCreatingUser] = useState(false);
+  const [deletingUsers, setDeletingUsers] = useState(false);
+  const [selectedUserRowKeys, setSelectedUserRowKeys] = useState<Key[]>([]);
   const [passwordReset, setPasswordReset] = useState<PasswordResetState>({ password: '' });
   const [expandedUserRowKeys, setExpandedUserRowKeys] = useState<Key[]>([]);
   const [memberCredentialState, setMemberCredentialState] = useState<MemberCredentialState>({
@@ -387,6 +390,37 @@ export function AdminPage() {
     } catch (error) {
       message.error(error instanceof Error ? error.message : '用户更新失败');
     }
+  };
+
+  const batchDeleteSelectedUsers = () => {
+    const userIds = selectedUserRowKeys.map(String).filter(Boolean);
+    if (!userIds.length) {
+      message.warning('请先选择要删除的成员');
+      return;
+    }
+    const selectedUsers = users.filter((user) => userIds.includes(user.id));
+    Modal.confirm({
+      title: `确认删除 ${selectedUsers.length} 个成员？`,
+      content: '删除后会清理这些成员的登录会话、团队关系、API Key 配置和用量记录。当前登录管理员和最后一个管理员不会被允许删除。',
+      okText: '删除',
+      okButtonProps: { danger: true, loading: deletingUsers },
+      cancelText: '取消',
+      onOk: async () => {
+        setDeletingUsers(true);
+        try {
+          const result = await deleteAdminUsers(userIds);
+          const deletedIdSet = new Set(result.deletedIds);
+          setUsers((current) => current.filter((user) => !deletedIdSet.has(user.id)));
+          setSelectedUserRowKeys([]);
+          message.success(`已删除 ${result.deletedCount} 个成员`);
+        } catch (error) {
+          message.error(error instanceof Error ? error.message : '成员删除失败');
+          throw error;
+        } finally {
+          setDeletingUsers(false);
+        }
+      },
+    });
   };
 
   const resetPassword = async () => {
@@ -1195,6 +1229,10 @@ export function AdminPage() {
                     className="admin-user-table"
                     columns={userColumns}
                     dataSource={userTableRows}
+                    rowSelection={{
+                      selectedRowKeys: selectedUserRowKeys,
+                      onChange: (keys) => setSelectedUserRowKeys([...keys]),
+                    }}
                     expandable={{
                       expandedRowKeys: expandedUserRowKeys,
                       indentSize: 18,
@@ -1215,9 +1253,21 @@ export function AdminPage() {
                     size="middle"
                     title={() => (
                       <div className="admin-user-table-summary">
-                        <span>管理员 {userTableSummary.adminCount}</span>
-                        <span>成员 {userTableSummary.memberCount}</span>
-                        {userTableSummary.unassignedCount ? <span>未归属 {userTableSummary.unassignedCount}</span> : null}
+                        <Space className="admin-user-summary-tags" size={10} wrap>
+                          <span>管理员 {userTableSummary.adminCount}</span>
+                          <span>成员 {userTableSummary.memberCount}</span>
+                          {userTableSummary.unassignedCount ? <span>未归属 {userTableSummary.unassignedCount}</span> : null}
+                          {selectedUserRowKeys.length ? <span>已选 {selectedUserRowKeys.length}</span> : null}
+                        </Space>
+                        <Button
+                          danger
+                          size="small"
+                          disabled={!selectedUserRowKeys.length}
+                          loading={deletingUsers}
+                          onClick={batchDeleteSelectedUsers}
+                        >
+                          批量删除
+                        </Button>
                       </div>
                     )}
                   />

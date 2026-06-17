@@ -151,7 +151,34 @@ def enqueue_visual_retry(job: dict[str, Any], *, error_message: str, delay_secon
                 "jobId": payload.get("jobId"),
                 "retryCount": payload.get("retryCount"),
                 "nextRetryAt": payload.get("nextRetryAt"),
-                "error": payload.get("lastError"),
+                "lastError": payload.get("lastError"),
+            },
+        )
+        return True
+    except Exception:
+        return False
+
+
+def enqueue_visual_deferred(job: dict[str, Any], *, reason: str, delay_seconds: int | None = None) -> bool:
+    if not redis_queue_enabled():
+        return False
+    payload = dict(job)
+    payload["deferReason"] = reason[:2000]
+    payload["deferredAt"] = int(time.time())
+    delay = delay_seconds
+    if delay is None:
+        delay = queue_int_setting("VISUAL_QUEUE_RETRY_DELAY_SECONDS", 30, minimum=1, maximum=3600)
+    payload["nextRetryAt"] = int(time.time()) + max(1, int(delay or 1))
+    try:
+        redis_client().zadd(retry_queue_name(), {json.dumps(payload, ensure_ascii=False): payload["nextRetryAt"]})
+        set_visual_progress(
+            str(payload.get("taskId") or ""),
+            {
+                "state": "queued",
+                "queue": retry_queue_name(),
+                "jobId": payload.get("jobId"),
+                "nextRetryAt": payload.get("nextRetryAt"),
+                "waitReason": payload.get("deferReason"),
             },
         )
         return True
@@ -182,14 +209,30 @@ def enqueue_visual_dead(job: dict[str, Any], *, error_message: str) -> bool:
         return False
 
 
-def promote_due_retry_jobs(*, limit: int = 50) -> int:
+def promote_due_deferred_jobs(*, limit: int = 50) -> int:
+    return promote_due_retry_jobs(limit=limit, mode="deferred")
+
+
+def promote_due_retry_jobs(*, limit: int = 50, mode: str = "all") -> int:
     if not redis_queue_enabled():
         return 0
     client = redis_client()
     retry_key = retry_queue_name()
-    due_payloads = client.zrangebyscore(retry_key, "-inf", int(time.time()), start=0, num=max(1, limit))
+    scan_limit = max(1, limit)
+    if mode != "all":
+        scan_limit = min(500, max(scan_limit * 5, scan_limit))
+    due_payloads = client.zrangebyscore(retry_key, "-inf", int(time.time()), start=0, num=scan_limit)
     promoted = 0
     for raw_payload in due_payloads:
+        try:
+            payload = json.loads(raw_payload)
+        except Exception:
+            payload = {}
+        is_deferred = isinstance(payload, dict) and bool(payload.get("deferReason")) and not payload.get("lastError")
+        if mode == "deferred" and not is_deferred:
+            continue
+        if mode == "retry" and is_deferred:
+            continue
         pipe = client.pipeline()
         pipe.zrem(retry_key, raw_payload)
         pipe.rpush(queue_name(), raw_payload)
@@ -197,7 +240,6 @@ def promote_due_retry_jobs(*, limit: int = 50) -> int:
         if results and int(results[0] or 0) > 0:
             promoted += 1
             try:
-                payload = json.loads(raw_payload)
                 set_visual_progress(
                     str(payload.get("taskId") or ""),
                     {
@@ -209,6 +251,8 @@ def promote_due_retry_jobs(*, limit: int = 50) -> int:
                 )
             except Exception:
                 continue
+        if promoted >= limit:
+            break
     return promoted
 
 
@@ -270,7 +314,7 @@ def release_worker_lock(token: str) -> None:
 
 
 def default_drain_max_jobs() -> int:
-    return queue_int_setting("VISUAL_QUEUE_DRAIN_MAX_JOBS", 3, minimum=1, maximum=50)
+    return queue_int_setting("VISUAL_QUEUE_DRAIN_MAX_JOBS", 10, minimum=1, maximum=50)
 
 
 def default_max_retries() -> int:

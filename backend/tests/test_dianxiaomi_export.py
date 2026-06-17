@@ -32,9 +32,15 @@ class DianxiaomiExportTest(unittest.TestCase):
             "app.modules.exports.dianxiaomi_temu.get_product_attribute_for_export_record",
             return_value={"category_id": "31075", "product_attribute_text": "[]"},
         )
+        self.image_processing_patcher = patch(
+            "app.modules.exports.dianxiaomi_temu.export_image_processing_enabled",
+            return_value=False,
+        )
         self.attribute_patcher.start()
+        self.image_processing_patcher.start()
 
     def tearDown(self):
+        self.image_processing_patcher.stop()
         self.attribute_patcher.stop()
 
     @patch(
@@ -596,6 +602,75 @@ class DianxiaomiExportTest(unittest.TestCase):
         self.assertNotIn("Valentines Day", sku_value)
         self.assertNotIn("Date Night", sku_value)
         self.assertFalse(sku_value.startswith("1 Pack1 Pack"))
+
+    def test_combo_sku_uses_source_titles_when_migrated_components_only_have_quantity(self):
+        captured_values: list[str] = []
+
+        def fake_translate(values, **_kwargs):
+            captured_values.extend(values)
+            return {values[0]: "2pcs Six-Sided Dice+1pc Wooden D12 Dice"}
+
+        with (
+            patch(
+                "app.modules.exports.dianxiaomi_temu.get_product_attribute_for_export_record",
+                return_value={"category_id": "31075", "product_attribute_text": "[]"},
+            ),
+            patch(
+                "app.modules.exports.dianxiaomi_temu.translate_variant_values_to_english",
+                side_effect=fake_translate,
+            ) as translator,
+        ):
+            rows = build_template_rows(
+                {
+                    "id": "record-1",
+                    "productId": "p1",
+                    "productTitle": "Dice Combo",
+                    "productTitleEn": "Dice Combo",
+                    "mainImage": {"sourceUrl": "https://example.com/main.jpg"},
+                    "sourceLinks": [
+                        {
+                            "id": "source-white",
+                            "title": (
+                                "No import charges2pcs Lover's Date Game Dice Stainless Steel "
+                                "Decision-making Dices - Perfect Gift for Couples"
+                            ),
+                            "imageUrl": "https://img.example.com/white-dice.jpg",
+                            "productUrl": "https://example.com/white-dice.html",
+                        },
+                        {
+                            "id": "source-wood",
+                            "title": (
+                                "1 Pack.IVW Wood Dice Suitable for Valentines Day Gifts - "
+                                "Twelve-Sided D12 Dice with Original Wood Grain"
+                            ),
+                            "imageUrl": "https://img.example.com/wood-d12.jpg",
+                            "productUrl": "https://example.com/wood-d12.html",
+                        },
+                    ],
+                    "skuEntries": [
+                        {
+                            "id": "sku-combo-1",
+                            "kind": "combo",
+                            "name": "2pcs+1 Pack",
+                            # Simulates migrated rows where only quantity specs survived on components.
+                            "componentSkus": [
+                                {"rawSpecs": {"Quantity": "2pcs"}},
+                                {"rawSpecs": {"Pack": "1 Pack"}},
+                            ],
+                        }
+                    ],
+                },
+                optimize_titles=False,
+            )
+
+        translator.assert_called_once()
+        self.assertEqual(rows[0]["variant_name"], "2pcs Six-Sided Dice+1pc Wooden D12 Dice")
+        self.assertEqual(rows[0]["variant_attr_name_1"], "\u578b\u53f7")
+        self.assertEqual(rows[0]["variant_attr_value_1"], "2pcs Six-Sided Dice+1pc Wooden D12 Dice")
+        self.assertTrue(captured_values)
+        self.assertNotEqual(captured_values[0], "2pcs+1 Pack")
+        self.assertIn("Decision", captured_values[0])
+        self.assertIn("D12 Dice", captured_values[0])
 
     def test_combo_sku_translates_model_value_and_variant_name(self):
         raw_combo_value = "\u4e00\u4ef6\u5ba0\u7269\u7897+\u9ed1\u8272\u5582\u98df\u57ab"

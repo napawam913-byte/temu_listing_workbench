@@ -11,6 +11,7 @@ from PIL import Image
 
 from app.modules.visual_generation.clients import (
     VisualGenerationError,
+    get_ai_stage_settings,
     image_file_to_data_url,
     image_file_to_upload,
     request_generated_image,
@@ -19,6 +20,35 @@ from app.modules.visual_generation.clients import (
 
 
 class VisualGenerationClientImageTest(unittest.TestCase):
+    def test_member_without_api_key_does_not_inherit_admin_channel_key(self):
+        with patch("app.modules.visual_generation.clients.get_enabled_user_api_credential", return_value=None):
+            with patch("app.modules.visual_generation.clients.get_user_role", return_value="user"):
+                with patch("app.modules.visual_generation.clients.get_runtime_setting", return_value=""):
+                    with patch("app.modules.visual_generation.clients.get_enabled_admin_api_channel_credential") as admin_channel:
+                        with self.assertRaises(VisualGenerationError):
+                            get_ai_stage_settings("visual_analysis", user_id="member-1")
+
+        admin_channel.assert_not_called()
+
+    def test_admin_without_personal_key_can_use_admin_channel_key(self):
+        with patch("app.modules.visual_generation.clients.get_enabled_user_api_credential", return_value=None):
+            with patch("app.modules.visual_generation.clients.get_user_role", return_value="admin"):
+                with patch("app.modules.visual_generation.clients.get_runtime_setting", return_value=""):
+                    with patch(
+                        "app.modules.visual_generation.clients.get_enabled_admin_api_channel_credential",
+                        return_value={
+                            "channelId": "chufan_ai",
+                            "apiKey": "admin-key",
+                            "baseUrl": "https://api.example.test/v1",
+                            "textModel": "channel-chat",
+                            "imageModel": "channel-image",
+                        },
+                    ):
+                        settings = get_ai_stage_settings("visual_analysis", user_id="admin-1")
+
+        self.assertEqual(settings["api_key"], "admin-key")
+        self.assertEqual(settings["base_url"], "https://api.example.test/v1")
+
     def test_image_file_to_data_url_normalizes_to_supported_jpeg(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             image_path = Path(tmpdir) / "reference.png"

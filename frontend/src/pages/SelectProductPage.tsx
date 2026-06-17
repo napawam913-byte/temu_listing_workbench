@@ -782,8 +782,14 @@ function getSelectedSkuImageRefDescriptors(record: LinkListRecord, selectedSkuId
 
   entries.forEach((entry) => {
     const skuName = String(entry.name || `SKU ${entry.order || ''}`).trim();
-    const skuLabel = `Selected SKU: ${skuName}`;
     const components = entry.componentSkus || [];
+    const primarySourceLink = (entry.sourceSkuLinks || [])[0];
+    const primaryComponent = components[0];
+    const entrySourceTitle =
+      getRecordSourceTitle(record, primarySourceLink?.sourceId, primarySourceLink?.sourceTitle) ||
+      getRecordSourceTitle(record, primaryComponent?.sourceId, primaryComponent?.sourceTitle) ||
+      record.productTitle;
+    const skuLabel = `Selected SKU: ${skuName} / Product title: ${entrySourceTitle}`;
 
     if (entry.kind === 'combo' && components.length > 0) {
       const addedComponentRef = components.reduce((added, component) => {
@@ -807,12 +813,16 @@ function getSelectedSkuImageRefDescriptors(record: LinkListRecord, selectedSkuId
         );
       }, false);
       if (!addedComponentRef) {
-        addRef(getSkuDisplayImageUrl(entry), skuLabel, skuName);
+        addRef(getSkuDisplayImageUrl(entry), skuLabel, [skuName, entrySourceTitle].filter(Boolean).join('|'));
       }
       return;
     }
 
-    const addedEntryRef = addRef(getSkuDisplayImageUrl(entry), skuLabel, skuName);
+    const addedEntryRef = addRef(
+      getSkuDisplayImageUrl(entry),
+      skuLabel,
+      [entry.id, skuName, entrySourceTitle].filter(Boolean).join('|'),
+    );
     if (!addedEntryRef) {
       (entry.sourceSkuLinks || []).some((link) => {
         const sourceTitle = getRecordSourceTitle(record, link.sourceId, link.sourceTitle);
@@ -2658,6 +2668,7 @@ function LinkListPanel({
       statusLabel: '创建中',
       statusColor: 'processing',
       backendStatus: 'creating',
+      errorMessage: undefined,
       modules: markModules('排队中', 'processing'),
     }));
 
@@ -2693,6 +2704,7 @@ function LinkListPanel({
       backendStatus: created.status,
       statusLabel: '后台执行中',
       statusColor: 'processing',
+      errorMessage: undefined,
       modules: markModules('等待回写', 'processing'),
     }));
 
@@ -2715,6 +2727,7 @@ function LinkListPanel({
       backendStatus: runResult.item.status || (waitingForConcurrency ? 'queued' : 'running'),
       statusLabel: waitingForConcurrency ? '\u6392\u961f\u7b49\u5f85' : '\u751f\u6210\u4e2d',
       statusColor: waitingForConcurrency ? 'blue' : 'processing',
+      errorMessage: undefined,
       modules: markModules(waitingForConcurrency ? '\u7b49\u5f85\u7a7a\u4f4d' : '\u751f\u6210\u4e2d', waitingForConcurrency ? 'blue' : 'processing'),
     }));
 
@@ -2729,7 +2742,7 @@ function LinkListPanel({
         motherImageUrl: progressTask.motherImageUrl || current.motherImageUrl,
         motherImagePath: progressTask.motherImagePath || current.motherImagePath,
         manifest: progressTask.manifest || current.manifest,
-        errorMessage: progressTask.errorMessage || current.errorMessage,
+        errorMessage: progressTask.status === 'failed' ? progressTask.errorMessage || current.errorMessage : undefined,
       }));
     });
     const itemWithBackendId = { ...item, backendTaskId: created.id };
@@ -2762,7 +2775,7 @@ function LinkListPanel({
       motherImageUrl: generated.motherImageUrl || undefined,
       motherImagePath: generated.motherImagePath || undefined,
       manifest: generated.manifest,
-      errorMessage: generated.errorMessage || undefined,
+      errorMessage: generated.status === 'failed' ? generated.errorMessage || undefined : undefined,
       modules: item.modules.map((module, index) => {
         const generatedModule = generatedModules[index];
         const resultUrl = generatedModule ? getVisualTaskResultUrl(generatedModule) : undefined;
@@ -2791,30 +2804,40 @@ function LinkListPanel({
 
     setVisualQueueExecuting(true);
     const recordMap = new Map(records.map((record) => [record.id, record]));
-    let successCount = 0;
     try {
-      for (const item of pendingItems) {
-        try {
+      const results = await Promise.allSettled(
+        pendingItems.map(async (item) => {
           await executeVisualQueueItem(item, recordMap);
-          successCount += 1;
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : '生图任务执行失败';
-          patchVisualQueueItem(item.id, () => ({
-            statusLabel: '执行失败',
+          return item.id;
+        }),
+      );
+
+      results.forEach((result, index) => {
+        if (result.status === 'fulfilled') return;
+        const item = pendingItems[index];
+        const error = result.reason;
+        const errorMessage = error instanceof Error ? error.message : '生图任务执行失败';
+        patchVisualQueueItem(item.id, () => ({
+          statusLabel: '执行失败',
+          statusColor: 'red',
+          backendStatus: 'failed',
+          errorMessage,
+          modules: item.modules.map((module) => ({
+            ...module,
+            statusLabel: '失败',
             statusColor: 'red',
-            backendStatus: 'failed',
-            errorMessage,
-            modules: item.modules.map((module) => ({
-              ...module,
-              statusLabel: '失败',
-              statusColor: 'red',
-            })),
-          }));
-          message.error(errorMessage);
-        }
-      }
+          })),
+        }));
+        message.error(errorMessage);
+      });
+
+      const successCount = results.filter((result) => result.status === 'fulfilled').length;
+      const failedCount = results.length - successCount;
       if (successCount > 0) {
         message.success(`已执行 ${successCount} 个生图任务，结果已回写到链接列表`);
+      }
+      if (failedCount > 0) {
+        message.warning(`${failedCount} 个生图任务失败，其他任务已继续执行`);
       }
     } finally {
       setVisualQueueExecuting(false);
@@ -3462,6 +3485,8 @@ function LinkListPanel({
               {visualQueueItems.map((item) => {
                 const active = activeVisualQueueItem?.id === item.id;
                 const progress = getVisualQueueProgress(item);
+                const referencePreviewRefs = getVisualReferenceImageRefs(item);
+                const visibleReferencePreviewRefs = referencePreviewRefs.slice(0, 3);
                 return (
                   <details
                     className={`visual-queue-panel ${active ? 'visual-queue-panel-active' : ''}`}
@@ -3478,15 +3503,25 @@ function LinkListPanel({
                   >
                     <summary className="visual-queue-panel-summary">
                       <span className="visual-queue-reference-thumb">
-                        {item.referenceImageUrl ? (
-                          <Image
-                            alt={item.productTitle}
-                            height={46}
-                            preview={false}
-                            referrerPolicy="no-referrer"
-                            src={item.referenceImageUrl}
-                            width={46}
-                          />
+                        {visibleReferencePreviewRefs.length > 0 ? (
+                          <>
+                            {visibleReferencePreviewRefs.map((ref, index) => (
+                              <Image
+                                alt={ref.label || `${item.productTitle} reference ${index + 1}`}
+                                height={visibleReferencePreviewRefs.length > 1 ? 34 : 46}
+                                key={`${ref.url}-${index}`}
+                                preview={false}
+                                referrerPolicy="no-referrer"
+                                src={ref.url}
+                                width={visibleReferencePreviewRefs.length > 1 ? 34 : 46}
+                              />
+                            ))}
+                            {referencePreviewRefs.length > visibleReferencePreviewRefs.length ? (
+                              <span className="visual-queue-reference-more">
+                                +{referencePreviewRefs.length - visibleReferencePreviewRefs.length}
+                              </span>
+                            ) : null}
+                          </>
                         ) : (
                           <PictureOutlined />
                         )}
@@ -3500,6 +3535,9 @@ function LinkListPanel({
                           <Tag color={item.statusColor}>{item.statusLabel}</Tag>
                           <Tag color="purple">{item.generationMode}</Tag>
                           <Tag color={item.styleLockStatus === 'ready' ? 'green' : 'gold'}>{item.styleLockLabel}</Tag>
+                          <Tag color={referencePreviewRefs.length > 1 ? 'cyan' : 'default'}>
+                            参考图 {referencePreviewRefs.length || 0}
+                          </Tag>
                           <span>{item.requestedCount} 张</span>
                           <span>{getVisualQueueLayoutLabel(item.requestedCount)}</span>
                           <span>{item.backendTaskId || item.backendStatus || '待创建'}</span>

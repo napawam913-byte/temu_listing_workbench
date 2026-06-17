@@ -16,6 +16,7 @@ from app.core.database import (
     get_app_setting_value,
     get_enabled_admin_api_channel_credential,
     get_enabled_user_api_credential,
+    get_user_role,
 )
 
 try:
@@ -106,7 +107,12 @@ def get_runtime_setting(key: str, default: str = "") -> str:
 def get_ai_settings(user_id: str | None = None) -> dict[str, str]:
     user_credential = get_enabled_user_api_credential(user_id)
     has_user_credential = bool(user_credential and user_credential.get("apiKey"))
-    admin_credential = None if has_user_credential else get_enabled_admin_api_channel_credential()
+    user_role = get_user_role(user_id)
+    requires_member_credential = bool(str(user_id or "").strip()) and user_role != "admin"
+    if requires_member_credential and not has_user_credential:
+        raise VisualGenerationError("当前成员未配置可用 API Key，请管理员在后台为该成员配置 API Key 后再执行。")
+
+    admin_credential = None if has_user_credential or requires_member_credential else get_enabled_admin_api_channel_credential()
     has_admin_credential = bool(admin_credential and admin_credential.get("apiKey"))
     base_url = (
         str(user_credential.get("baseUrl") or "").strip().rstrip("/")
@@ -114,6 +120,20 @@ def get_ai_settings(user_id: str | None = None) -> dict[str, str]:
         else str(admin_credential.get("baseUrl") or "").strip().rstrip("/")
         if has_admin_credential
         else get_runtime_setting("OPENAI_BASE_URL", app_config.OPENAI_BASE_URL).strip().rstrip("/")
+    )
+    credential_text_model = (
+        str(user_credential.get("textModel") or "").strip()
+        if has_user_credential
+        else str(admin_credential.get("textModel") or "").strip()
+        if has_admin_credential
+        else ""
+    )
+    credential_image_model = (
+        str(user_credential.get("imageModel") or "").strip()
+        if has_user_credential
+        else str(admin_credential.get("imageModel") or "").strip()
+        if has_admin_credential
+        else ""
     )
     return {
         "api_key": (
@@ -124,8 +144,12 @@ def get_ai_settings(user_id: str | None = None) -> dict[str, str]:
             else get_runtime_setting("OPENAI_API_KEY", app_config.OPENAI_API_KEY).strip()
         ),
         "base_url": base_url or DEFAULT_OPENAI_BASE_URL,
-        "text_model": get_runtime_setting("OPENAI_TEXT_MODEL", app_config.OPENAI_TEXT_MODEL).strip() or "gpt-5.5",
-        "image_model": get_runtime_setting("OPENAI_IMAGE_MODEL", app_config.OPENAI_IMAGE_MODEL).strip() or "gpt-image-2-1k",
+        "text_model": credential_text_model
+        or get_runtime_setting("OPENAI_TEXT_MODEL", app_config.OPENAI_TEXT_MODEL).strip()
+        or "gpt-5.5",
+        "image_model": credential_image_model
+        or get_runtime_setting("OPENAI_IMAGE_MODEL", app_config.OPENAI_IMAGE_MODEL).strip()
+        or "gpt-image-2-1k",
         "image_quality": get_runtime_setting("OPENAI_IMAGE_QUALITY", app_config.OPENAI_IMAGE_QUALITY).strip() or "medium",
         "channel_id": (
             str(user_credential.get("channelId") or "")

@@ -24,7 +24,7 @@ const { Text } = Typography;
 const DEFAULT_IMAGE_PROVIDER = 'chatgpt';
 const MIN_PRODUCT_IMAGE_GENERATION_COUNT = 1;
 const MAX_PRODUCT_IMAGE_GENERATION_COUNT = 8;
-const SMART_RECOMMEND_CACHE_STORAGE_KEY = 'temuListingWorkbenchSmart1688CacheV2';
+const SMART_RECOMMEND_CACHE_STORAGE_KEY = 'temuListingWorkbenchSmart1688CacheV6';
 const SMART_RECOMMEND_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_STYLE_PROMPT =
   '先分析，再执行。先分析商品品类、主体组件、SKU/组合售卖内容、可复用画风和禁用元素；再统一光线、背景、色温、质感和构图。保留 SKU 的真实款式、颜色、数量和关键细节，组合 SKU 必须把购买会收到的所有组件同框展示，生成干净一致的 Temu 电商商品图。';
@@ -455,12 +455,12 @@ function Smart1688KeywordRecommendations({ product }: { product: Product }) {
             {cacheLoaded ? <Tag color="green">已缓存</Tag> : null}
           </Space>
           <Text className="smart-recommend-subtitle" type="secondary">
-            先筛选 GPT 分析关键词，再从你的本地商品列表中回显可参考商品
+            先让 GPT 发散相邻类目和搭配品方向，再从你的本地商品列表中回显可参考商品
           </Text>
         </div>
         <Space>
           <Button icon={<BulbOutlined />} loading={keywordLoading} onClick={analyzeKeywords}>
-            {keywords.length > 0 ? '重新分析' : '分析关键词'}
+            {keywords.length > 0 ? '重新分析' : '分析推荐方向'}
           </Button>
           <Button
             disabled={keywords.length === 0}
@@ -482,7 +482,7 @@ function Smart1688KeywordRecommendations({ product }: { product: Product }) {
       {keywords.length > 0 ? (
         <div className="smart-keyword-section">
           <div className="smart-keyword-toolbar">
-            <Text strong>关键词筛选</Text>
+            <Text strong>推荐方向筛选</Text>
             <Text type="secondary">已选 {selectedKeywords.length} 个</Text>
           </div>
           <div className="smart-keyword-grid">
@@ -511,7 +511,7 @@ function Smart1688KeywordRecommendations({ product }: { product: Product }) {
           </div>
           <div className="smart-keyword-custom">
             <Input
-              placeholder="手动补充关键词，例如：圆形药片盒"
+              placeholder="手动补充方向，例如：陶瓷碗、餐垫、礼品包装盒"
               value={customKeyword}
               onChange={(event) => setCustomKeyword(event.target.value)}
               onPressEnter={addCustomKeyword}
@@ -523,10 +523,10 @@ function Smart1688KeywordRecommendations({ product }: { product: Product }) {
         <Empty
           className="sourcing-empty"
           image={Empty.PRESENTED_IMAGE_SIMPLE}
-          description="先点击分析关键词，确认搜索方向后再推荐商品"
+          description="先点击分析推荐方向，确认相邻类目后再推荐商品"
         >
           <Button type="primary" loading={keywordLoading} onClick={analyzeKeywords}>
-            分析关键词
+            分析推荐方向
           </Button>
         </Empty>
       )}

@@ -2611,18 +2611,44 @@ body {
   border-radius: 8px;
   color: #94a3b8;
   display: inline-flex;
+  flex-wrap: wrap;
+  gap: 2px;
   height: 46px;
   justify-content: center;
   overflow: hidden;
+  padding: 3px;
+  position: relative;
   width: 46px;
 }
 
 .visual-queue-reference-thumb .ant-image,
 .visual-queue-reference-thumb .ant-image-img {
   display: block;
+  border-radius: 5px;
   height: 100%;
   object-fit: cover;
   width: 100%;
+}
+
+.visual-queue-reference-thumb .ant-image {
+  flex: 0 0 auto;
+}
+
+.visual-queue-reference-more {
+  align-items: center;
+  background: rgba(15, 23, 42, 0.72);
+  border-radius: 999px;
+  bottom: 2px;
+  color: #fff;
+  display: inline-flex;
+  font-size: 10px;
+  font-weight: 700;
+  height: 16px;
+  justify-content: center;
+  min-width: 18px;
+  padding: 0 4px;
+  position: absolute;
+  right: 2px;
 }
 
 .visual-queue-panel-main,
@@ -6589,9 +6615,10 @@ body {
   gap: 8px;
   font-size: 12px;
   font-weight: 700;
+  justify-content: space-between;
 }
 
-.admin-user-table-summary span {
+.admin-user-summary-tags span {
   background: #ffffff;
   border: 1px solid #dbe5f2;
   border-radius: 999px;

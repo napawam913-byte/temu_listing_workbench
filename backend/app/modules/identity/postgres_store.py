@@ -110,6 +110,11 @@ def ensure_identity_schema(conn: Any) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_team_members_user ON team_members(user_id)")
 
 
+def pg_table_exists(conn: Any, table_name: str) -> bool:
+    row = conn.execute("SELECT to_regclass(%s) AS table_name", (f"public.{table_name}",)).fetchone()
+    return bool(row and row["table_name"])
+
+
 def sync_user_teams(conn: Any) -> None:
     now = utc_now_text()
     admins = conn.execute(
@@ -344,6 +349,105 @@ def update_managed_user(
             )
         row = fetch_admin_user_row(conn, clean_user_id)
     return admin_public_user(row)
+
+
+def delete_managed_users(user_ids: list[str], *, requested_by_user_id: str) -> dict[str, Any]:
+    clean_ids = []
+    seen: set[str] = set()
+    for user_id in user_ids:
+        clean_user_id = clean_text(user_id)
+        if clean_user_id and clean_user_id not in seen:
+            seen.add(clean_user_id)
+            clean_ids.append(clean_user_id)
+    if not clean_ids:
+        raise ValueError("请选择要删除的成员")
+
+    requester_id = clean_text(requested_by_user_id)
+    if requester_id in seen:
+        raise ValueError("不能删除当前登录的管理员账号")
+
+    with get_pg_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, username, role, status FROM users WHERE id = ANY(%s)",
+            (clean_ids,),
+        ).fetchall()
+        found_ids = {row["id"] for row in rows}
+        missing_ids = [user_id for user_id in clean_ids if user_id not in found_ids]
+        if missing_ids:
+            raise ValueError(f"成员不存在：{', '.join(missing_ids)}")
+
+        deleting_admin_ids = [row["id"] for row in rows if row["role"] == "admin"]
+        if deleting_admin_ids:
+            active_admin_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM users WHERE role = 'admin' AND status = 'active'"
+            ).fetchone()["count"]
+            deleting_active_admin_count = sum(1 for row in rows if row["role"] == "admin" and row["status"] == "active")
+            if int(active_admin_count or 0) - deleting_active_admin_count <= 0:
+                raise ValueError("至少需要保留一个启用中的管理员")
+
+        now = utc_now_text()
+        remaining_admin = conn.execute(
+            """
+            SELECT id
+            FROM users
+            WHERE id = %s AND role = 'admin' AND status = 'active'
+            """,
+            (requester_id,),
+        ).fetchone()
+        fallback_manager_id = requester_id if remaining_admin else ""
+
+        if fallback_manager_id:
+            conn.execute(
+                """
+                UPDATE users
+                SET manager_user_id = %s, updated_at = %s
+                WHERE manager_user_id = ANY(%s)
+                  AND NOT (id = ANY(%s))
+                """,
+                (fallback_manager_id, now, deleting_admin_ids, clean_ids),
+            )
+        elif deleting_admin_ids:
+            conn.execute(
+                """
+                UPDATE users
+                SET manager_user_id = '', updated_at = %s
+                WHERE manager_user_id = ANY(%s)
+                  AND NOT (id = ANY(%s))
+                """,
+                (now, deleting_admin_ids, clean_ids),
+            )
+
+        cleanup_tables = (
+            ("user_sessions", "user_id"),
+            ("team_members", "user_id"),
+            ("user_api_settings", "user_id"),
+            ("user_usage_limits", "user_id"),
+            ("api_usage_logs", "user_id"),
+            ("product_pool_memberships", "user_id"),
+        )
+        for table_name, column_name in cleanup_tables:
+            if pg_table_exists(conn, table_name):
+                conn.execute(
+                    f"DELETE FROM {table_name} WHERE {column_name} = ANY(%s)",
+                    (clean_ids,),
+                )
+
+        if deleting_admin_ids and pg_table_exists(conn, "teams"):
+            conn.execute("DELETE FROM teams WHERE admin_user_id = ANY(%s)", (deleting_admin_ids,))
+
+        if pg_table_exists(conn, "app_settings"):
+            conn.execute(
+                "UPDATE app_settings SET updated_by = NULL WHERE updated_by = ANY(%s)",
+                (clean_ids,),
+            )
+
+        deleted_rows = conn.execute(
+            "DELETE FROM users WHERE id = ANY(%s)",
+            (clean_ids,),
+        ).rowcount
+        sync_user_teams(conn)
+
+    return {"deletedCount": int(deleted_rows or 0), "deletedIds": clean_ids}
 
 
 def reset_managed_user_password(user_id: str, password: str) -> dict[str, Any]:

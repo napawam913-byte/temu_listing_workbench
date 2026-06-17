@@ -48,9 +48,11 @@ MAX_EXPORT_RECORD_CONCURRENCY = 20
 EXPORT_LISTING_IMAGE_SIZE = 800
 
 SKU_PROMOTION_PATTERNS = (
+    r"\bno\s+import\s+charges\b",
     r"\b\d+(?:,\d+)*\s*sold(?:\s+from\s+this\s+store)?\b",
     r"\bsold\s+from\s+this\s+store\b",
     r"\b(?:best\s*seller|hot\s*sale|top\s*rated|free\s*shipping|limited\s*time|flash\s*deal|sale|discount)\b",
+    r"\bperfect\s+gift\b[^,+-]*",
     r"\bpopular\s+s(?:eller)?\b",
     r"\b(?:valentine'?s?\s+day|christmas|halloween|birthday|wedding|date\s+night|couples?)\b[^,+-]*",
     r"\bfor\s+RPGs?,?\s+Tabletop\s+Role[- ]Playing\s+Games?,?\s+and\s+Activities\b",
@@ -813,7 +815,15 @@ def build_combo_variant_value(
 ) -> str:
     components = combo_variant_components(sku_entry)
     source_title_lookup = build_source_title_lookup(record or {})
-    labels = [combo_component_variant_label(component, source_title_lookup) for component in components]
+    source_titles_by_order = build_source_title_list(record or {})
+    labels = [
+        combo_component_variant_label(
+            component,
+            source_title_lookup,
+            fallback_source_title=source_titles_by_order[index] if index < len(source_titles_by_order) else "",
+        )
+        for index, component in enumerate(components)
+    ]
     labels = [label for label in labels if label]
     if labels:
         return "+".join(labels)
@@ -827,21 +837,39 @@ def combo_variant_components(sku_entry: dict[str, Any]) -> list[dict[str, Any]]:
     return [source for source in sku_entry.get("sourceSkuLinks") or [] if isinstance(source, dict)]
 
 
-def combo_component_variant_label(component: dict[str, Any], source_title_lookup: dict[str, str]) -> str:
+def combo_component_variant_label(
+    component: dict[str, Any],
+    source_title_lookup: dict[str, str],
+    *,
+    fallback_source_title: str = "",
+) -> str:
     spec_value = sanitize_sku_product_label(combo_component_spec_value(component))
-    source_title = sanitize_sku_product_label(first_non_empty(
-        source_title_lookup.get(clean_text(component.get("sourceId"))),
-        source_title_lookup.get(clean_text(component.get("sourceProductUrl"))),
-        source_title_lookup.get(clean_text(component.get("sourceUrl"))),
-        component.get("sourceTitle"),
-        component.get("sourceProductTitle"),
-        component.get("title"),
-    ))
+    source_title = sanitize_sku_product_label(
+        first_non_empty(
+            source_title_lookup.get(clean_text(component.get("sourceId"))),
+            source_title_lookup.get(clean_text(component.get("sourceProductUrl"))),
+            source_title_lookup.get(clean_text(component.get("sourceUrl"))),
+            source_title_lookup.get(clean_text(component.get("url"))),
+            component.get("sourceTitle"),
+            component.get("sourceProductTitle"),
+            component.get("title"),
+            fallback_source_title,
+        )
+    )
     if spec_value and source_title:
         if sku_label_key(source_title).startswith(sku_label_key(spec_value)):
-            return source_title
-        return f"{spec_value}{source_title}"
+            return replace_leading_quantity_label(source_title, spec_value)
+        if is_weak_combo_spec_label(spec_value):
+            prefix = normalize_combo_quantity_prefix(spec_value)
+            if prefix:
+                return join_component_label(prefix, source_title)
+        return join_component_label(spec_value, source_title)
     return spec_value or source_title
+
+
+def join_component_label(prefix: str, source_title: str) -> str:
+    separator = "" if contains_cjk(prefix) or contains_cjk(source_title) else " "
+    return f"{prefix}{separator}{source_title}"
 
 
 def build_source_title_lookup(record: dict[str, Any]) -> dict[str, str]:
@@ -858,11 +886,76 @@ def build_source_title_lookup(record: dict[str, Any]) -> dict[str, str]:
             source.get("productUrl"),
             source.get("sourceProductUrl"),
             source.get("url"),
+            source.get("sourceUrl"),
         ):
             clean_key = clean_text(key)
             if clean_key:
                 lookup[clean_key] = title
     return lookup
+
+
+def build_source_title_list(record: dict[str, Any]) -> list[str]:
+    titles: list[str] = []
+    for source in record.get("sourceLinks") or []:
+        if not isinstance(source, dict):
+            continue
+        title = sanitize_sku_product_label(source.get("title"))
+        if title:
+            titles.append(title)
+    return titles
+
+
+def is_weak_combo_spec_label(value: Any) -> bool:
+    text = clean_text(value).lower()
+    if not text:
+        return True
+    if re.fullmatch(r"\d+(?:\.\d+)?\s*(?:pc|pcs|piece|pieces|pack|packs|set|sets)", text, re.I):
+        return True
+    if text in {
+        "mix",
+        "mixed",
+        "assorted",
+        "random",
+        "black",
+        "white",
+        "red",
+        "blue",
+        "green",
+        "yellow",
+        "pink",
+        "purple",
+        "orange",
+        "brown",
+        "gray",
+        "grey",
+        "silver",
+        "gold",
+    }:
+        return True
+    variant_name = normalize_variant_name("", text)
+    return variant_name in {VARIANT_LABELS["quantity"], VARIANT_LABELS["color"]}
+
+
+def normalize_combo_quantity_prefix(value: Any) -> str:
+    text = clean_text(value)
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(?:pc|pcs|piece|pieces|pack|packs)", text, re.I)
+    if match:
+        amount = match.group(1)
+        return f"{amount}pc" if amount == "1" else f"{amount}pcs"
+    return text
+
+
+def replace_leading_quantity_label(source_title: str, spec_value: str) -> str:
+    prefix = normalize_combo_quantity_prefix(spec_value)
+    if not prefix or prefix == spec_value:
+        return source_title
+    return re.sub(
+        r"^\s*" + re.escape(spec_value) + r"(?=[\s.:-]|$)",
+        prefix,
+        source_title,
+        count=1,
+        flags=re.I,
+    )
 
 
 def sanitize_sku_product_label(value: Any) -> str:

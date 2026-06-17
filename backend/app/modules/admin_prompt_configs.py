@@ -72,11 +72,19 @@ def _title_split_prompt_content() -> str:
     payload = {
         "title": "{{ productTitle }}",
         "category": "{{ category }}",
+        "translation_requirement": (
+            "英文或中英混合标题必须先转成简体中文 1688 采购搜索词，不能原样输出英文连写词、型号词、物流词或营销词。"
+        ),
+        "must_translate_examples": {
+            "3DPaperAirplaneF": "纸飞机玩具",
+            "Pale Mini Tote Bags": "迷你托特包",
+            "Wood D12 Dice": "木质十二面骰子",
+        },
         "required_json": {
-            "primary_keyword": "best precise 1688 search keyword, Chinese, usually 4-12 chars",
+            "primary_keyword": "最精准的简体中文 1688 采购搜索词，通常 4-12 个中文字符；英文标题必须翻译成中文，不要原样输出英文",
             "keywords": [
                 {
-                    "keyword": "alternative 1688 search keyword",
+                    "keyword": "简体中文 1688 采购搜索词，不要英文原词",
                     "intent": "precise/core/attribute/broaden",
                     "reason": "short Chinese reason",
                 }
@@ -87,10 +95,16 @@ def _title_split_prompt_content() -> str:
     return "\n\n".join(
         [
             "System:\n"
-            "You convert noisy marketplace product titles into concise Chinese 1688 sourcing keywords. "
-            "Return strict JSON only. Keep the core product subject and necessary attributes. "
-            "Remove quantity, marketing copy, target users, scenes, gift wording, platform names, and broad usage claims. "
-            "Prefer supplier/search terms a 1688 buyer would type. Do not output English unless the product noun is normally English.",
+            "You convert noisy marketplace product titles into concise Simplified Chinese 1688 sourcing keywords. "
+            "If the title is English or mixed-language, first translate the real product subject, material, shape, "
+            "structure, and key attributes into Chinese supplier search terms. Return strict JSON only. "
+            "Every keyword must be suitable for 1688 supplier search in Simplified Chinese. "
+            "Do not output raw English title fragments, SKU/model codes, logistics text, quantity, marketing copy, "
+            "target users, scenes, gift wording, platform names, or broad usage claims. "
+            "Examples: '3DPaperAirplaneF' -> '纸飞机玩具'; 'Mini Tote Bags' -> '迷你托特包'; "
+            "'Wood D12 Dice' -> '木质十二面骰子'. "
+            "Only keep universal English abbreviations when paired with a Chinese product noun, such as '3D纸飞机模型', "
+            "'LED灯', or 'USB充电线'.",
             f"User payload template:\n{_json_template(payload)}",
         ]
     )
@@ -102,17 +116,38 @@ def _recommendation_prompt_content() -> str:
         "category": "{{ category }}",
         "main_image_url": "{{ optional image input }}",
         "task": (
-            "Analyze the product title and image. Recommend related 1688 sourcing directions that keep the same core use "
-            "but explore different shapes, materials, structures, scenes, or user groups. Do not recommend unrelated products."
+            "Analyze the product title and image. If the title is English or mixed-language, first translate the real product "
+            "subject and key attributes into Simplified Chinese. Then recommend exploratory 1688 sourcing directions for "
+            "adjacent categories, complementary products, bundle add-ons, same-scene items, or same-buyer-intent products. "
+            "The recommendations are references for product expansion, not exact same-item keyword variants. "
+            "For example: if the product is a spoon, recommend bowls, plates, placemats, chopstick holders, or cutlery organizers. "
+            "Do not only recommend the original product with suffixes like different款, 批发, 1688, same material, same shape, or same function."
         ),
+        "translation_requirement": (
+            "所有 keyword 必须是简体中文 1688 采购搜索词。英文/中英混合标题必须转成中文，不能原样输出英文连写词、型号词、物流词、促销词或数量词。"
+        ),
+        "divergent_recommendation_requirement": (
+            "关键词应该发散到相似类目、搭配类目、同使用场景或可组成套装的周边商品；不要只围绕原商品本身扩词。"
+        ),
+        "good_examples": {
+            "勺子": ["陶瓷碗", "餐盘", "餐垫", "筷子筒", "餐具收纳盒"],
+            "宠物碗": ["宠物餐垫", "宠物喂食勺", "宠物储粮桶", "宠物饮水器"],
+            "纸飞机玩具": ["折纸材料包", "儿童手工材料", "飞机模型玩具", "派对游戏道具"],
+        },
+        "bad_examples": ["勺子不同款", "勺子批发", "勺子1688", "36pcs 3d paper airplane 不同款"],
+        "must_translate_examples": {
+            "3DPaperAirplaneF": "纸飞机玩具",
+            "Pale Mini Tote Bags": "迷你托特包",
+            "Wood D12 Dice": "木质十二面骰子",
+        },
         "required_json": {
             "summary": "short Chinese summary of product core use and visual traits",
-            "strategy": "short Chinese strategy for adjacent 1688 sourcing",
+            "strategy": "short Chinese strategy explaining adjacent category expansion, complementary bundles, or same-scene sourcing",
             "keywords": [
                 {
-                    "keyword": "Chinese 1688 search keyword, 4-16 chars where possible",
-                    "intent": "same use but different shape/material/scene",
-                    "reason": "why this direction is relevant",
+                    "keyword": "简体中文 1688 相邻类目/搭配品/同场景商品搜索词，4-16 个中文字符为主，不要英文原词",
+                    "intent": "adjacent-category/complementary-bundle/same-scene/same-buyer-intent",
+                    "reason": "why this adjacent product direction is commercially relevant",
                 }
             ],
         },
@@ -121,8 +156,14 @@ def _recommendation_prompt_content() -> str:
         [
             "System:\n"
             "You are a careful 1688 sourcing analyst for Temu listing operations. "
-            "Return strict JSON only. Keep recommendations practical, adjacent, and product-specific. "
-            "Avoid brand names, medical claims, certification claims, and unsafe marketplace wording.",
+            "Return strict JSON only. Think like a product expansion buyer, not an exact-match keyword splitter. "
+            "Recommend adjacent categories, complementary items, bundle add-ons, same-scene products, or same-buyer-intent products. "
+            "Avoid same-item variants that merely add different款, 批发, 1688, material, color, size, shape, or quantity to the original product. "
+            "Every keyword must be a Simplified Chinese supplier/search phrase for 1688. "
+            "Do not output raw English title fragments, SKU/model codes, logistics text, promo text, pack counts, "
+            "brand names, medical claims, certification claims, or unsafe marketplace wording. "
+            "Only keep universal English abbreviations when paired with a Chinese product noun, such as '3D纸飞机模型', "
+            "'LED灯', or 'USB充电线'.",
             f"User payload template:\n{_json_template(payload)}",
         ]
     )

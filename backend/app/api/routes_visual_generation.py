@@ -9,6 +9,8 @@ from app.api.auth import require_current_user
 from app.modules.visual_generation.clients import VisualGenerationError
 from app.modules.visual_generation.service import (
     TASK_STATUS_QUEUED,
+    TASK_STATUS_FAILED,
+    TASK_STATUS_RETRY_WAITING,
     VisualTaskError,
     assert_visual_concurrency_available,
     create_visual_task,
@@ -212,7 +214,7 @@ def run_task(
 ):
     user_id = str(current_user["id"])
     try:
-        get_visual_task(task_id=task_id, user_id=user_id)
+        existing_task = get_visual_task(task_id=task_id, user_id=user_id)
     except VisualTaskError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     waiting_for_concurrency = False
@@ -238,8 +240,9 @@ def run_task(
         "imageSize": payload.imageSize,
         "useReferenceImage": True if payload.useReferenceImage is None else payload.useReferenceImage,
         "applyToLinkRecord": True if payload.applyToLinkRecord is None else payload.applyToLinkRecord,
+        "reuseExistingOutputs": existing_task.get("status") in {TASK_STATUS_FAILED, TASK_STATUS_RETRY_WAITING},
     }
-    update_task_status(task_id, user_id, TASK_STATUS_QUEUED)
+    update_task_status(task_id, user_id, TASK_STATUS_QUEUED, clear_error=True)
     queued_in_redis = enqueue_visual_job(run_payload)
     if queued_in_redis:
         background_tasks.add_task(run_visual_queue_drain)

@@ -60,10 +60,39 @@ IMAGE_PAYLOAD_RETRY_PROFILES = [
 IMAGE_RATE_LIMIT_RETRY_DELAYS_SECONDS = (0, 8, 16, 30)
 CHUFAN_AI_HOST_MARKER = "aicoming.top"
 CHUFAN_AI_DEFAULT_IMAGE_MODEL = "gpt-image-2-1k"
+VISUAL_PROMPT_LOGIC_VERSION = "sku-image-binding-geometry-lock-2026-06-17"
 
 
 class VisualTaskError(ValueError):
     pass
+
+
+def visual_prompt_logic_version_from_task(task: dict[str, Any]) -> str:
+    analysis = task.get("analysis") if isinstance(task.get("analysis"), dict) else {}
+    return clean_text(analysis.get("visualPromptLogicVersion") or analysis.get("promptLogicVersion"))
+
+
+def visual_task_has_persisted_generation(task: dict[str, Any]) -> bool:
+    if clean_text(task.get("promptText")):
+        return True
+    if clean_text(task.get("motherImagePath")) or clean_text(task.get("motherImageUrl")):
+        return True
+    manifest = task.get("manifest") if isinstance(task.get("manifest"), dict) else {}
+    if isinstance(manifest.get("panels"), list) and manifest.get("panels"):
+        return True
+    modules = task.get("modules") if isinstance(task.get("modules"), list) else []
+    return any(
+        clean_text(module.get("prompt"))
+        or clean_text(module.get("outputPath"))
+        or clean_text(module.get("outputUrl"))
+        for module in modules
+    )
+
+
+def visual_task_prompt_is_stale(task: dict[str, Any]) -> bool:
+    if not visual_task_has_persisted_generation(task):
+        return False
+    return visual_prompt_logic_version_from_task(task) != VISUAL_PROMPT_LOGIC_VERSION
 
 
 def is_chufan_ai_image_target(settings: dict[str, str], model: str) -> bool:
@@ -213,6 +242,19 @@ def count_running_visual_tasks_for_user(conn, user_id: str, *, exclude_task_id: 
         RUNNING_VISUAL_TASK_STATUSES,
         exclude_task_id=exclude_task_id,
     )
+
+
+def count_running_visual_tasks_global() -> int:
+    with get_connection() as conn:
+        ensure_visual_generation_schema(conn)
+        placeholders = ", ".join("?" for _ in RUNNING_VISUAL_TASK_STATUSES)
+        return int(
+            conn.execute(
+                f"SELECT COUNT(*) FROM visual_generation_tasks WHERE status IN ({placeholders})",
+                RUNNING_VISUAL_TASK_STATUSES,
+            ).fetchone()[0]
+            or 0
+        )
 
 
 def count_visual_tasks_for_team(
@@ -463,6 +505,34 @@ def delete_visual_task(*, task_id: str, user_id: str) -> None:
         conn.execute("DELETE FROM visual_generation_modules WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM visual_generation_tasks WHERE id = ? AND user_id = ?", (task_id, user_id))
 
+
+def reset_stale_visual_task_outputs(*, task_id: str, user_id: str) -> None:
+    now = utc_now_text()
+    with get_connection() as conn:
+        ensure_visual_generation_schema(conn)
+        row = conn.execute(
+            "SELECT id FROM visual_generation_tasks WHERE id = ? AND user_id = ?",
+            (task_id, user_id),
+        ).fetchone()
+        if row is None:
+            raise VisualTaskError("visual task not found")
+        conn.execute("DELETE FROM visual_generation_modules WHERE task_id = ?", (task_id,))
+        conn.execute(
+            """
+            UPDATE visual_generation_tasks
+            SET analysis_json = '{}',
+                prompt_text = '',
+                mother_image_path = NULL,
+                mother_image_url = NULL,
+                manifest_json = '{}',
+                status = ?,
+                error_message = NULL,
+                updated_at = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (TASK_STATUS_DRAFT, now, task_id, user_id),
+        )
+
 def request_product_analysis_with_payload_retry(
     *,
     api_url: str,
@@ -573,7 +643,7 @@ def plan_visual_task(
 
     context = build_visual_prompt_context(task=task, record=record, reference_refs=reference_refs)
     requested_count = int(task.get("requestedCount") or task.get("requested_count") or layout_panel_count(task["layout"]))
-    update_task_status(task_id, user_id, TASK_STATUS_RUNNING)
+    update_task_status(task_id, user_id, TASK_STATUS_RUNNING, clear_error=True)
     try:
         assert_user_api_usage_allowed(user_id)
         try:
@@ -670,6 +740,8 @@ def generate_visual_task(
     use_reference_image: bool | None = None,
 ) -> dict[str, Any]:
     task = get_visual_task(task_id=task_id, user_id=user_id)
+    if visual_task_prompt_is_stale(task):
+        raise VisualTaskError("task prompt is stale; run plan first")
     prompt_text = clean_text(task.get("promptText"))
     if not prompt_text:
         raise VisualTaskError("task has no mother prompt; run plan first")
@@ -700,7 +772,7 @@ def generate_visual_task(
     )
     request_image_size = "" if use_chufan_image_target else resolved_image_size
 
-    update_task_status(task_id, user_id, TASK_STATUS_RUNNING)
+    update_task_status(task_id, user_id, TASK_STATUS_RUNNING, clear_error=True)
     try:
         assert_user_api_usage_allowed(user_id)
         try:
@@ -772,6 +844,8 @@ def split_visual_task(
     sharpen: float | None = None,
 ) -> dict[str, Any]:
     task = get_visual_task(task_id=task_id, user_id=user_id)
+    if visual_task_prompt_is_stale(task):
+        raise VisualTaskError("task prompt is stale; run plan first")
     source_ref = clean_text(mother_image_ref) or clean_text(task.get("motherImagePath")) or clean_text(task.get("motherImageUrl"))
     if not source_ref:
         raise VisualTaskError("mother image is required for split")
@@ -794,7 +868,7 @@ def split_visual_task(
     resolved_sharpen = (
         sharpen if sharpen is not None else visual_float_setting("VISUAL_SPLIT_SHARPEN", 0.7, minimum=0, maximum=3)
     )
-    update_task_status(task_id, user_id, TASK_STATUS_RUNNING)
+    update_task_status(task_id, user_id, TASK_STATUS_RUNNING, clear_error=True)
     try:
         manifest = split_grid_file(
             input_path=mother_path,
@@ -838,36 +912,103 @@ def run_visual_task_pipeline(
     image_size: str | None = None,
     use_reference_image: bool | None = True,
     apply_to_link_record: bool = True,
+    reuse_existing_outputs: bool = False,
 ) -> dict[str, Any]:
-    """Run plan -> generate -> split and optionally write generated images back to the link record."""
-    planned = plan_visual_task(
-        task_id=task_id,
-        user_id=user_id,
-        source_image_ref=source_image_ref,
-        reference_image_refs=reference_image_refs,
-        allow_short_labels=allow_short_labels,
-        analysis_model=analysis_model,
-        prompt_model=prompt_model,
-    )
-    generated = generate_visual_task(
-        task_id=task_id,
-        user_id=user_id,
-        split_after=split_after,
-        upload_to_oss=upload_to_oss,
-        image_model=image_model,
-        image_size=image_size,
-        use_reference_image=use_reference_image,
-    )
+    """Run plan -> generate -> split.
+
+    Persisted prompt/mother outputs are only reusable for explicit failure retries.
+    A normal run against the same task/link should regenerate from fresh planning.
+    """
+    task = get_visual_task(task_id=task_id, user_id=user_id)
+    if visual_task_prompt_is_stale(task) or (
+        not reuse_existing_outputs and visual_task_has_persisted_generation(task)
+    ):
+        reset_stale_visual_task_outputs(task_id=task_id, user_id=user_id)
+        task = get_visual_task(task_id=task_id, user_id=user_id)
+
+    completed_status = completed_status_from_task(task)
+    if completed_status:
+        update_task_status(task_id, user_id, completed_status, clear_error=True)
+        if apply_to_link_record:
+            apply_visual_task_results_to_link_record(task_id=task_id, user_id=user_id)
+            update_task_status(task_id, user_id, TASK_STATUS_COMPLETED, clear_error=True)
+        return get_visual_task(task_id=task_id, user_id=user_id)
+
+    planned: dict[str, Any] | None = None
+    if not clean_text(task.get("promptText")):
+        planned = plan_visual_task(
+            task_id=task_id,
+            user_id=user_id,
+            source_image_ref=source_image_ref,
+            reference_image_refs=reference_image_refs,
+            allow_short_labels=allow_short_labels,
+            analysis_model=analysis_model,
+            prompt_model=prompt_model,
+        )
+        task = planned
+
+    generated: dict[str, Any] | None = None
+    if split_after is not False and task_has_usable_mother_image(task):
+        generated = split_visual_task(
+            task_id=task_id,
+            user_id=user_id,
+            mother_image_ref=clean_text(task.get("motherImagePath")) or clean_text(task.get("motherImageUrl")),
+            upload_to_oss=upload_to_oss,
+        )
+    elif not task_has_usable_mother_image(task):
+        generated = generate_visual_task(
+            task_id=task_id,
+            user_id=user_id,
+            split_after=split_after,
+            upload_to_oss=upload_to_oss,
+            image_model=image_model,
+            image_size=image_size,
+            use_reference_image=use_reference_image,
+        )
+    else:
+        generated = task
+
     if apply_to_link_record:
         try:
-            update_task_status(task_id, user_id, TASK_STATUS_RUNNING)
+            update_task_status(task_id, user_id, TASK_STATUS_RUNNING, clear_error=True)
             apply_visual_task_results_to_link_record(task_id=task_id, user_id=user_id)
-            update_task_status(task_id, user_id, TASK_STATUS_COMPLETED)
+            update_task_status(task_id, user_id, TASK_STATUS_COMPLETED, clear_error=True)
         except Exception as exc:
             # The generated assets should remain usable even if link-list persistence fails.
             mark_task_failed(task_id, user_id, f"generated, but link record update failed: {exc}")
             raise
     return get_visual_task(task_id=task_id, user_id=user_id) if apply_to_link_record else generated or planned
+
+
+def task_has_usable_mother_image(task: dict[str, Any]) -> bool:
+    mother_url = clean_text(task.get("motherImageUrl"))
+    if mother_url:
+        return True
+    mother_path = clean_text(task.get("motherImagePath"))
+    if not mother_path:
+        return False
+    if mother_path.startswith("http://") or mother_path.startswith("https://"):
+        return True
+    return Path(mother_path).exists()
+
+
+def completed_status_from_task(task: dict[str, Any]) -> str:
+    expected_count = int(task.get("requestedCount") or 0)
+    manifest = task.get("manifest") if isinstance(task.get("manifest"), dict) else {}
+    manifest_panels = manifest.get("panels") if isinstance(manifest.get("panels"), list) else []
+    if expected_count <= 0:
+        expected_count = len(manifest_panels)
+    if expected_count <= 0 or not task_has_usable_mother_image(task):
+        return ""
+
+    modules = task.get("modules") if isinstance(task.get("modules"), list) else []
+    output_count = sum(
+        1 for module in modules if clean_text(module.get("outputUrl")) or clean_text(module.get("outputPath"))
+    )
+    if output_count < expected_count:
+        return ""
+    url_count = sum(1 for module in modules if clean_text(module.get("outputUrl")))
+    return TASK_STATUS_COMPLETED if url_count >= expected_count else TASK_STATUS_SPLIT
 
 
 def apply_visual_task_results_to_link_record(*, task_id: str, user_id: str) -> dict[str, Any] | None:
@@ -1102,6 +1243,8 @@ def persist_plan(
     mother_prompt: str,
 ) -> None:
     now = utc_now_text()
+    plan = dict(plan or {})
+    plan["visualPromptLogicVersion"] = VISUAL_PROMPT_LOGIC_VERSION
     tasks = plan.get("panelTasks") or []
     with get_connection() as conn:
         ensure_visual_generation_schema(conn)
@@ -1258,18 +1401,39 @@ def upsert_module(
     )
 
 
-def update_task_status(task_id: str, user_id: str, status: str) -> None:
+def update_task_status(task_id: str, user_id: str, status: str, *, clear_error: bool = False) -> None:
     with get_connection() as conn:
         ensure_visual_generation_schema(conn)
-        conn.execute(
-            "UPDATE visual_generation_tasks SET status = ?, updated_at = ? WHERE id = ? AND user_id = ?",
-            (status, utc_now_text(), task_id, user_id),
-        )
+        if clear_error:
+            conn.execute(
+                """
+                UPDATE visual_generation_tasks
+                SET status = ?, error_message = NULL, updated_at = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (status, utc_now_text(), task_id, user_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE visual_generation_tasks SET status = ?, updated_at = ? WHERE id = ? AND user_id = ?",
+                (status, utc_now_text(), task_id, user_id),
+            )
 
 
 def mark_task_failed(task_id: str, user_id: str, error_message: str) -> None:
     with get_connection() as conn:
         ensure_visual_generation_schema(conn)
+        completed_status = resolve_completed_task_status(conn, task_id=task_id, user_id=user_id)
+        if completed_status:
+            conn.execute(
+                """
+                UPDATE visual_generation_tasks
+                SET status = ?, error_message = NULL, updated_at = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (completed_status, utc_now_text(), task_id, user_id),
+            )
+            return
         conn.execute(
             """
             UPDATE visual_generation_tasks
@@ -1280,16 +1444,62 @@ def mark_task_failed(task_id: str, user_id: str, error_message: str) -> None:
         )
 
 
+def resolve_completed_task_status(conn, *, task_id: str, user_id: str) -> str:
+    row = conn.execute(
+        """
+        SELECT requested_count, mother_image_path, mother_image_url, manifest_json
+        FROM visual_generation_tasks
+        WHERE id = ? AND user_id = ?
+        """,
+        (task_id, user_id),
+    ).fetchone()
+    if row is None:
+        return ""
+
+    manifest = parse_json(row["manifest_json"], {})
+    manifest_panels = manifest.get("panels") if isinstance(manifest, dict) else []
+    try:
+        requested_count = int(row["requested_count"] or 0)
+    except (TypeError, ValueError):
+        requested_count = 0
+    expected_count = requested_count or (len(manifest_panels) if isinstance(manifest_panels, list) else 0)
+    if expected_count <= 0:
+        return ""
+
+    has_mother_image = bool(clean_text(row["mother_image_path"]) or clean_text(row["mother_image_url"]))
+    if not has_mother_image:
+        return ""
+
+    module_row = conn.execute(
+        """
+        SELECT
+            COUNT(*) AS total_count,
+            SUM(CASE WHEN COALESCE(output_url, '') != '' THEN 1 ELSE 0 END) AS url_count,
+            SUM(CASE WHEN COALESCE(output_url, '') != '' OR COALESCE(output_path, '') != '' THEN 1 ELSE 0 END) AS output_count
+        FROM visual_generation_modules
+        WHERE task_id = ?
+        """,
+        (task_id,),
+    ).fetchone()
+    if module_row is None:
+        return ""
+    output_count = int(module_row["output_count"] or 0)
+    if output_count < expected_count:
+        return ""
+    url_count = int(module_row["url_count"] or 0)
+    return TASK_STATUS_COMPLETED if url_count >= expected_count else TASK_STATUS_SPLIT
+
+
 def mark_task_retry_waiting(task_id: str, user_id: str, error_message: str) -> None:
     with get_connection() as conn:
         ensure_visual_generation_schema(conn)
         conn.execute(
             """
             UPDATE visual_generation_tasks
-            SET status = ?, error_message = ?, updated_at = ?
+            SET status = ?, error_message = NULL, updated_at = ?
             WHERE id = ? AND user_id = ?
             """,
-            (TASK_STATUS_RETRY_WAITING, error_message[:2000], utc_now_text(), task_id, user_id),
+            (TASK_STATUS_RETRY_WAITING, utc_now_text(), task_id, user_id),
         )
 
 
@@ -1415,6 +1625,7 @@ def build_visual_prompt_context(*, task: dict[str, Any], record: dict[str, Any],
         or "Untitled product"
     )
     sku_bindings = extract_record_sku_bindings(record, reference_refs)
+    sku_reference_bindings = build_sku_reference_bindings(sku_bindings)
     return {
         "linkRecordId": clean_text(task.get("linkRecordId")) or clean_text(record.get("id")),
         "productId": clean_text(task.get("productId")) or clean_text(record.get("productId")),
@@ -1425,7 +1636,9 @@ def build_visual_prompt_context(*, task: dict[str, Any], record: dict[str, Any],
         "skuBindingRule": (
             "SKU names may be quantity-like or repeated across source products. "
             "Always interpret each SKU/component through skuBindings and skuCombinationBindings, "
-            "including sourceTitle and referenceImageIndex. Do not merge 1pc/6pc labels across different products."
+            "including sourceTitle, referenceImageIndex, and skuReferenceBindings. Do not merge 1pc/6pc labels across different products. "
+            "When a SKU name is only a quantity/unit, the sourceTitle and bound reference image are the product identity. "
+            "The visual identity of each SKU comes from its bound reference image, not from SKU text alone."
         ),
         "skuBindings": sku_bindings,
         "skuCombinationBindings": [
@@ -1433,11 +1646,14 @@ def build_visual_prompt_context(*, task: dict[str, Any], record: dict[str, Any],
             for binding in sku_bindings
             if binding.get("skuKind") == "combo" or len(binding.get("components") or []) > 1
         ],
+        "skuReferenceBindings": sku_reference_bindings,
         "referenceImageBindingRule": (
             "All reference images are equal product image parameters. Do not treat the first image as the only main product, "
             "and do not rank images as main/material. Use each image label and SKU binding to identify which product or SKU "
             "component it shows. Preserve the exact visible product subject appearance and do not replace selected SKU "
-            "components with generic category items."
+            "components with generic category items. For different-product bundles, keep every reference image tied to its "
+            "own SKU name and source product title. Image facts override title text. Preserve silhouette, geometry, facet/side count, "
+            "shape, visible color, material, quantity, surface texture, edge details, and printed pattern for every bound SKU."
         ),
         "referenceImages": [
             {
@@ -1448,6 +1664,58 @@ def build_visual_prompt_context(*, task: dict[str, Any], record: dict[str, Any],
             for index, ref in enumerate(reference_refs)
         ],
     }
+
+
+def build_sku_reference_bindings(sku_bindings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    bindings: list[dict[str, Any]] = []
+    for sku in sku_bindings:
+        if not isinstance(sku, dict):
+            continue
+        sku_name = clean_text(sku.get("skuName"))
+        sku_kind = clean_text(sku.get("skuKind"))
+        for component in sku.get("components") or []:
+            if not isinstance(component, dict):
+                continue
+            reference_index = component.get("referenceImageIndex")
+            try:
+                reference_index = int(reference_index)
+            except (TypeError, ValueError):
+                reference_index = 0
+            if reference_index <= 0:
+                continue
+            component_name = clean_text(component.get("componentName"))
+            source_title = clean_text(component.get("sourceTitle"))
+            spec_text = clean_text(component.get("specText"))
+            option_text = clean_text(component.get("optionText"))
+            visual_lock = (
+                f"Reference image {reference_index} is the visual source of truth for SKU {sku_name or component_name}. "
+                "Preserve the exact visible silhouette, geometry, facet/side count, shape, color, material, quantity, "
+                "surface texture, edge/rim details, and printed pattern from that image. Titles and SKU names are secondary hints "
+                "and must not override the visible product appearance."
+            )
+            bindings.append(
+                {
+                    "referenceImageIndex": reference_index,
+                    "skuName": sku_name,
+                    "skuKind": sku_kind,
+                    "componentName": component_name,
+                    "sourceProductTitle": source_title,
+                    "specText": spec_text,
+                    "optionText": option_text,
+                    "visualLock": visual_lock,
+                    "bindingText": " / ".join(
+                        part
+                        for part in (
+                            f"SKU {sku_name}" if sku_name else "",
+                            f"component {component_name}" if component_name else "",
+                            f"product title {source_title}" if source_title else "",
+                            f"visual source reference image {reference_index}" if reference_index else "",
+                        )
+                        if part
+                    ),
+                }
+            )
+    return sorted(bindings, key=lambda item: (int(item.get("referenceImageIndex") or 0), clean_text(item.get("skuName"))))[:80]
 
 
 def extract_record_sku_bindings(record: dict[str, Any], reference_refs: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:

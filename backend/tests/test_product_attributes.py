@@ -718,6 +718,71 @@ class ProductAttributesTest(unittest.TestCase):
         self.assertEqual(result["category_id"], "dice")
         intent_api.assert_called_once()
 
+    def test_strict_category_resolution_uses_single_ai_top_candidate_selection(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.row_factory = sqlite3.Row
+        seed_category_snapshots(
+            conn,
+            [
+                ("storage-box", ["Home, Kitchen & Household", "Storage & Organization", "Storage Boxes"]),
+                ("party-favor-bag", ["Toys & Games", "Party Supplies", "Kids Party Favor Bags"]),
+            ],
+        )
+
+        def biased_score(leaves, _query_vector, _query_text):
+            scored = []
+            for leaf in leaves:
+                path = leaf.get("path_text") or ""
+                score = 0.95 if "Storage Boxes" in path else 0.45
+                scored.append({**leaf, "score": score, "matched_terms": []})
+            scored.sort(key=lambda item: item["score"], reverse=True)
+            return scored
+
+        def choose_party_branch(**kwargs):
+            for index, candidate in enumerate(kwargs["candidates"], start=1):
+                path = candidate.get("path_text") or ""
+                if "Toys" in path or "Party" in path or "Favor" in path:
+                    return {"selected_index": index, "confidence": 0.92}
+            return {"selected_index": 1, "confidence": 0.92}
+
+        with (
+            patch("app.modules.exports.product_attributes.is_product_attribute_ai_configured", return_value=True),
+            patch(
+                "app.modules.exports.product_attributes.request_category_intent_ai",
+                return_value={
+                    "product_identity": "children party favor gift bag",
+                    "product_type": "party favor bag",
+                    "visual_subject": "colorful small party favor bags",
+                    "core_keywords": ["kids party favor bag", "party supplies"],
+                    "exclude_keywords": ["storage box", "organizer"],
+                },
+            ),
+            patch("app.modules.exports.product_attributes.score_category_leaves", side_effect=biased_score),
+            patch("app.modules.exports.product_attributes.request_category_branch_ai", side_effect=choose_party_branch) as branch_api,
+        ):
+            result = resolve_category_for_record(
+                conn,
+                {
+                    "productId": "party-bag",
+                    "productTitle": "Children party favor gift bags with colorful design",
+                    "productTitleEn": "Kids Party Favor Gift Bags",
+                    "mainImage": {"sourceUrl": "https://img.example.com/party-bag.jpg"},
+                    "sourceLinks": [{"title": "storage box party gift bag", "imageUrl": "https://img.example.com/source.jpg"}],
+                    "skuEntries": [{"name": "Mixed Color"}],
+                },
+                user_id="u1",
+                require_api=True,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["category_id"], "party-favor-bag")
+        self.assertEqual(branch_api.call_count, 1)
+        selected_candidates = branch_api.call_args.kwargs["candidates"]
+        self.assertEqual(len(selected_candidates), 2)
+        self.assertTrue(any("Storage Boxes" in candidate.get("path_text", "") for candidate in selected_candidates))
+        self.assertTrue(any("Kids Party Favor Bags" in candidate.get("path_text", "") for candidate in selected_candidates))
+
     def test_category_intent_ai_uses_title_and_images_as_multimodal_context(self):
         with (
             patch(
@@ -764,6 +829,10 @@ class ProductAttributesTest(unittest.TestCase):
         payload = request_json_mock.call_args.args[2]
         content = payload["messages"][0]["content"]
         instruction = json.loads(content[0]["text"])
+        self.assertIn("First identify the real product", instruction["task"])
+        self.assertIn("product_identity", instruction["output_schema"])
+        self.assertTrue(any("images and final export title as primary evidence" in rule for rule in instruction["rules"]))
+        self.assertTrue(any("storage container" in rule for rule in instruction["rules"]))
         self.assertEqual(instruction["product"]["title_en"], "5PCS Pale Mini Tote Bag Set")
         self.assertIn(
             {"role": "main_image", "url": "https://img.example.com/main-tote.jpg"},
@@ -822,6 +891,8 @@ class ProductAttributesTest(unittest.TestCase):
         payload = request_json_mock.call_args.args[2]
         content = payload["messages"][0]["content"]
         instruction = json.loads(content[0]["text"])
+        self.assertTrue(any("First identify the real product" in rule for rule in instruction["rules"]))
+        self.assertTrue(any("storage/organizer/container" in rule for rule in instruction["rules"]))
         self.assertEqual(instruction["product"]["title_cn"], "5pcs pale mini tote bag set with zipper closure")
         self.assertEqual(instruction["candidates"][1]["path"], "Video Games > Game Boy Color")
         self.assertEqual(content[1]["image_url"]["url"], "https://img.example.com/main-tote.jpg")

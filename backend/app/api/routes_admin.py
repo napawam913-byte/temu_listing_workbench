@@ -11,6 +11,7 @@ from app.api.auth import require_admin_user
 from app.core import config as app_config
 from app.core.database import (
     create_managed_user,
+    delete_managed_users,
     get_api_usage_summary,
     get_app_settings_map,
     get_user_api_credentials_map,
@@ -101,7 +102,7 @@ SETTING_DEFINITIONS: tuple[SettingDefinition, ...] = (
     SettingDefinition("REDIS_URL", "visual", "Redis URL", "Redis queue/cache URL, e.g. redis://127.0.0.1:6379/0", is_secret=True),
     SettingDefinition("VISUAL_QUEUE_REDIS_ENABLED", "visual", "Visual Redis Queue", "1 enables Redis-backed visual task queue; 0 falls back to FastAPI background task", "0"),
     SettingDefinition("VISUAL_QUEUE_NAME", "visual", "Visual Queue Name", "Redis list key for visual generation jobs", "visual:tasks:queue"),
-    SettingDefinition("VISUAL_QUEUE_DRAIN_MAX_JOBS", "visual", "Visual Queue Drain Jobs", "Max jobs drained by one auto-start worker pass", "3"),
+    SettingDefinition("VISUAL_QUEUE_DRAIN_MAX_JOBS", "visual", "Visual Queue Drain Jobs", "Max jobs drained by one auto-start worker pass", "10"),
     SettingDefinition("VISUAL_QUEUE_WORKER_LOCK_SECONDS", "visual", "Visual Worker Lock TTL", "Seconds to hold the single worker drain lock", "3600"),
     SettingDefinition("VISUAL_QUEUE_POP_TIMEOUT_SECONDS", "visual", "Visual Queue Pop Timeout", "Seconds to wait for one Redis queue pop", "1"),
     SettingDefinition("VISUAL_QUEUE_RETRY_NAME", "visual", "Visual Retry Queue Name", "Redis sorted-set key for delayed visual retries", "visual:tasks:retry"),
@@ -257,6 +258,10 @@ class AdminUserApiCredentialsUpdateRequest(BaseModel):
     items: list[AdminUserApiCredentialUpdateItem]
 
 
+class AdminUsersBatchDeleteRequest(BaseModel):
+    userIds: list[str]
+
+
 class AdminApiRouteApplyRequest(BaseModel):
     stage: str
     channelId: str
@@ -307,6 +312,17 @@ def admin_update_user(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"user": user}
+
+
+@router.post("/users/batch-delete")
+def admin_batch_delete_users(
+    payload: AdminUsersBatchDeleteRequest,
+    admin: dict[str, Any] = Depends(require_admin_user),
+):
+    try:
+        return delete_managed_users(payload.userIds, requested_by_user_id=str(admin["id"]))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/users/{user_id}/password")
