@@ -26,6 +26,13 @@ require_command systemctl
 require_command nginx
 require_command curl
 
+print_service_debug() {
+  echo "----- systemctl status ${SERVICE_NAME} -----" >&2
+  systemctl status "$SERVICE_NAME" --no-pager -l >&2 || true
+  echo "----- journalctl ${SERVICE_NAME} -----" >&2
+  journalctl -u "$SERVICE_NAME" -n 120 --no-pager >&2 || true
+}
+
 NODE_MAJOR="$(node -p "Number(process.versions.node.split('.')[0])")"
 if [ "$NODE_MAJOR" -lt 18 ]; then
   echo "Node.js 18+ is required for the frontend build. Current: $(node --version)" >&2
@@ -138,7 +145,16 @@ nginx -t
 systemctl reload nginx || systemctl restart nginx
 
 log "Checking service health"
-curl -fsS "http://${BACKEND_HOST}:${BACKEND_PORT}/docs" >/dev/null
+for attempt in $(seq 1 30); do
+  if curl -fsS "http://${BACKEND_HOST}:${BACKEND_PORT}/api/health" >/dev/null; then
+    break
+  fi
+  if [ "$attempt" -eq 30 ]; then
+    print_service_debug
+    exit 1
+  fi
+  sleep 1
+done
 curl -fsS "http://127.0.0.1/" >/dev/null
 
 log "Deployment finished"
