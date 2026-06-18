@@ -15,8 +15,13 @@ type Props = {
   onPriceSortChange?: (order?: SortOrder) => void;
   gmvSortOrder?: SortOrder;
   onGmvSortChange?: (order?: SortOrder) => void;
+  hideGmvColumn?: boolean;
+  dateColumnTitle?: string;
+  dateMetaLabel?: string;
+  getDateValue?: (product: Product) => string | undefined;
   onView: (product: Product) => void;
-  onDelete: (product: Product) => void;
+  onDelete?: (product: Product) => void;
+  onRecord?: (product: Product) => void;
 };
 
 function formatProductPrice(product: Product) {
@@ -68,9 +73,13 @@ function ProductThumb({
 function ProductTitleBlock({
   product,
   onView,
+  dateMetaLabel,
+  dateValue,
 }: {
   product: Product;
   onView: (product: Product) => void;
+  dateMetaLabel: string;
+  dateValue?: string;
 }) {
   const visibleTitle = product.titleEn || product.title;
   const shouldShowFulfillmentTag = product.sourceType !== '1688';
@@ -99,7 +108,7 @@ function ProductTitleBlock({
           <Tag color="orange">半托管</Tag>
         </div>
       ) : null}
-      <div className="product-title-meta">上架：{product.listedAt || '-'}</div>
+      <div className="product-title-meta">{dateMetaLabel}：{dateValue || '-'}</div>
     </div>
   );
 }
@@ -116,8 +125,13 @@ export function ProductTable({
   onPriceSortChange,
   gmvSortOrder,
   onGmvSortChange,
+  hideGmvColumn = false,
+  dateColumnTitle = '上架时间',
+  dateMetaLabel = '上架',
+  getDateValue = (product) => product.listedAt,
   onView,
   onDelete,
+  onRecord,
 }: Props) {
   const [pageSizeDraft, setPageSizeDraft] = useState<number | null>(10);
 
@@ -146,7 +160,12 @@ export function ProductTable({
       render: (_, product) => (
         <div className="product-cell">
           <ProductThumb alt={product.titleEn || product.title} src={product.mainImageUrl} tone={product.imageTone} />
-          <ProductTitleBlock product={product} onView={onView} />
+          <ProductTitleBlock
+            product={product}
+            onView={onView}
+            dateMetaLabel={dateMetaLabel}
+            dateValue={getDateValue(product)}
+          />
         </div>
       ),
     },
@@ -166,40 +185,36 @@ export function ProductTable({
       sortOrder: priceSortOrder || null,
       render: (_, product) => formatProductPrice(product),
     },
+    ...(hideGmvColumn
+      ? []
+      : [
+          {
+            title: 'GMV',
+            key: 'gmv',
+            dataIndex: 'gmv',
+            width: '11%',
+            sorter: true,
+            sortDirections: ['descend', 'ascend'] as SortOrder[],
+            sortOrder: gmvSortOrder || null,
+            render: (_: unknown, product: Product) => formatProductGmv(product),
+          },
+        ]),
     {
-      title: 'GMV',
-      key: 'gmv',
-      dataIndex: 'gmv',
-      width: '11%',
-      sorter: true,
-      sortDirections: ['descend', 'ascend'],
-      sortOrder: gmvSortOrder || null,
-      render: (_, product) => formatProductGmv(product),
-    },
-    {
-      title: '上架时间',
+      title: dateColumnTitle,
       dataIndex: 'listedAt',
       width: '12%',
+      render: (_, product) => getDateValue(product) || '-',
     },
     {
       title: '操作',
       key: 'action',
       width: '8%',
-      render: (_, product) => (
-        <div className="table-actions">
-          <Button type="link" onClick={() => onView(product)}>
-            查看
+      render: (_, product) => {
+        const productAction = onRecord ? (
+          <Button type="link" onClick={() => onRecord(product)}>
+            录入
           </Button>
-          <Button
-            disabled={!product.sourceUrl}
-            type="link"
-            onClick={() => {
-              if (!product.sourceUrl) return;
-              window.open(product.sourceUrl, '_blank', 'noopener,noreferrer');
-            }}
-          >
-            访问
-          </Button>
+        ) : onDelete ? (
           <Popconfirm
             title="确认删除该商品？"
             description="删除后商品会从当前列表中隐藏。"
@@ -211,8 +226,27 @@ export function ProductTable({
               删除
             </Button>
           </Popconfirm>
-        </div>
-      ),
+        ) : null;
+
+        return (
+          <div className="table-actions">
+            <Button type="link" onClick={() => onView(product)}>
+              查看
+            </Button>
+            <Button
+              disabled={!product.sourceUrl}
+              type="link"
+              onClick={() => {
+                if (!product.sourceUrl) return;
+                window.open(product.sourceUrl, '_blank', 'noopener,noreferrer');
+              }}
+            >
+              访问
+            </Button>
+            {productAction}
+          </div>
+        );
+      },
     },
   ];
 

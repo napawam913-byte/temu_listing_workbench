@@ -167,7 +167,6 @@ def get_ai_settings(user_id: str | None = None) -> dict[str, str]:
 
 
 AI_STAGE_SETTING_PREFIXES = {
-    "title": "OPENAI_TITLE",
     "recommendation": "OPENAI_RECOMMENDATION",
     "product_attribute": "OPENAI_PRODUCT_ATTRIBUTE",
     "visual_analysis": "OPENAI_VISUAL_ANALYSIS",

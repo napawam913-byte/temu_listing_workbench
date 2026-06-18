@@ -1,3 +1,4 @@
+import { ApiOutlined, LockOutlined } from '@ant-design/icons';
 import {
   Button,
   Card,
@@ -130,12 +131,6 @@ const API_USAGE_DONUT_CIRCUMFERENCE = 2 * Math.PI * API_USAGE_DONUT_RADIUS;
 const SETTING_CATEGORY_ORDER = ['ai', 'visual', '1688', 'oss'];
 const AI_STAGE_CONFIGS = [
   {
-    title: '标题生成',
-    modelKey: 'OPENAI_TITLE_MODEL',
-    modelFallbackKey: 'OPENAI_TEXT_MODEL',
-    description: '中文标题、英文标题、变种值英文翻译',
-  },
-  {
     title: '标题拆分',
     modelKey: 'OPENAI_TITLE_SPLIT_MODEL',
     modelFallbackKey: 'OPENAI_TEXT_MODEL',
@@ -181,7 +176,7 @@ function categoryLabel(category: string) {
 }
 
 function categoryDescription(category: string) {
-  if (category === 'ai') return '管理各个 AI 阶段实际调用的模型，API Key 和 Base URL 请到初凡 API 配置。';
+  if (category === 'ai') return '管理各个 AI 阶段实际调用的模型，API 密钥和接口地址请到初凡 API 配置。';
   if (category === 'visual') return '管理母图任务、九宫格切图、图生图参考和 OSS 上传默认策略。';
   if (category === '1688') return '管理 1688 搜图 API 服务，用于后续同款或相关货源检索。';
   if (category === 'oss') return '管理阿里云 OSS 图片存储，用于导出模板中的公网图片链接。';
@@ -205,7 +200,7 @@ function apiStageLabel(stage: string) {
   if (normalizedStage === 'visual-prompt') return '提示词规划';
   if (normalizedStage === 'visual-image') return '图片生成';
   if (normalizedStage === 'recommendation') return '智能推荐';
-  if (normalizedStage === 'title') return '标题生成';
+  if (normalizedStage === 'title') return '已停用标题生成';
   if (normalizedStage === 'title-split') return '标题拆分';
   if (normalizedStage === 'product-attribute') return '产品属性';
   return stage || '未知阶段';
@@ -286,6 +281,11 @@ function memberCredentialDraftsFromItems(items: AdminUserApiCredential[]) {
 
 function adminUserInitial(user: AdminUser) {
   return (user.displayName || user.username || '?').trim().slice(0, 1).toUpperCase();
+}
+
+function compactAdminDate(value?: string) {
+  if (!value) return '-';
+  return value.slice(0, 10) || value;
 }
 
 function usageStatusColor(status?: string) {
@@ -402,7 +402,7 @@ export function AdminPage() {
     const selectedUsers = users.filter((user) => userIds.includes(user.id));
     Modal.confirm({
       title: `确认删除 ${selectedUsers.length} 个成员？`,
-      content: '删除后会清理这些成员的登录会话、团队关系、API Key 配置和用量记录。当前登录管理员和最后一个管理员不会被允许删除。',
+      content: '删除后会清理这些成员的登录会话、团队关系、API 密钥配置和用量记录。当前登录管理员和最后一个管理员不会被允许删除。',
       okText: '删除',
       okButtonProps: { danger: true, loading: deletingUsers },
       cancelText: '取消',
@@ -759,7 +759,7 @@ export function AdminPage() {
     {
       title: '用户',
       dataIndex: 'username',
-      width: 245,
+      width: 188,
       render: (_, user) => {
         const displayName = user.displayName || user.username;
         const fullName = user.displayName && user.displayName !== user.username ? `${user.displayName} / @${user.username}` : `@${user.username}`;
@@ -783,7 +783,7 @@ export function AdminPage() {
     {
       title: '角色',
       dataIndex: 'role',
-      width: 88,
+      width: 82,
       render: (_, user) => (
         <Select
           className="admin-user-select"
@@ -799,7 +799,7 @@ export function AdminPage() {
     {
       title: '状态',
       dataIndex: 'status',
-      width: 88,
+      width: 82,
       render: (_, user) => (
         <Select
           className="admin-user-select"
@@ -815,7 +815,7 @@ export function AdminPage() {
     {
       title: '归属管理员',
       dataIndex: 'managerId',
-      width: 132,
+      width: 126,
       render: (_, user) =>
         user.role === 'admin' ? (
           <Space className="admin-user-manager-inline" size={6}>
@@ -840,7 +840,7 @@ export function AdminPage() {
     {
       title: '活跃登录',
       dataIndex: 'activeSessionCount',
-      width: 72,
+      width: 76,
       align: 'center',
       render: (count: number) => (
         <Tag className="admin-session-tag" color={count > 0 ? 'blue' : 'default'}>
@@ -851,21 +851,38 @@ export function AdminPage() {
     {
       title: '创建时间',
       dataIndex: 'createdAt',
-      width: 124,
-      render: (value: string) => <span className="admin-user-date">{value}</span>,
+      width: 104,
+      render: (value: string) => (
+        <Tooltip title={value}>
+          <span className="admin-user-date">{compactAdminDate(value)}</span>
+        </Tooltip>
+      ),
     },
     {
       title: '操作',
       key: 'action',
-      width: 124,
+      width: 86,
+      align: 'center',
       render: (_, user) => (
-        <Space className="admin-user-actions" size={8} wrap={false}>
-          <Button className="admin-user-action-btn" size="small" onClick={() => void openMemberApiCredentials(user)}>
-            API 配置
-          </Button>
-          <Button className="admin-user-action-btn" size="small" onClick={() => setPasswordReset({ user, password: '' })}>
-            重置密码
-          </Button>
+        <Space className="admin-user-actions" size={6} wrap={false}>
+          <Tooltip title="API 配置">
+            <Button
+              aria-label="API 配置"
+              className="admin-user-action-btn"
+              icon={<ApiOutlined />}
+              size="small"
+              onClick={() => void openMemberApiCredentials(user)}
+            />
+          </Tooltip>
+          <Tooltip title="重置密码">
+            <Button
+              aria-label="重置密码"
+              className="admin-user-action-btn"
+              icon={<LockOutlined />}
+              size="small"
+              onClick={() => setPasswordReset({ user, password: '' })}
+            />
+          </Tooltip>
         </Space>
       ),
     },
@@ -1258,7 +1275,6 @@ export function AdminPage() {
                         .filter(Boolean)
                         .join(' ')
                     }
-                    scroll={{ x: 890 }}
                     size="small"
                     title={() => (
                       <div className="admin-user-table-summary">
@@ -1503,7 +1519,7 @@ export function AdminPage() {
                     <div className="admin-api-section-head">
                       <div>
                         <Typography.Text strong>初凡 API</Typography.Text>
-                        <Typography.Text type="secondary">配置初凡 AI 的 API Key 和 OpenAI 兼容 Base URL。</Typography.Text>
+                        <Typography.Text type="secondary">配置初凡 AI 的 API 密钥和 OpenAI 兼容接口地址。</Typography.Text>
                       </div>
                       <Button loading={savingSettings} onClick={() => void saveApiChannels()}>
                         保存初凡 API
@@ -1526,14 +1542,14 @@ export function AdminPage() {
                             <Space size={6} wrap>
                               <Tag color="green">启用</Tag>
                               <Tag color={channel.apiKeyConfigured && !draft.clearApiKey ? 'green' : 'gold'}>
-                                {channel.apiKeyConfigured && !draft.clearApiKey ? channel.maskedApiKey || 'Key 已配置' : 'Key 待配置'}
+                                {channel.apiKeyConfigured && !draft.clearApiKey ? channel.maskedApiKey || '密钥已配置' : '密钥待配置'}
                               </Tag>
                             </Space>
                             <div className="admin-api-channel-fields">
                               <label>
-                                <span>API Key</span>
+                                <span>API 密钥</span>
                                 <Input.Password
-                                  placeholder={channel.apiKeyConfigured ? '输入新 Key 才会替换' : '输入 API Key'}
+                                  placeholder={channel.apiKeyConfigured ? '输入新密钥才会替换' : '输入 API 密钥'}
                                   value={draft.apiKey}
                                   onChange={(event) =>
                                     setApiChannelDrafts((current) => ({
@@ -1548,7 +1564,7 @@ export function AdminPage() {
                                 />
                               </label>
                               <label>
-                                <span>Base URL</span>
+                                <span>接口地址</span>
                                 <Input
                                   value={draft.baseUrl}
                                   onChange={(event) =>
@@ -1756,7 +1772,7 @@ export function AdminPage() {
       >
         <div className="admin-api-member-credentials">
           <Typography.Text type="secondary">
-            管理员代管成员 API Key。成员调用 AI 时优先使用这里启用的渠道，成员本人不可修改密钥。
+            管理员代管成员 API 密钥。成员调用 AI 时优先使用这里启用的渠道，成员本人不可修改密钥。
           </Typography.Text>
           {memberCredentialState.loading ? (
             <Card loading />
@@ -1804,15 +1820,15 @@ export function AdminPage() {
                       <Tag color={draft.enabled ? 'green' : 'default'}>{draft.enabled ? '启用' : '停用'}</Tag>
                       <Tag color={credential.apiKeyConfigured && !draft.clearApiKey ? 'green' : 'gold'}>
                         {credential.apiKeyConfigured && !draft.clearApiKey
-                          ? credential.maskedApiKey || 'Key 已配置'
-                          : 'Key 待配置'}
+                          ? credential.maskedApiKey || '密钥已配置'
+                          : '密钥待配置'}
                       </Tag>
                     </Space>
                     <div className="admin-api-channel-fields">
                       <label>
-                        <span>API Key</span>
+                        <span>API 密钥</span>
                         <Input.Password
-                          placeholder={credential.apiKeyConfigured ? '输入新 Key 才会替换' : '输入 API Key'}
+                          placeholder={credential.apiKeyConfigured ? '输入新密钥才会替换' : '输入 API 密钥'}
                           value={draft.apiKey}
                           onChange={(event) =>
                             setMemberCredentialState((current) => ({
@@ -1830,7 +1846,7 @@ export function AdminPage() {
                         />
                       </label>
                       <label>
-                        <span>Base URL</span>
+                        <span>接口地址</span>
                         <Input
                           value={draft.baseUrl}
                           onChange={(event) =>

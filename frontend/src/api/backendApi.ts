@@ -238,6 +238,7 @@ export type BackendProduct = {
   monthly_sales: number;
   review_count: number;
   listing_time?: string;
+  pool_added_at?: string | null;
   status: 'active' | 'deleted' | 'sourced';
   in_product_pool?: boolean;
   source_row_index: number;
@@ -259,6 +260,8 @@ export type ProductListParams = {
   priceRange?: string;
   salesRange?: string;
   gmvRange?: string;
+  poolAddedStart?: string;
+  poolAddedEnd?: string;
   scope?: 'pool' | 'all';
   sortBy?: 'price' | 'gmv';
   sortOrder?: 'asc' | 'desc';
@@ -355,6 +358,10 @@ export type YunqiSyncResponse = YunqiImportResponse & {
 };
 
 export type Link1688ImportResponse = YunqiImportResponse;
+
+export type DianxiaomiTemplateImportResponse = YunqiImportResponse & {
+  records: LinkListRecord[];
+};
 
 export type DianxiaomiExportMode = 'distribution' | 'curated';
 
@@ -538,6 +545,7 @@ export type VisualTaskGeneratePayload = {
 
 export type VisualTaskRunPayload = VisualTaskPlanPayload & VisualTaskGeneratePayload & {
   applyToLinkRecord?: boolean;
+  reuseExistingOutputs?: boolean;
 };
 
 export type VisualTaskSplitPayload = {
@@ -732,6 +740,8 @@ export async function fetchProducts(params: ProductListParams): Promise<ProductL
   if (params.scope) search.set('scope', params.scope);
   if (params.sortBy) search.set('sort_by', params.sortBy);
   if (params.sortOrder) search.set('sort_order', params.sortOrder);
+  if (params.poolAddedStart) search.set('pool_added_start', params.poolAddedStart);
+  if (params.poolAddedEnd) search.set('pool_added_end', params.poolAddedEnd);
   appendRangeParams(search, 'price', params.priceRange);
   appendRangeParams(search, 'sales', params.salesRange);
   appendRangeParams(search, 'gmv', params.gmvRange);
@@ -1070,6 +1080,23 @@ export async function fetchSmart1688Keywords(product: Product): Promise<Omit<Sma
     headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ product, limit: 6 }),
   }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json();
+}
+
+export async function uploadDianxiaomiTemplateFile(file: File): Promise<DianxiaomiTemplateImportResponse> {
+  const formData = new FormData();
+  formData.append('file', file);
+
+  const response = await fetch(`${API_BASE_URL}/api/uploads/dianxiaomi-template`, withSession({
+    method: 'POST',
+    headers: authHeaders(),
+    body: formData,
+  }));
+
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
@@ -1586,6 +1613,7 @@ export function mapBackendProduct(product: BackendProduct): Product {
     gmv: product.gmv_usd,
     reviewCount: product.review_count,
     listedAt: product.listing_time ? product.listing_time.slice(0, 10) : '',
+    selectedAt: product.pool_added_at ? product.pool_added_at.slice(0, 10) : undefined,
     growthRate: 0,
     sourceRow: product.source_row_index,
     period: product.weekly_sales > 0 ? '近7天' : '近30天',

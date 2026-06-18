@@ -16,7 +16,6 @@ from app.core.config import DIANXIAOMI_TEMU_TEMPLATE_PATH, EXPORTS_DIR, ensure_r
 from app.core.image_plugins import register_optional_image_plugins
 from app.modules.creative_generation.listing_title_optimizer import (
     fallback_translate_variant_value,
-    optimize_listing_titles,
     translate_variant_values_to_english,
 )
 from app.modules.exports.product_attributes import get_product_attribute_for_export_record
@@ -160,12 +159,53 @@ def build_template_rows_for_export_record(
     user_id: str | None = None,
 ) -> list[dict[str, Any]]:
     try:
-        return build_template_rows(record, export_mode=export_mode, user_id=user_id)
+        return build_template_rows(record, export_mode=export_mode, user_id=user_id, translate_variants=False)
     except DianxiaomiExportError:
         raise
     except Exception as exc:
         title = clean_text(record.get("productTitle")) or clean_text(record.get("id")) or clean_text(record.get("productId")) or "record"
         raise DianxiaomiExportError(f"Export failed for {title}: {exc}") from exc
+
+
+def visual_product_identity_from_record(record: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        return {}
+    identity = record.get("visualProductIdentity")
+    if isinstance(identity, dict):
+        return identity
+    return {}
+
+
+def visual_identity_title_context(record: dict[str, Any]) -> dict[str, str]:
+    identity = visual_product_identity_from_record(record)
+    title_cn = first_non_empty(
+        record.get("visualGeneratedTitleCn"),
+        identity.get("title_cn"),
+        identity.get("titleCn"),
+        record.get("attributeTitle"),
+    )
+    title_en = first_non_empty(
+        record.get("visualGeneratedTitleEn"),
+        identity.get("title_en"),
+        identity.get("titleEn"),
+        record.get("attributeTitleEn"),
+    )
+    return {"title_cn": title_cn, "title_en": title_en}
+
+
+def visual_identity_sku_standard_name(record: dict[str, Any] | None, sku_index: int | None = None) -> str:
+    identity = visual_product_identity_from_record(record)
+    skus = identity.get("skus") if isinstance(identity.get("skus"), list) else []
+    for item in skus:
+        if not isinstance(item, dict):
+            continue
+        item_index = safe_int(item.get("sku_index") or item.get("skuIndex"))
+        if sku_index is not None and item_index != sku_index:
+            continue
+        value = first_non_empty(item.get("standard_name"), item.get("standardName"))
+        if value:
+            return value
+    return ""
 
 
 def build_template_rows(
@@ -179,22 +219,14 @@ def build_template_rows(
     export_mode = normalize_export_mode(export_mode)
     sku_entries = sort_sku_entries(record.get("skuEntries") or [])
 
-    product_title = clean_text(record.get("productTitle")) or _cn("\\u672a\\u547d\\u540d\\u5546\\u54c1")
-    product_title_en = normalize_english_title(record.get("productTitleEn"), product_title)
-    if optimize_titles:
-        try:
-            optimized_titles = optimize_listing_titles(
-                record,
-                fallback_title_cn=product_title,
-                fallback_title_en=product_title_en,
-                user_id=user_id,
-                strict=False,
-            )
-            product_title = clean_text(optimized_titles.get("title_cn")) or product_title
-            product_title_en = clean_text(optimized_titles.get("title_en")) or product_title_en
-        except Exception:
-            # Title optimization is best-effort; a transient AI empty response must not block the Excel export.
-            pass
+    visual_titles = visual_identity_title_context(record)
+    product_title = clean_text(visual_titles.get("title_cn")) or clean_text(record.get("productTitle")) or _cn("\\u672a\\u547d\\u540d\\u5546\\u54c1")
+    product_title_en = (
+        clean_text(visual_titles.get("title_en"))
+        or normalize_english_title(record.get("productTitleEn"), product_title)
+    )
+    # Titles are now generated during visual product analysis. Keep optimize_titles in the
+    # signature for old callers, but do not make a separate title-generation API call here.
 
     product_id = clean_text(record.get("productId")) or uuid.uuid4().hex[:10]
     raw_main_image_url = pick_record_main_image(record, export_mode)
@@ -228,8 +260,12 @@ def build_template_rows(
 
     prepared_skus: list[tuple[dict[str, Any], str, list[tuple[str, str]]]] = []
     for index, sku_entry in enumerate(sku_entries, start=1):
+        identity_sku_name = visual_identity_sku_standard_name(record, index)
+        if identity_sku_name and not clean_text(sku_entry.get("visualGeneratedName") or sku_entry.get("generatedSkuName")):
+            sku_entry = dict(sku_entry)
+            sku_entry["visualGeneratedName"] = identity_sku_name
         sku_name = clean_text(sku_entry.get("name")) or f"SKU {index}"
-        variant_pairs = derive_variant_pairs(sku_entry, sku_name, record)
+        variant_pairs = derive_variant_pairs(sku_entry, sku_name, record, sku_index=index)
         prepared_skus.append((sku_entry, sku_name, variant_pairs))
     prepared_skus = enforce_consistent_variant_schema(prepared_skus)
     raw_variant_values = [
@@ -246,7 +282,7 @@ def build_template_rows(
         material_image_urls=material_image_urls,
     )
 
-    if translate_variants:
+    if translate_variants and raw_variant_values:
         try:
             variant_value_translations = translate_variant_values_to_english(
                 raw_variant_values,
@@ -428,15 +464,15 @@ def build_rows_for_record(
     *,
     user_id: str | None = None,
 ) -> list[list[Any]]:
-    use_title_optimizer = getattr(type(optimize_listing_titles), "__module__", "") == "unittest.mock"
     rows = build_template_rows(
         record,
         export_mode=export_mode,
         user_id=user_id,
-        optimize_titles=use_title_optimizer,
+        optimize_titles=False,
         translate_variants=False,
     )
-    if not use_title_optimizer:
+    visual_titles = visual_identity_title_context(record)
+    if not clean_text(visual_titles.get("title_en")):
         legacy_title_en = build_legacy_english_title(record)
         for row in rows:
             row["product_title_en"] = legacy_title_en or row.get("product_title_en", "")
@@ -641,7 +677,16 @@ def derive_variant_pairs(
     sku_entry: dict[str, Any],
     fallback_value: str,
     record: dict[str, Any] | None = None,
+    sku_index: int | None = None,
 ) -> list[tuple[str, str]]:
+    visual_name = clean_text(
+        sku_entry.get("visualGeneratedName")
+        or sku_entry.get("generatedSkuName")
+        or visual_identity_sku_standard_name(record, sku_index)
+    )
+    if visual_name:
+        return [(VARIANT_LABELS["model"], visual_name)]
+
     if is_combo_sku_entry(sku_entry):
         return [(VARIANT_LABELS["model"], build_combo_variant_value(sku_entry, fallback_value, record))]
 
@@ -691,6 +736,8 @@ def is_combo_sku_entry(sku_entry: dict[str, Any]) -> bool:
 
 
 def should_translate_variant_value(sku_entry: dict[str, Any], variant_name: str) -> bool:
+    if clean_text(sku_entry.get("visualGeneratedName") or sku_entry.get("generatedSkuName")):
+        return False
     return True
 
 
@@ -1455,6 +1502,13 @@ def first_non_empty(*values: Any) -> str:
         if text:
             return text
     return ""
+
+
+def safe_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def clean_text(value: Any) -> str:

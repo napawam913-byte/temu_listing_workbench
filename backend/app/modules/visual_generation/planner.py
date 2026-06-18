@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from app.modules.creative_generation.listing_title_optimizer import load_listing_prompt
 from app.modules.visual_generation.clients import (
     VisualGenerationError,
     extract_response_text,
@@ -18,10 +19,19 @@ from app.modules.visual_generation.splitter import POSITION_NAMES, layout_key, p
 REFERENCE_FIDELITY_RULE = (
     "Use every attached selected SKU/product reference image as a binding visual reference, not loose inspiration. "
     "Do not change the product subject appearance: preserve exact visible shape, color, material, edge/rim details, "
-    "silhouette, geometry, facet count or side count, surface texture, quantity, scale logic, and component relationship. "
+    "silhouette, geometry, facet count or side count, physical construction, surface texture, material attributes, quantity, "
+    "scale logic, proportions, and component relationship. "
+    "For overall product category/use understanding, image evidence has 70% authority and title/SKU text has 30% authority. "
+    "For appearance, material, surface feel, gloss/matte finish, wrinkles, folds, rigidity/flexibility, body shape, color, quantity, "
+    "visible geometry, facet/side count, construction, and printed pattern, reference image evidence has 100% authority and title/SKU text has 0% authority. "
+    "Titles and SKU names may describe function, usage, occasion, quantity, or selling-point copy, but must never decide visual appearance or material texture. "
     "The image is the visual source of truth; titles and SKU names are secondary text hints and must never override visible geometry, "
-    "color, material, quantity, or printed pattern. For dice, cubes, polyhedrons, or multi-sided items, preserve the exact form: "
+    "color, material, surface finish, rigidity/flexibility, wrinkles/folds, quantity, or printed pattern. For dice, cubes, polyhedrons, or multi-sided items, preserve the exact form: "
     "do not convert a six-sided cube-style die into a twelve-sided die, and do not convert a twelve-sided die into a cube-style die. "
+    "Never transform the selected product into a different object type, body form, material, surface finish, structure, function, package, container, or generic category substitute. "
+    "If the reference shows wrinkled, thin, soft, flexible, crumpled, translucent, matte, paper-like, fabric-like, rubbery, or plastic-film material, preserve that tactile texture exactly; "
+    "do not make it smooth, glossy, rigid, ceramic, glass, metal, molded hard plastic, or bottle-like unless the reference image visibly shows that. "
+    "On-image copy must not name a shape, material, component, or feature that is not visibly supported by the reference image. "
     "For combo SKUs, show all selected components together and keep each component visually identifiable. "
     "Never replace the selected item with a generic category item."
 )
@@ -44,6 +54,7 @@ def ensure_reference_fidelity_text(prompt: str) -> str:
 
 def build_product_analysis_instruction(context: dict[str, Any] | None = None) -> str:
     context_json = json.dumps(context or {}, ensure_ascii=False, indent=2)
+    listing_title_rules = load_listing_prompt()
     return f"""
 Analyze the attached ecommerce product reference images.
 
@@ -52,24 +63,58 @@ Return JSON only. Do not return markdown.
 Input context:
 {context_json}
 
+Listing title generation rules migrated into this product analysis stage:
+{listing_title_rules}
+
 Rules:
-1. Extract only visible or strongly supported product facts. The attached image itself is the visual source of truth.
-2. Use productTitle, skuNames, skuBindings, and skuCombinationBindings only as secondary text hints for category, option names, source-product binding, and possible colors/specs. If text conflicts with image evidence, the image wins.
-3. Do not invent accessories, SKU options, materials, functions, brand names, platform names, claims, price, stock, weight, MOQ, SKU ID, or source spec tables.
-4. Treat all attached reference images as equal product reference images. Do not rank them as main image versus material image.
-5. For each reference image, use the image itself first, then its label/title and skuBindings, to identify the exact visible subject: product category, silhouette, shape, geometry, facet count or side count, color, material, quantity, surface texture, edge/rim details, printed pattern, and component relationship.
-6. If multiple products or SKU components are shown across the reference images, analyze each one separately and preserve the image-to-product binding.
-7. If SKU/component names are quantity-like or ambiguous, such as 1pc and 6pc, keep the sourceTitle and referenceImageIndex binding from skuBindings. Do not merge or swap components across source products.
-8. For dice, cubes, polyhedrons, or any object with a fixed geometric body, explicitly distinguish visible geometry: six-sided rounded cube-style die, twelve-sided dodecahedron-style die, sphere, cylinder, flat sheet, bag, bowl, etc. Do not infer a different side count from title text.
-9. If uncertain, use "unknown" or an empty array.
-10. Mark only visual facts that future generation must preserve or must not change.
-11. Mark visible risks in the source image: logo, watermark, QR code, price, discount, rating, platform UI, or unsafe/unsupported claims.
+1. Extract only visible or strongly supported product facts. The attached image itself is the visual source of truth. If uncertain, use "unknown" or an empty array instead of guessing.
+2. Evidence priority: for overall category/use, reference images have 70% authority and productTitle/skuNames/sourceTitle text has 30% authority. For visual identity, reference images have 100% authority and title/SKU/source text has 0% authority. Visual identity includes appearance, material, tactile texture, surface finish, gloss/matte quality, wrinkles/folds, rigidity/flexibility, shape, color, quantity, visible geometry, facet/side count, construction, proportions, and printed pattern.
+3. Text may only guide category, function/use, occasion, SKU option naming, source binding, and safe selling copy. If text conflicts with image evidence, the image wins. Do not infer shape, material, side count, color, texture, or quantity from title/SKU/source text unless visibly supported.
+4. Treat every attached image as an equal product reference. Analyze each reference image independently using only its own label/sourceTitle/SKU binding. Never borrow another source product title, another image's title, SKU, or global productTitle to decide that image's appearance, material, texture, color, side count, or quantity.
+5. For each reference image, identify the exact visible subject: category, silhouette, shape/geometry, facet or side count when clear, colors, material, tactile texture, surface finish, rigidity/flexibility, quantity, edge/rim details, printed pattern, visible components, and component relationship. For dice or fixed-geometry items, distinguish forms such as six-sided rounded cube-style die or twelve-sided dodecahedron-style die only when clearly visible. For low-resolution or ambiguous geometry, return a neutral description such as "multi-faced / exact side count unknown".
+6. Preserve SKU and component binding. If names are ambiguous or quantity-like, such as "1 Pack" or "2pcs", keep the sourceTitle and referenceImageIndex from skuBindings. For combo/bundle SKUs, keep every component separate in productIdentity.skus[].components and join component standard names with "+" for combo_sku_name.
+7. Record facts that later generation must preserve and must not change: body form, silhouette, proportions, physical construction, material attributes, surface finish, tactile texture, wrinkles/folds, color placement, quantity/component count, and component relationship. Add doNotChange items for likely drift risks: do not change material, do not lose texture, do not change soft flexible material into smooth rigid material, do not change shape/construction/color/quantity, do not add unsupported components, do not replace the product with another object type, and do not use generic category substitution.
+8. Do not invent accessories, SKU options, materials, functions, brand names, platform names, claims, price, stock, weight, MOQ, SKU ID, source spec tables, or unsupported on-image copy. Mark visible risks such as logo, watermark, QR code, price, discount, rating, platform UI, or unsafe/unsupported claims.
+9. Also return productIdentity as the single source of truth for later image planning, Excel titles, SKU names, and export titles. productIdentity.title_cn and productIdentity.title_en are the final listing titles generated in this same product analysis stage. There is no later separate title-generation step.
+10. title_cn must be Chinese. title_en and sku standard_name values must be clean marketplace English with no Chinese characters. Titles must follow the migrated listing title rules, keep supported quantity/pack count, stay faithful to selected images and SKU/bundle structure, and remove promotion, holiday-only wording, rating, sold count, store text, import charge text, platform text, price/discount text, brand names, medical/certification claims, and exaggerated language. For visual identity words in titles, the reference image remains 100% authority; title text may only support function/use/occasion and buyer-facing benefit wording.
 
 Return this JSON shape:
 {{
   "productUnderstanding": {{
     "productTitle": "",
     "skuNames": [],
+    "productIdentity": {{
+      "product_type": "",
+      "product_type_cn": "",
+      "title_cn": "",
+      "title_en": "",
+      "combo_sku_name": "",
+      "skus": [
+        {{
+          "sku_index": 1,
+          "raw_name": "",
+          "standard_name": "",
+          "product_name": "",
+          "quantity": "",
+          "shape": "",
+          "material": "",
+          "reference_image_indexes": [],
+          "components": [
+            {{
+              "component_index": 1,
+              "raw_name": "",
+              "standard_name": "",
+              "product_name": "",
+              "quantity": "",
+              "shape": "",
+              "material": "",
+              "source_title": "",
+              "reference_image_index": 1
+            }}
+          ]
+        }}
+      ]
+    }},
     "skuBindings": [],
     "skuCombinationBindings": [],
     "overallCategory": "",
@@ -89,6 +134,11 @@ Return this JSON shape:
         "materials": [],
         "quantity": "",
         "surfaceTexture": "",
+        "surfaceFinish": "",
+        "textureDetails": [],
+        "rigidityFlexibility": "",
+        "materialEvidence": "",
+        "materialDoNotChange": [],
         "edgeOrRimDetails": "",
         "printedPattern": "",
         "visibleComponents": [],
@@ -145,8 +195,47 @@ def label_policy_text(allow_short_labels: bool) -> str:
     )
 
 
+def fixed_grid_layout_rules(rows: int, cols: int) -> str:
+    key = layout_key(rows, cols)
+    if rows == 3 and cols == 3:
+        boundary_rule = (
+            "For a square 1024x1024 style output, treat each tile as a fixed 341x341 square region; "
+            "place vertical boundaries at exactly one-third and two-thirds of the canvas width, and horizontal "
+            "boundaries at exactly one-third and two-thirds of the canvas height."
+        )
+    elif rows == 2 and cols == 2:
+        boundary_rule = (
+            "For a square 1024x1024 style output, treat each tile as a fixed 512x512 square region; "
+            "place the vertical boundary at exactly half of the canvas width and the horizontal boundary at "
+            "exactly half of the canvas height."
+        )
+    else:
+        boundary_rule = "Use one fixed square tile that fills the square canvas."
+    return f"""
+Canvas and fixed grid lock:
+1. The final output must be one perfect square canvas using a mechanical {key} grid, not a magazine collage, masonry layout, freeform poster, or variable-width split screen.
+2. The canvas must contain exactly {cols} equal-width columns and exactly {rows} equal-height rows.
+3. Every visible panel rectangle must have the same width and the same height. No panel, column, or row may be wider, narrower, taller, or shorter than another.
+4. {boundary_rule}
+5. Use straight full-length white gutters of one uniform thickness only on the exact grid boundaries. Do not use irregular margins, offset seams, staggered panel edges, overlapping cards, or floating panels.
+6. Each panel's product, text, props, shadows, and background must stay inside its own fixed tile. Nothing may cross, bend, cover, or visually move the grid boundary.
+7. Leave no unused outer margin beyond the fixed grid. The first tile starts at the top-left canvas edge and the last tile ends at the bottom-right canvas edge.
+""".strip()
+
+
 def context_sku_names(context: dict[str, Any] | None, product_understanding: dict[str, Any] | None = None) -> list[str]:
     candidates: list[Any] = []
+    product_identity = (
+        product_understanding.get("productIdentity")
+        if isinstance(product_understanding, dict) and isinstance(product_understanding.get("productIdentity"), dict)
+        else {}
+    )
+    identity_skus = product_identity.get("skus") if isinstance(product_identity, dict) else []
+    if isinstance(identity_skus, list):
+        for item in identity_skus:
+            if not isinstance(item, dict):
+                continue
+            candidates.append(item.get("standard_name") or item.get("standardName"))
     if isinstance(context, dict):
         candidates.extend(context.get("skuNames") if isinstance(context.get("skuNames"), list) else [])
     if isinstance(product_understanding, dict):
@@ -236,6 +325,11 @@ def build_prompt_plan_instruction(
     expected = requested_count or rows * cols
     modules = candidate_modules or default_slot_blueprints(layout)
     product_json = json.dumps(product_analysis, ensure_ascii=False, indent=2)
+    product_identity_json = json.dumps(
+        product_analysis.get("productIdentity") if isinstance(product_analysis.get("productIdentity"), dict) else {},
+        ensure_ascii=False,
+        indent=2,
+    )
     sku_json = json.dumps(context_sku_names(context, product_analysis), ensure_ascii=False, indent=2)
     sku_binding_json = json.dumps(context_sku_bindings(context), ensure_ascii=False, indent=2)
     sku_combo_json = json.dumps(context_sku_combination_bindings(context), ensure_ascii=False, indent=2)
@@ -251,6 +345,7 @@ Return JSON only. Do not return markdown.
 Input:
 {{
   "productUnderstanding": {product_json},
+  "productIdentity": {product_identity_json},
   "requestedCount": {expected},
   "layout": "{key}",
   "skuNames": {sku_json},
@@ -266,21 +361,24 @@ Rules:
 3. Choose, replace, and order modules from the candidateModules according to the product title, visible product facts, SKU bindings, and commercial listing needs.
 4. Do not invent SKU details, price, weight, stock, MOQ, SKU ID, source specification tables, brand names, certifications, platform names, or unsupported claims.
 5. Use skuNames as option/category/color/spec text hints, but use skuBindings, skuReferenceBindings, productUnderstanding.referenceAnalyses, and reference image labels/titles as the authority for which SKU/component belongs to which source product and reference image.
+5a. Use productIdentity as the normalized authority for product type, Excel-ready titles, and standard SKU names. Do not replace productIdentity.skus[].standard_name with raw quantity-only names.
 6. Treat all reference images as equal product references. Do not prioritize "main image" over "material image"; infer the product shown in each image from the image content first, then label/title.
 7. If the product has multiple SKU names or combo SKU components, plan whether the batch should show one selected SKU, multiple SKU color options, bundle/combination value, or SKU-specific detail images.
 8. If SKU/component names are quantity-like or ambiguous, such as 1pc and 6pc, never interpret them by name alone. Preserve each component's sourceTitle, source product title, and referenceImageIndex binding.
+8a. When planning targetSkuName for a SKU, prefer productIdentity.skus[].standard_name or productIdentity.skus[].components[].standard_name.
 9. Use skuReferenceBindings as the explicit binding table: each referenceImageIndex belongs to one SKU name and one sourceProductTitle. Do not swap products across these bindings.
 10. For combo SKUs or different-product selected bundles, every component listed in skuCombinationBindings or skuReferenceBindings must be represented in combo/package/option panels unless the component is explicitly marked unsafe or visually unavailable.
 11. Each module must preserve productUnderstanding.globalMustPreserve and avoid productUnderstanding.globalDoNotChange.
-12. Each module must preserve the exact visual identity from productUnderstanding.referenceAnalyses for every used reference index: silhouette, shape, geometry, facet/side count, visible color, material, quantity, surface texture, and printed pattern. Text titles cannot override these visible facts.
+12. Each module must preserve the exact visual identity from productUnderstanding.referenceAnalyses for every used reference index: silhouette, shape, geometry, facet/side count, visible color, material attributes, physical construction, proportions, quantity, surface texture, surface finish, tactile texture, wrinkles/folds, rigidity/flexibility, component count, component relationship, and printed pattern. Text titles cannot override these visible facts.
 13. For dice or polyhedron products, explicitly protect geometry in mustPreserve/doNotChange. Example: a six-sided rounded cube-style die must stay six-sided/cube-style; a twelve-sided dodecahedron-style wooden die must stay twelve-sided/dodecahedron-style.
-14. Each module may plan whether on-image copy is useful.
-15. On-image copy intent can include feature introduction, benefit emphasis, usage scene, component explanation, comparison, bundle value, or SKU option clarification.
-16. Do not write the final full on-image copy here. Only define copyIntent and textPolicy.
-17. Text must be objective, safe, purchase-oriented, and supported by productTitle, skuNames, skuBindings, reference image labels/titles, sourceProductTitle, or visible product facts.
-18. Do not use medical claims, absolute promises, certification claims, platform names, brand names, price, discount, rating, stock, shipping time, or unverifiable claims.
-19. Keep the overall batch visually coherent: consistent product identity, lighting family, marketplace polish, and non-conflicting backgrounds.
-20. Text availability rule: {label_policy_text(allow_short_labels)}
+14. Every module must carry a product identity lock in mustPreserve/doNotChange: do not change the product material, surface finish, tactile texture, wrinkles/folds, rigidity/flexibility, body shape, silhouette, proportions, construction, color arrangement, component count, or component relationship; do not turn the selected product into another object type, package, container, or generic category substitute.
+15. Each module may plan whether on-image copy is useful.
+16. On-image copy intent can include feature introduction, benefit emphasis, usage scene, component explanation, comparison, bundle value, or SKU option clarification.
+17. Do not write the final full on-image copy here. Only define copyIntent and textPolicy.
+18. Text must be objective, safe, purchase-oriented, and supported by productTitle, skuNames, skuBindings, reference image labels/titles, sourceProductTitle, or visible product facts. Title text may support function/use/occasion copy, but must not decide appearance, material, texture, surface finish, or construction. Text must never describe a shape, material, construction, component, or function that contradicts the visible reference product.
+19. Do not use medical claims, absolute promises, certification claims, platform names, brand names, price, discount, rating, stock, shipping time, or unverifiable claims.
+20. Keep the overall batch visually coherent: consistent product identity, lighting family, marketplace polish, and non-conflicting backgrounds.
+21. Text availability rule: {label_policy_text(allow_short_labels)}
 
 Return this JSON shape:
 {{
@@ -327,6 +425,13 @@ def build_panel_prompt_instruction(
     context: dict[str, Any] | None = None,
 ) -> str:
     product_json = json.dumps(product_understanding, ensure_ascii=False, indent=2)
+    product_identity_json = json.dumps(
+        product_understanding.get("productIdentity")
+        if isinstance(product_understanding.get("productIdentity"), dict)
+        else {},
+        ensure_ascii=False,
+        indent=2,
+    )
     plan_json = json.dumps(visual_task_plan, ensure_ascii=False, indent=2)
     sku_json = json.dumps(context_sku_names(context, product_understanding), ensure_ascii=False, indent=2)
     sku_binding_json = json.dumps(context_sku_bindings(context), ensure_ascii=False, indent=2)
@@ -345,6 +450,7 @@ Return JSON only. Do not return markdown.
 Input:
 {{
   "productUnderstanding": {product_json},
+  "productIdentity": {product_identity_json},
   "visualTaskPlan": {plan_json},
   "layout": "{key}",
   "skuNames": {sku_json},
@@ -357,24 +463,26 @@ Input:
 Rules:
 1. Create one panel prompt for each module in visualTaskPlan.modules.
 2. Each panel prompt must be written in English and ready for an image generation model.
-3. Preserve the exact product facts from productUnderstanding: product category, visual identity, silhouette, shape, geometry, facet/side count, color, material, quantity, texture, rim/edge details, printed pattern, visible components, and component relationship.
+3. Preserve the exact product facts from productUnderstanding: product category, visual identity, silhouette, shape, geometry, facet/side count, color, material, surface finish, tactile texture, wrinkles/folds, rigidity/flexibility, quantity, rim/edge details, printed pattern, visible components, and component relationship.
 4. Treat reference images as equal binding product references, not loose inspiration. Do not rank them as main image versus material image.
 5. Do not replace the selected SKU/product with a generic category item.
 6. Use targetSkuName and skuNames as option/category/color/spec hints, but use skuBindings plus reference image labels/titles as the authority for component-to-source-product and reference-image binding. Do not add hidden SKU data.
+6a. productIdentity contains the standardized product type, title, and SKU names. Use productIdentity.skus[].standard_name in prompts and on-image SKU option copy instead of raw quantity-only labels when available.
 7. If SKU/component names are quantity-like or ambiguous, such as 1pc and 6pc, write the prompt so each component remains tied to its sourceProductTitle and referenceImageIndex. Do not swap, merge, or treat them as generic quantities.
 8. Use skuReferenceBindings as a hard binding table. For every referenceImageIndex used by a panel, state the matching SKU name and source product title in the panel prompt.
 9. For combo/package/option panels, include every component listed in the target SKU binding. If the user supplied images and titles for multiple components, the prompt must ask for all those components in the same panel when the SKU represents a combo or a different-product bundle.
-10. For every referenceImageIndex used by a panel, explicitly describe its visual identity from productUnderstanding.referenceAnalyses: exact silhouette, geometry/facet or side count, color, material, quantity, texture, and printed pattern. If title text conflicts with visible image facts, follow the image.
+10. For every referenceImageIndex used by a panel, explicitly describe its visual identity from productUnderstanding.referenceAnalyses: exact silhouette, geometry/facet or side count, body form, proportions, color, material attributes, surface finish, tactile texture, wrinkles/folds, rigidity/flexibility, physical construction, quantity, component relationship, and printed pattern. If title text conflicts with visible image facts, follow the image.
 11. For dice or polyhedron products, write hard negative constraints against geometry drift. Example: if one SKU is a six-sided rounded cube-style die and another is a twelve-sided wooden dodecahedron-style die, the prompt must say the six-sided die must not become twelve-sided and the twelve-sided die must not become cube-style.
-12. Add composition, camera angle, lighting, background, scene, props, text placement, and ecommerce style only when they support the module purpose.
-13. On-image copy is allowed when useful for purchase motivation, feature introduction, usage explanation, component explanation, comparison, bundle value, or SKU clarification.
-14. On-image copy does not have to be extremely short. It may be a concise phrase or a short sentence when the module needs clearer selling-point explanation.
-15. On-image copy must be objective, safe, and supported by productTitle, skuNames, skuBindings, sourceProductTitle, reference image labels/titles, or visible product facts.
-16. Do not include medical claims, absolute promises, certification claims, brand names, platform names, price, discount, rating, stock, shipping time, QR code, watermark, or platform UI.
-17. Text must not cover the product subject, must not dominate the product, and must stay inside the panel.
-18. Keep all panels visually coherent as one listing batch: consistent product identity, lighting family, color temperature, marketplace polish, and compatible background language.
-19. Make every prompt self-contained enough for the image generation model to produce the intended panel.
-20. Text availability rule: {label_policy_text(allow_short_labels)}
+12. For every product, write hard negative constraints against identity drift: do not change material attributes, surface finish, tactile texture, wrinkles/folds, rigidity/flexibility, body shape, silhouette, proportions, construction, color arrangement, component count, or component relationship; do not transform the selected product into another object type, package, container, or generic category substitute.
+13. Add composition, camera angle, lighting, background, scene, props, text placement, and ecommerce style only when they support the module purpose.
+14. On-image copy is allowed when useful for purchase motivation, feature introduction, usage explanation, component explanation, comparison, bundle value, or SKU clarification.
+15. On-image copy does not have to be extremely short. It may be a concise phrase or a short sentence when the module needs clearer selling-point explanation.
+16. On-image copy must be objective, safe, and supported by productTitle, skuNames, skuBindings, sourceProductTitle, reference image labels/titles, or visible product facts. Titles may support function/use/occasion wording only. Copy and prompt wording must never introduce a shape, material, texture, surface finish, construction, component, or function that contradicts the reference image.
+17. Do not include medical claims, absolute promises, certification claims, brand names, platform names, price, discount, rating, stock, shipping time, QR code, watermark, or platform UI.
+18. Text must not cover the product subject, must not dominate the product, and must stay inside the panel.
+19. Keep all panels visually coherent as one listing batch: consistent product identity, lighting family, color temperature, marketplace polish, and compatible background language.
+20. Make every prompt self-contained enough for the image generation model to produce the intended panel.
+21. Text availability rule: {label_policy_text(allow_short_labels)}
 
 Return this JSON shape:
 {{
@@ -608,6 +716,7 @@ def build_mother_prompt_from_plan(plan: dict[str, Any], layout: str, allow_short
     key = layout_key(rows, cols)
     tasks = normalized_panel_tasks(plan, layout, allow_short_labels)
     expected = rows * cols
+    grid_rules = fixed_grid_layout_rules(rows, cols)
     product_json = json.dumps(plan.get("productUnderstanding") or plan.get("productAnalysis") or {}, ensure_ascii=False, indent=2)
     sku_binding_json = json.dumps(plan.get("skuBindings") or [], ensure_ascii=False, indent=2)
     sku_combo_json = json.dumps(plan.get("skuCombinationBindings") or [], ensure_ascii=False, indent=2)
@@ -633,26 +742,26 @@ Create one single {key} ecommerce mother image.
 This mother image contains {expected} independent square listing-image panels.
 
 Grid rules:
-1. Use a strict {key} grid.
-2. Every panel must be an equal square.
-3. Use clean white gutters between panels.
-4. Do not merge panels.
-5. Do not let products, text, props, shadows, or backgrounds cross panel boundaries.
-6. Do not add panel numbers.
-7. Do not add extra panels.
-8. Do not leave any panel blank.
-9. The final image must be suitable for precise programmatic slicing into separate square ecommerce listing images.
+{grid_rules}
+8. Do not merge panels.
+9. Do not add panel numbers.
+10. Do not add extra panels.
+11. Do not leave any panel blank.
+12. The final image must be suitable for precise programmatic slicing into separate square ecommerce listing images.
 
 Global product consistency:
 1. Use the analyzed reference image facts, reference image labels/titles, and SKU/component binding facts as binding product references.
 2. Treat all reference images as equal product references; do not prioritize a "main" image over other supplied product images.
-3. Preserve product visual identity for every SKU/component with supplied visual facts: silhouette, exact geometry, facet/side count, shape, color, material, quantity, structure, component relationship, surface texture, rim/edge details, and printed pattern.
+3. Preserve product visual identity for every SKU/component with supplied visual facts: silhouette, exact geometry, facet/side count, body shape, proportions, color, material attributes, surface finish, tactile texture, wrinkles/folds, rigidity/flexibility, physical construction, quantity, structure, component relationship, rim/edge details, and printed pattern.
 4. For combo SKUs, include every component listed in the combo binding when a panel is about combo/package/option contents.
 5. For different-product bundles where SKU names are only quantities or units, use the reference image to SKU/source product title binding table as the product identity authority.
 6. Do not swap products between reference images, do not merge different products into one generic item, and do not replace the selected product/SKU with a generic category item.
-7. The attached reference image is the visual source of truth. Titles, SKU names, and generated copy must not override visible shape, geometry, side count, color, material, quantity, or printed pattern.
+7. The attached reference image is the visual source of truth. Titles, SKU names, and generated copy must not override visible shape, geometry, side count, color, material, surface finish, tactile texture, wrinkles/folds, rigidity/flexibility, quantity, or printed pattern.
 8. Geometry lock: for dice, cubes, polyhedrons, or multi-sided items, never change the visible form. A six-sided rounded cube-style die must not become a twelve-sided/dodecahedron die; a twelve-sided/dodecahedron wooden die must not become a six-sided cube-style die.
-9. Keep all panels visually coherent as one commercial listing batch.
+9. Product identity lock: never change the selected product's material attributes, surface finish, tactile texture, wrinkles/folds, rigidity/flexibility, body shape, silhouette, proportions, physical construction, color arrangement, component count, or component relationship.
+10. Object-type lock: never transform the selected product into another object type, package, container, functional form, or generic category substitute unless that form is visibly present in the reference image.
+11. Copy truth lock: on-image copy must not name any shape, material, texture, surface finish, construction, component, or function that is not visibly supported by the reference image. Titles may support function/use/occasion copy only.
+12. Keep all panels visually coherent as one commercial listing batch.
 
 Product facts to preserve:
 {product_json}
@@ -708,6 +817,7 @@ def build_compact_mother_prompt_from_plan(plan: dict[str, Any], layout: str, all
     rows, cols = parse_layout(layout)
     key = layout_key(rows, cols)
     tasks = normalized_panel_tasks(plan, layout, allow_short_labels)
+    grid_rules = fixed_grid_layout_rules(rows, cols)
     product_json = json.dumps(
         compact_json_value(plan.get("productUnderstanding") or plan.get("productAnalysis") or {}, max_items=6, max_chars=140),
         ensure_ascii=False,
@@ -762,19 +872,23 @@ Reference image to SKU/source product title bindings:
 {sku_reference_json}
 
 Grid rules:
-Use a strict {key} grid, equal square panels, clean white gutters, no merged panels, no blank panels, no panel numbers,
-and no product, text, prop, shadow, or background crossing panel boundaries.
+{grid_rules}
+No merged panels, no blank panels, no panel numbers, no extra panels, and no product, text, prop, shadow, or background crossing panel boundaries.
 
 Global product consistency:
 Use analyzed reference image facts, reference image labels/titles, and SKU/component binding facts as binding product references.
 Treat all supplied images as equal product references, not main-versus-material hierarchy. Preserve product visual identity: silhouette,
-exact geometry, facet/side count, shape, color, material, quantity, structure, component relationship, surface texture, rim/edge details,
+exact geometry, facet/side count, body shape, proportions, color, material attributes, surface finish, tactile texture, wrinkles/folds, rigidity/flexibility, physical construction, quantity, structure, component relationship, rim/edge details,
 and printed pattern for every SKU/component with supplied visual facts.
 For combo/package/option panels, include every component listed in the combo binding. For different-product bundles where SKU names are only quantities or units,
 use the reference image to SKU/source product title binding table as the product identity authority. Do not swap products between reference images,
 do not merge different products into one generic item, and do not replace the selected product/SKU with a generic category item.
-Image-first rule: titles and SKU names are text hints only; visible image facts override title text. Geometry lock: never convert a six-sided rounded cube-style die
+Image-first rule: titles and SKU names are text hints only for function/use/occasion; visible image facts have 100% authority for appearance, material, surface finish, tactile texture, wrinkles/folds, rigidity/flexibility, color, shape, quantity, and construction. Geometry lock: never convert a six-sided rounded cube-style die
 into a twelve-sided/dodecahedron die, and never convert a twelve-sided/dodecahedron die into a six-sided cube-style die.
+Product identity lock: never change the selected product's material attributes, surface finish, tactile texture, wrinkles/folds, rigidity/flexibility, body shape, silhouette, proportions, physical construction,
+color arrangement, component count, or component relationship. Never transform the selected product into another object type,
+package, container, functional form, or generic category substitute unless that form is visibly present in the reference image.
+Copy truth lock: on-image copy must not describe a shape, material, texture, surface finish, construction, component, or function that is not visibly supported by the reference image. Titles may support function/use/occasion copy only.
 
 Global safety:
 No brand logo, platform logo, watermark, QR code, price, discount, rating, certification badge, medical claim,
@@ -849,52 +963,89 @@ def request_prompt_plan(
     allow_short_labels: bool = True,
     requested_count: int | None = None,
     context: dict[str, Any] | None = None,
+    cached_plan: dict[str, Any] | None = None,
+    on_partial_plan: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     candidate_modules = default_slot_blueprints(layout)
     sku_bindings = context_sku_bindings(context)
     sku_combination_bindings = context_sku_combination_bindings(context)
     sku_reference_bindings = context_sku_reference_bindings(context)
     reference_images = context_reference_images(context)
-    parsed_task_plan = request_text_json(
-        api_url=api_url,
-        api_key=api_key,
-        model=model,
-        instruction=build_prompt_plan_instruction(
-            product_analysis=product_analysis,
-            layout=layout,
-            allow_short_labels=allow_short_labels,
+    cached = cached_plan if isinstance(cached_plan, dict) else {}
+    cached_visual_task_plan = cached.get("visualTaskPlan") if isinstance(cached.get("visualTaskPlan"), dict) else None
+    cached_panel_prompt_plan = cached.get("panelPromptPlan") if isinstance(cached.get("panelPromptPlan"), dict) else None
+
+    if cached_visual_task_plan and isinstance(cached_visual_task_plan.get("modules"), list):
+        visual_task_plan = normalized_visual_task_plan(
+            {"visualTaskPlan": cached_visual_task_plan},
+            layout,
             requested_count=requested_count,
-            context=context,
             candidate_modules=candidate_modules,
-        ),
-        temperature=0.6,
-    )
-    visual_task_plan = normalized_visual_task_plan(
-        parsed_task_plan,
-        layout,
-        requested_count=requested_count,
-        candidate_modules=candidate_modules,
-    )
-    parsed_panel_prompt_plan = request_text_json(
-        api_url=api_url,
-        api_key=api_key,
-        model=model,
-        instruction=build_panel_prompt_instruction(
+        )
+    else:
+        parsed_task_plan = request_text_json(
+            api_url=api_url,
+            api_key=api_key,
+            model=model,
+            instruction=build_prompt_plan_instruction(
+                product_analysis=product_analysis,
+                layout=layout,
+                allow_short_labels=allow_short_labels,
+                requested_count=requested_count,
+                context=context,
+                candidate_modules=candidate_modules,
+            ),
+            temperature=0.6,
+        )
+        visual_task_plan = normalized_visual_task_plan(
+            parsed_task_plan,
+            layout,
+            requested_count=requested_count,
+            candidate_modules=candidate_modules,
+        )
+        if on_partial_plan:
+            on_partial_plan(
+                {
+                    "stage": "visual_task_plan",
+                    "productUnderstanding": product_analysis,
+                    "productAnalysis": product_analysis,
+                    "skuBindings": sku_bindings,
+                    "skuCombinationBindings": sku_combination_bindings,
+                    "skuReferenceBindings": sku_reference_bindings,
+                    "referenceImages": reference_images,
+                    "visualTaskPlan": visual_task_plan,
+                }
+            )
+
+    if cached_panel_prompt_plan and isinstance(cached_panel_prompt_plan.get("panels"), list):
+        panel_prompt_plan = normalized_panel_prompt_plan(
+            {"panelPromptPlan": cached_panel_prompt_plan},
             product_understanding=product_analysis,
             visual_task_plan=visual_task_plan,
             layout=layout,
             allow_short_labels=allow_short_labels,
-            context=context,
-        ),
-        temperature=0.6,
-    )
-    panel_prompt_plan = normalized_panel_prompt_plan(
-        parsed_panel_prompt_plan,
-        product_understanding=product_analysis,
-        visual_task_plan=visual_task_plan,
-        layout=layout,
-        allow_short_labels=allow_short_labels,
-    )
+        )
+    else:
+        parsed_panel_prompt_plan = request_text_json(
+            api_url=api_url,
+            api_key=api_key,
+            model=model,
+            instruction=build_panel_prompt_instruction(
+                product_understanding=product_analysis,
+                visual_task_plan=visual_task_plan,
+                layout=layout,
+                allow_short_labels=allow_short_labels,
+                context=context,
+            ),
+            temperature=0.6,
+        )
+        panel_prompt_plan = normalized_panel_prompt_plan(
+            parsed_panel_prompt_plan,
+            product_understanding=product_analysis,
+            visual_task_plan=visual_task_plan,
+            layout=layout,
+            allow_short_labels=allow_short_labels,
+        )
     raw_plan = {
         "productUnderstanding": product_analysis,
         "productAnalysis": product_analysis,
@@ -910,7 +1061,7 @@ def request_prompt_plan(
         layout,
         allow_short_labels,
     )
-    return {
+    final_plan = {
         "productUnderstanding": product_analysis,
         "productAnalysis": product_analysis,
         "skuBindings": sku_bindings,
@@ -930,4 +1081,11 @@ def request_prompt_plan(
             "allowShortLabels": allow_short_labels,
         },
     }
+    if on_partial_plan and not (
+        cached_panel_prompt_plan and isinstance(cached_panel_prompt_plan.get("panels"), list)
+    ):
+        partial_plan = dict(final_plan)
+        partial_plan["stage"] = "panel_prompt_plan"
+        on_partial_plan(partial_plan)
+    return final_plan
 

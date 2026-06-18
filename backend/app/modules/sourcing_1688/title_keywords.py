@@ -102,9 +102,9 @@ def split_title_for_1688_search(title: str, category: str = "", *, user_id: str 
 
 def split_title_with_gpt(title: str, category: str, settings: Any) -> dict[str, Any]:
     client = build_openai_client(settings)
-    response = client.responses.create(
+    response = client.chat.completions.create(
         model=settings.text_model,
-        input=[
+        messages=[
             {
                 "role": "system",
                 "content": (

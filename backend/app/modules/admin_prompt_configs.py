@@ -4,7 +4,6 @@ import json
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from app.modules.creative_generation.listing_title_optimizer import load_listing_prompt
 from app.modules.visual_generation.planner import (
     build_mother_prompt_from_plan,
     build_panel_prompt_instruction,
@@ -29,43 +28,6 @@ class AdminPromptConfig:
 
 def _json_template(value: dict[str, Any]) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2)
-
-
-def _title_prompt_content() -> str:
-    user_payload = {
-        "listing_optimization_rules": "{{ backend/config/prompts/listing_optimization.md }}",
-        "task": "Generate one optimized Chinese product title and one optimized English product title for a Dianxiaomi TEMU semi-managed import template.",
-        "requirements": [
-            "title_cn must be Chinese.",
-            "title_en must be English and contain no Chinese characters.",
-            "Keep quantity or pack count when the source title clearly includes it.",
-            "Remove exact size specs when they are not core SKU identity.",
-            "Use differentiated SEO wording so repeated products do not share identical titles.",
-            "Keep the meaning faithful to the source product and SKU/bundle structure.",
-            "Avoid sensitive words, brand names, platform names, exaggerated claims, and medical claims.",
-        ],
-        "source": {
-            "product_id": "{{ productId }}",
-            "current_title_cn": "{{ fallbackTitleCn }}",
-            "current_title_en": "{{ fallbackTitleEn }}",
-            "source_links": "{{ sourceLinks[:5] }}",
-            "sku_entries": "{{ skuEntries[:30] }}",
-        },
-        "required_json": {
-            "title_cn": "optimized Chinese title",
-            "title_en": "optimized English title, 50-200 characters preferred",
-        },
-    }
-    return "\n\n".join(
-        [
-            "System:\n"
-            "You are a Temu marketplace listing title optimizer. Follow the user's listing optimization rules. "
-            "Return strict JSON only. Do not include markdown. Do not invent brands, platform names, certification claims, "
-            "medical claims, absolute guarantees, price or discount words.",
-            f"User payload template:\n{_json_template(user_payload)}",
-            f"Listing optimization rules file:\n{load_listing_prompt()}",
-        ]
-    )
 
 
 def _title_split_prompt_content() -> str:
@@ -316,25 +278,13 @@ def _visual_image_prompt_content() -> str:
 def list_admin_prompt_configs() -> list[dict[str, Any]]:
     items = [
         AdminPromptConfig(
-            id="title",
-            stage="title",
-            title="标题生成",
-            description="根据商品标题、SKU、来源链接生成中文标题和英文标题。",
-            model_key="OPENAI_TITLE_MODEL",
-            source="backend/app/modules/creative_generation/listing_title_optimizer.py + backend/config/prompts/listing_optimization.md",
-            input_from="商品池/链接列表记录、SKU、来源商品标题",
-            output_to="商品中文标题、英文标题",
-            variables=("productId", "fallbackTitleCn", "fallbackTitleEn", "sourceLinks", "skuEntries"),
-            content=_title_prompt_content(),
-        ),
-        AdminPromptConfig(
             id="title_split",
             stage="title_split",
             title="标题拆分",
             description="把商品标题压缩成适合 1688 搜索的中文采购关键词。",
             model_key="OPENAI_TITLE_SPLIT_MODEL",
             source="backend/app/modules/sourcing_1688/title_keywords.py",
-            input_from="标题生成/商品原始标题、类目",
+            input_from="商品分析标题/商品原始标题、类目",
             output_to="1688 primary_keyword、关键词候选、被移除噪音词",
             variables=("productTitle", "category"),
             content=_title_split_prompt_content(),

@@ -61,31 +61,28 @@ class ApiRouteStageDefinition:
 
 
 SETTING_DEFINITIONS: tuple[SettingDefinition, ...] = (
-    SettingDefinition("OPENAI_API_KEY", "ai", "OpenAI API Key", "初凡AI / OpenAI 兼容 API 密钥", is_secret=True),
-    SettingDefinition("OPENAI_BASE_URL", "ai", "OpenAI Base URL", "初凡AI 地址，例如 https://api.aicoming.top/v1"),
+    SettingDefinition("OPENAI_API_KEY", "ai", "通用 API 密钥", "初凡 AI / OpenAI 兼容 API 密钥", is_secret=True),
+    SettingDefinition("OPENAI_BASE_URL", "ai", "通用接口地址", "初凡 AI 地址，例如 https://api.aicoming.top/v1"),
     SettingDefinition("OPENAI_TEXT_MODEL", "ai", "文本模型", "用于标题、关键词、提示词分析", "gpt-5.5"),
-    SettingDefinition("OPENAI_TITLE_API_KEY", "ai", "Title API Key", "标题生成专用 API Key，留空继承通用 OPENAI_API_KEY", is_secret=True),
-    SettingDefinition("OPENAI_TITLE_BASE_URL", "ai", "Title Base URL", "标题生成专用接口地址，留空继承通用 OPENAI_BASE_URL"),
-    SettingDefinition("OPENAI_TITLE_MODEL", "ai", "标题生成模型", "用于中文标题、英文标题、变种值英文翻译", "gpt-5.5"),
-    SettingDefinition("OPENAI_TITLE_SPLIT_API_KEY", "ai", "Title Split API Key", "标题拆分专用 API Key，留空继承通用 OPENAI_API_KEY", is_secret=True),
-    SettingDefinition("OPENAI_TITLE_SPLIT_BASE_URL", "ai", "Title Split Base URL", "标题拆分专用接口地址，留空继承通用 OPENAI_BASE_URL"),
+    SettingDefinition("OPENAI_TITLE_SPLIT_API_KEY", "ai", "标题拆分 API 密钥", "标题拆分专用 API 密钥，留空继承通用 OPENAI_API_KEY", is_secret=True),
+    SettingDefinition("OPENAI_TITLE_SPLIT_BASE_URL", "ai", "标题拆分接口地址", "标题拆分专用接口地址，留空继承通用 OPENAI_BASE_URL"),
     SettingDefinition("OPENAI_TITLE_SPLIT_MODEL", "ai", "标题拆分模型", "用于把商品标题拆成 1688 采购搜索关键词", "gpt-5.5"),
-    SettingDefinition("OPENAI_RECOMMENDATION_API_KEY", "ai", "Recommendation API Key", "智能推荐专用 API Key，留空继承通用 OPENAI_API_KEY", is_secret=True),
-    SettingDefinition("OPENAI_RECOMMENDATION_BASE_URL", "ai", "Recommendation Base URL", "智能推荐专用接口地址，留空继承通用 OPENAI_BASE_URL"),
+    SettingDefinition("OPENAI_RECOMMENDATION_API_KEY", "ai", "智能推荐 API 密钥", "智能推荐专用 API 密钥，留空继承通用 OPENAI_API_KEY", is_secret=True),
+    SettingDefinition("OPENAI_RECOMMENDATION_BASE_URL", "ai", "智能推荐接口地址", "智能推荐专用接口地址，留空继承通用 OPENAI_BASE_URL"),
     SettingDefinition("OPENAI_RECOMMENDATION_MODEL", "ai", "智能推荐模型", "用于商品标题、类目、图片分析和推荐关键词", "gpt-5.5"),
-    SettingDefinition("OPENAI_PRODUCT_ATTRIBUTE_API_KEY", "ai", "Product Attribute API Key", "产品属性填写专用 API Key，留空继承通用 OPENAI_API_KEY", is_secret=True),
-    SettingDefinition("OPENAI_PRODUCT_ATTRIBUTE_BASE_URL", "ai", "Product Attribute Base URL", "产品属性填写专用接口地址，留空继承通用 OPENAI_BASE_URL"),
+    SettingDefinition("OPENAI_PRODUCT_ATTRIBUTE_API_KEY", "ai", "产品属性 API 密钥", "产品属性填写专用 API 密钥，留空继承通用 OPENAI_API_KEY", is_secret=True),
+    SettingDefinition("OPENAI_PRODUCT_ATTRIBUTE_BASE_URL", "ai", "产品属性接口地址", "产品属性填写专用接口地址，留空继承通用 OPENAI_BASE_URL"),
     SettingDefinition("OPENAI_PRODUCT_ATTRIBUTE_MODEL", "ai", "产品属性填写模型", "导出时根据商品类目属性库、商品标题和 SKU 信息填写产品属性", "gpt-5.5"),
-    SettingDefinition("OPENAI_VISUAL_ANALYSIS_API_KEY", "ai", "Visual Analysis API Key", "图片理解专用 API Key，留空继承通用 OPENAI_API_KEY", is_secret=True),
-    SettingDefinition("OPENAI_VISUAL_ANALYSIS_BASE_URL", "ai", "Visual Analysis Base URL", "图片理解专用接口地址，留空继承通用 OPENAI_BASE_URL"),
+    SettingDefinition("OPENAI_VISUAL_ANALYSIS_API_KEY", "ai", "图片理解 API 密钥", "图片理解专用 API 密钥，留空继承通用 OPENAI_API_KEY", is_secret=True),
+    SettingDefinition("OPENAI_VISUAL_ANALYSIS_BASE_URL", "ai", "图片理解接口地址", "图片理解专用接口地址，留空继承通用 OPENAI_BASE_URL"),
     SettingDefinition("OPENAI_VISUAL_ANALYSIS_MODEL", "ai", "图片理解模型", "生图前分析主体、材质、结构、风险和画风", "gpt-5.5"),
-    SettingDefinition("OPENAI_VISUAL_PROMPT_API_KEY", "ai", "Prompt Plan API Key", "提示词规划专用 API Key，留空继承通用 OPENAI_API_KEY", is_secret=True),
-    SettingDefinition("OPENAI_VISUAL_PROMPT_BASE_URL", "ai", "Prompt Plan Base URL", "提示词规划专用接口地址，留空继承通用 OPENAI_BASE_URL"),
+    SettingDefinition("OPENAI_VISUAL_PROMPT_API_KEY", "ai", "提示词规划 API 密钥", "提示词规划专用 API 密钥，留空继承通用 OPENAI_API_KEY", is_secret=True),
+    SettingDefinition("OPENAI_VISUAL_PROMPT_BASE_URL", "ai", "提示词规划接口地址", "提示词规划专用接口地址，留空继承通用 OPENAI_BASE_URL"),
     SettingDefinition("OPENAI_VISUAL_PROMPT_MODEL", "ai", "提示词规划模型", "把分析结果转成九宫格或四宫格母图提示词", "gpt-5.5"),
-    SettingDefinition("OPENAI_IMAGE_API_KEY", "ai", "Image API Key", "图片生成专用 API Key，留空继承通用 OPENAI_API_KEY", is_secret=True),
-    SettingDefinition("OPENAI_IMAGE_BASE_URL", "ai", "Image Base URL", "图片生成专用接口地址，留空继承通用 OPENAI_BASE_URL"),
+    SettingDefinition("OPENAI_IMAGE_API_KEY", "ai", "图片生成 API 密钥", "图片生成专用 API 密钥，留空继承通用 OPENAI_API_KEY", is_secret=True),
+    SettingDefinition("OPENAI_IMAGE_BASE_URL", "ai", "图片生成接口地址", "图片生成专用接口地址，留空继承通用 OPENAI_BASE_URL"),
     SettingDefinition("OPENAI_IMAGE_MODEL", "ai", "生图模型", "用于 API 生图备选方案", "gpt-image-2-1k"),
-    SettingDefinition("OPENAI_IMAGE_QUALITY", "ai", "生图质量", "low / medium / high", "medium"),
+    SettingDefinition("OPENAI_IMAGE_QUALITY", "ai", "生图质量", "可填 low / medium / high", "medium"),
     SettingDefinition("VISUAL_DEFAULT_MODE", "visual", "默认生图模式", "main-gallery / sku-gallery / single-refine", "main-gallery"),
     SettingDefinition("VISUAL_DEFAULT_LAYOUT", "visual", "默认母图布局", "1x1 / 2x2 / 3x3，对应单图、四宫格、九宫格", "3x3"),
     SettingDefinition("VISUAL_DEFAULT_REQUESTED_COUNT", "visual", "默认模块数量", "创建任务时默认需要生成的图片数量，1-9", "9"),
@@ -99,25 +96,25 @@ SETTING_DEFINITIONS: tuple[SettingDefinition, ...] = (
     SettingDefinition("VISUAL_SPLIT_QUALITY", "visual", "切图压缩质量", "1-100，webp/jpg 生效", "92"),
     SettingDefinition("VISUAL_SPLIT_SAFE_MARGIN_RATIO", "visual", "切图安全边距", "每个宫格裁切时避开边缘的比例，建议 0.03", "0.03"),
     SettingDefinition("VISUAL_SPLIT_SHARPEN", "visual", "切图锐化强度", "0 表示不锐化，建议 0.7", "0.7"),
-    SettingDefinition("REDIS_URL", "visual", "Redis URL", "Redis queue/cache URL, e.g. redis://127.0.0.1:6379/0", is_secret=True),
-    SettingDefinition("VISUAL_QUEUE_REDIS_ENABLED", "visual", "Visual Redis Queue", "1 enables Redis-backed visual task queue; 0 falls back to FastAPI background task", "0"),
-    SettingDefinition("VISUAL_QUEUE_NAME", "visual", "Visual Queue Name", "Redis list key for visual generation jobs", "visual:tasks:queue"),
-    SettingDefinition("VISUAL_QUEUE_DRAIN_MAX_JOBS", "visual", "Visual Queue Drain Jobs", "Max jobs drained by one auto-start worker pass", "10"),
-    SettingDefinition("VISUAL_QUEUE_WORKER_LOCK_SECONDS", "visual", "Visual Worker Lock TTL", "Seconds to hold the single worker drain lock", "3600"),
-    SettingDefinition("VISUAL_QUEUE_POP_TIMEOUT_SECONDS", "visual", "Visual Queue Pop Timeout", "Seconds to wait for one Redis queue pop", "1"),
-    SettingDefinition("VISUAL_QUEUE_RETRY_NAME", "visual", "Visual Retry Queue Name", "Redis sorted-set key for delayed visual retries", "visual:tasks:retry"),
-    SettingDefinition("VISUAL_QUEUE_DEAD_NAME", "visual", "Visual Dead Queue Name", "Redis list key for failed visual jobs after retries", "visual:tasks:dead"),
-    SettingDefinition("VISUAL_QUEUE_MAX_RETRIES", "visual", "Visual Queue Max Retries", "Max retry attempts for one visual job", "2"),
-    SettingDefinition("VISUAL_QUEUE_RETRY_DELAY_SECONDS", "visual", "Visual Queue Retry Delay", "Seconds to wait before retrying failed visual job", "30"),
+    SettingDefinition("REDIS_URL", "visual", "Redis 连接地址", "Redis 队列/缓存连接地址，例如 redis://127.0.0.1:6379/0", is_secret=True),
+    SettingDefinition("VISUAL_QUEUE_REDIS_ENABLED", "visual", "启用 Redis 生图队列", "1 表示启用 Redis 生图任务队列；0 表示使用 FastAPI 后台任务兜底", "0"),
+    SettingDefinition("VISUAL_QUEUE_NAME", "visual", "生图任务队列名称", "Redis 中保存生图任务的列表键名", "visual:tasks:queue"),
+    SettingDefinition("VISUAL_QUEUE_DRAIN_MAX_JOBS", "visual", "单轮拉取任务数", "自动启动的 Worker 每轮最多拉取的任务数量", "10"),
+    SettingDefinition("VISUAL_QUEUE_WORKER_LOCK_SECONDS", "visual", "Worker 锁定时长", "单个 Worker 抢占队列锁的保持秒数", "3600"),
+    SettingDefinition("VISUAL_QUEUE_POP_TIMEOUT_SECONDS", "visual", "队列取任务超时", "每次从 Redis 队列等待取出任务的秒数", "1"),
+    SettingDefinition("VISUAL_QUEUE_RETRY_NAME", "visual", "生图重试队列名称", "Redis 中保存延迟重试生图任务的有序集合键名", "visual:tasks:retry"),
+    SettingDefinition("VISUAL_QUEUE_DEAD_NAME", "visual", "生图失败队列名称", "重试耗尽后保存失败生图任务的 Redis 列表键名", "visual:tasks:dead"),
+    SettingDefinition("VISUAL_QUEUE_MAX_RETRIES", "visual", "生图最大重试次数", "单个生图任务失败后最多自动重试的次数", "2"),
+    SettingDefinition("VISUAL_QUEUE_RETRY_DELAY_SECONDS", "visual", "生图重试等待秒数", "生图任务失败后等待多久再重试", "30"),
     SettingDefinition("VISUAL_USER_CONCURRENCY_LIMIT", "visual", "成员任务并发限制", "单个成员同时运行的生图任务数量，也控制清单导出时商品链接并行处理数；超过后生图进入等待队列；0 表示不限制", "5"),
     SettingDefinition("VISUAL_TEAM_CONCURRENCY_LIMIT", "visual", "团队并发生图限制", "同一管理员团队同时运行的视觉任务数量；超过后新任务进入等待队列；0 表示不限制", "5"),
     SettingDefinition("TMAPI_API_TOKEN", "1688", "1688 搜图 API Token", "TMAPI 或同类 1688 搜图服务 Token", is_secret=True),
-    SettingDefinition("TMAPI_BASE_URL", "1688", "1688 API Base URL", "默认 http://api.tmapi.top", "http://api.tmapi.top"),
+    SettingDefinition("TMAPI_BASE_URL", "1688", "1688 API 接口地址", "默认 http://api.tmapi.top", "http://api.tmapi.top"),
     SettingDefinition("ALIYUN_OSS_ENABLED", "oss", "启用 OSS", "1 表示启用，0 表示关闭", "0"),
-    SettingDefinition("ALIYUN_OSS_ACCESS_KEY_ID", "oss", "OSS AccessKey ID", "阿里云 OSS 访问 ID", is_secret=True),
-    SettingDefinition("ALIYUN_OSS_ACCESS_KEY_SECRET", "oss", "OSS AccessKey Secret", "阿里云 OSS 访问密钥", is_secret=True),
-    SettingDefinition("ALIYUN_OSS_ENDPOINT", "oss", "OSS Endpoint", "例如 oss-cn-beijing.aliyuncs.com"),
-    SettingDefinition("ALIYUN_OSS_BUCKET", "oss", "OSS Bucket", "图片 Bucket 名称"),
+    SettingDefinition("ALIYUN_OSS_ACCESS_KEY_ID", "oss", "OSS 访问 ID", "阿里云 OSS 访问 ID", is_secret=True),
+    SettingDefinition("ALIYUN_OSS_ACCESS_KEY_SECRET", "oss", "OSS 访问密钥", "阿里云 OSS 访问密钥", is_secret=True),
+    SettingDefinition("ALIYUN_OSS_ENDPOINT", "oss", "OSS 节点地址", "例如 oss-cn-beijing.aliyuncs.com"),
+    SettingDefinition("ALIYUN_OSS_BUCKET", "oss", "OSS 存储桶", "图片存储桶名称"),
     SettingDefinition("ALIYUN_OSS_PUBLIC_BASE_URL", "oss", "OSS 公网 URL", "不填时按 bucket + endpoint 自动生成"),
     SettingDefinition("ALIYUN_OSS_OBJECT_PREFIX", "oss", "OSS 文件前缀", "图片存储目录前缀", "temu-listing"),
 )
@@ -135,14 +132,6 @@ API_CHANNEL_DEFINITIONS: tuple[ApiChannelDefinition, ...] = (
 )
 
 API_ROUTE_STAGE_DEFINITIONS: tuple[ApiRouteStageDefinition, ...] = (
-    ApiRouteStageDefinition(
-        "title",
-        "标题生成",
-        "中文标题、英文标题、变种值英文翻译",
-        "OPENAI_TITLE_API_KEY",
-        "OPENAI_TITLE_BASE_URL",
-        "OPENAI_TITLE_MODEL",
-    ),
     ApiRouteStageDefinition(
         "title_split",
         "标题拆分",
@@ -193,6 +182,22 @@ API_ROUTE_STAGE_DEFINITIONS: tuple[ApiRouteStageDefinition, ...] = (
         "image",
     ),
 )
+
+
+LEGACY_TITLE_SETTING_KEYS = {
+    "OPENAI_TITLE_API_KEY",
+    "OPENAI_TITLE_BASE_URL",
+    "OPENAI_TITLE_MODEL",
+}
+LEGACY_TITLE_STAGE_IDS = {"title"}
+
+
+def visible_setting_definitions() -> tuple[SettingDefinition, ...]:
+    return tuple(definition for definition in SETTING_DEFINITIONS if definition.key not in LEGACY_TITLE_SETTING_KEYS)
+
+
+def active_api_route_stage_definitions() -> tuple[ApiRouteStageDefinition, ...]:
+    return tuple(definition for definition in API_ROUTE_STAGE_DEFINITIONS if definition.id not in LEGACY_TITLE_STAGE_IDS)
 
 
 class AdminUserCreateRequest(BaseModel):
@@ -401,7 +406,7 @@ def admin_update_user_api_credentials(
 @router.get("/settings")
 def admin_list_settings(_admin: dict[str, Any] = Depends(require_admin_user)):
     saved_settings = get_app_settings_map()
-    return {"items": [serialize_setting(definition, saved_settings.get(definition.key)) for definition in SETTING_DEFINITIONS]}
+    return {"items": [serialize_setting(definition, saved_settings.get(definition.key)) for definition in visible_setting_definitions()]}
 
 
 @router.get("/api-usage")
@@ -440,7 +445,7 @@ def admin_apply_api_channel(
     payload: AdminApiRouteApplyRequest,
     admin: dict[str, Any] = Depends(require_admin_user),
 ):
-    stage = {definition.id: definition for definition in API_ROUTE_STAGE_DEFINITIONS}.get(
+    stage = {definition.id: definition for definition in active_api_route_stage_definitions()}.get(
         normalize_api_identifier(payload.stage)
     )
     if not stage:
@@ -471,7 +476,7 @@ def admin_apply_api_channel_to_all(
 
     saved_settings = get_app_settings_map()
     channel_values = api_channel_runtime_values(channel, saved_settings)
-    for stage in API_ROUTE_STAGE_DEFINITIONS:
+    for stage in active_api_route_stage_definitions():
         apply_api_channel_to_stage(stage, channel, channel_values, admin["id"])
     return serialize_api_channel_bundle()
 
@@ -481,7 +486,7 @@ def admin_update_settings(
     payload: AdminSettingsUpdateRequest,
     admin: dict[str, Any] = Depends(require_admin_user),
 ):
-    definitions = {definition.key: definition for definition in SETTING_DEFINITIONS}
+    definitions = {definition.key: definition for definition in visible_setting_definitions()}
     saved_settings = get_app_settings_map()
     updated = []
     for item in payload.items:
@@ -507,7 +512,7 @@ def admin_update_settings(
         updated.append(serialize_setting(definition, updated_setting, previous_value=existing_value))
 
     return {
-        "items": [serialize_setting(definition, saved_settings.get(definition.key)) for definition in SETTING_DEFINITIONS],
+        "items": [serialize_setting(definition, saved_settings.get(definition.key)) for definition in visible_setting_definitions()],
         "updated": updated,
     }
 
@@ -542,7 +547,7 @@ def serialize_setting(
 def serialize_api_channel_bundle() -> dict[str, Any]:
     saved_settings = get_app_settings_map()
     channels = [serialize_api_channel(definition, saved_settings) for definition in API_CHANNEL_DEFINITIONS]
-    routes = [serialize_api_route(stage, saved_settings) for stage in API_ROUTE_STAGE_DEFINITIONS]
+    routes = [serialize_api_route(stage, saved_settings) for stage in active_api_route_stage_definitions()]
     return {"channels": channels, "routes": routes}
 
 
@@ -763,7 +768,7 @@ def update_api_channel(
             key=api_channel_setting_key(definition, "API_KEY"),
             value=item.apiKey.strip(),
             category="ai_channel",
-            label=f"{definition.name} API Key",
+            label=f"{definition.name} API 密钥",
             description="管理员后台 API 渠道密钥",
             is_secret=True,
             updated_by=admin_id,
@@ -773,7 +778,7 @@ def update_api_channel(
             key=api_channel_setting_key(definition, "API_KEY"),
             value="",
             category="ai_channel",
-            label=f"{definition.name} API Key",
+            label=f"{definition.name} API 密钥",
             description="管理员后台 API 渠道密钥",
             is_secret=True,
             updated_by=admin_id,
@@ -783,7 +788,7 @@ def update_api_channel(
             key=api_channel_setting_key(definition, "BASE_URL"),
             value=item.baseUrl.strip().rstrip("/"),
             category="ai_channel",
-            label=f"{definition.name} Base URL",
+            label=f"{definition.name} 接口地址",
             description="OpenAI 兼容接口地址",
             updated_by=admin_id,
         )
@@ -833,9 +838,9 @@ def apply_api_channel_to_stage(
         return
 
     if not channel_values["apiKey"]:
-        raise HTTPException(status_code=400, detail=f"{channel_values['name']} 还没有配置 API Key")
+        raise HTTPException(status_code=400, detail=f"{channel_values['name']} 还没有配置 API 密钥")
     if not channel_values["baseUrl"]:
-        raise HTTPException(status_code=400, detail=f"{channel_values['name']} 还没有配置 Base URL")
+        raise HTTPException(status_code=400, detail=f"{channel_values['name']} 还没有配置接口地址")
 
     upsert_defined_setting(stage.api_key_key, channel_values["apiKey"], admin_id)
     upsert_defined_setting(stage.base_url_key, channel_values["baseUrl"], admin_id)

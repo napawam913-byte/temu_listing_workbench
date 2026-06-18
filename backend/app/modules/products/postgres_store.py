@@ -61,6 +61,8 @@ def list_products(
     sales_max: int | None = None,
     gmv_min: float | None = None,
     gmv_max: float | None = None,
+    pool_added_start: str | None = None,
+    pool_added_end: str | None = None,
     scope: str = "pool",
     sort_by: str | None = None,
     sort_order: str | None = None,
@@ -83,6 +85,12 @@ def list_products(
         where.append("membership.user_id = %s")
         where.append("membership.status != 'deleted'")
         params.append(user_id)
+        if pool_added_start:
+            where.append("NULLIF(membership.created_at, '')::timestamp >= %s::timestamp")
+            params.append(pool_added_start)
+        if pool_added_end:
+            where.append("NULLIF(membership.created_at, '')::timestamp < (%s::date + INTERVAL '1 day')")
+            params.append(pool_added_end)
         from_sql = """
             products
             JOIN product_pool_memberships AS membership
@@ -97,15 +105,16 @@ def list_products(
     safe_page_size = max(1, min(100, page_size))
     offset = (safe_page - 1) * safe_page_size
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
-    order_sql = build_product_order_sql(sort_by, sort_order)
+    order_sql = build_product_order_sql(sort_by, sort_order, scope=scope)
 
     with get_pg_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(f"SELECT COUNT(*) AS count FROM {from_sql} {where_sql}", params)
             total = int(cur.fetchone()["count"] or 0)
+            pool_added_select = "membership.created_at AS pool_added_at" if scope == "pool" else "NULL AS pool_added_at"
             cur.execute(
                 f"""
-                SELECT products.*
+                SELECT products.*, {pool_added_select}
                 FROM {from_sql}
                 {where_sql}
                 ORDER BY {order_sql}
@@ -484,9 +493,13 @@ def add_range_filter(
         params.append(maximum)
 
 
-def build_product_order_sql(sort_by: str | None, sort_order: str | None) -> str:
+def build_product_order_sql(sort_by: str | None, sort_order: str | None, *, scope: str = "pool") -> str:
     direction = "ASC" if sort_order == "asc" else "DESC"
-    listing_time = "NULLIF(products.listing_time, '')::timestamp DESC NULLS LAST"
+    listing_time = (
+        "NULLIF(membership.created_at, '')::timestamp DESC NULLS LAST"
+        if scope == "pool"
+        else "NULLIF(products.listing_time, '')::timestamp DESC NULLS LAST"
+    )
     if sort_by == "price":
         return f"products.price_usd {direction}, {listing_time}, products.gmv_usd DESC"
     if sort_by == "gmv":
@@ -532,6 +545,7 @@ def product_row_to_api(row: dict[str, Any]) -> dict[str, Any]:
         "monthly_sales": row.get("monthly_sales"),
         "review_count": row.get("review_count"),
         "listing_time": row.get("listing_time"),
+        "pool_added_at": row.get("pool_added_at"),
         "status": row.get("status"),
         "in_product_pool": bool(row.get("in_product_pool", True)),
         "source_row_index": row.get("source_row_index"),

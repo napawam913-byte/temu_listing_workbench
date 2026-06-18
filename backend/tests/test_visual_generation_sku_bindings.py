@@ -10,10 +10,13 @@ from app.modules.visual_generation.service import (
     TASK_STATUS_FAILED,
     TASK_STATUS_RETRY_WAITING,
     VISUAL_PROMPT_LOGIC_VERSION,
+    apply_visual_product_identity_to_record,
+    apply_visual_sku_identity_rewrites,
     build_visual_prompt_context,
     ensure_visual_generation_schema,
     mark_task_failed,
     mark_task_retry_waiting,
+    normalize_visual_product_identity,
     run_visual_task_pipeline,
     visual_task_prompt_is_stale,
 )
@@ -690,6 +693,258 @@ class VisualGenerationSkuBindingTest(unittest.TestCase):
         self.assertIn("six-sided rounded cube-style die must not become", mother_prompt)
         self.assertIn("twelve-sided/dodecahedron wooden die", mother_prompt)
         self.assertIn("2pcs must remain two six-sided rounded cube-style dice", mother_prompt)
+
+    def test_prompt_uses_general_material_and_appearance_identity_lock(self):
+        analysis_instruction = build_product_analysis_instruction(
+            {
+                "productTitle": "Reference product",
+                "skuReferenceBindings": [
+                    {
+                        "referenceImageIndex": 1,
+                        "skuName": "1 Pack",
+                        "sourceProductTitle": "selected source product",
+                    }
+                ],
+            }
+        )
+        self.assertIn("material attributes", analysis_instruction)
+        self.assertIn("reference images have 70% authority", analysis_instruction)
+        self.assertIn("reference images have 100% authority", analysis_instruction)
+        self.assertIn("title/SKU/source text has 0% authority", analysis_instruction)
+        self.assertIn("title text may only support function/use/occasion", analysis_instruction)
+        self.assertIn("soft flexible material into smooth rigid material", analysis_instruction)
+        self.assertIn("Never borrow another source product title", analysis_instruction)
+        self.assertIn("exact side count unknown", analysis_instruction)
+        self.assertIn("body form, silhouette, proportions, physical construction", analysis_instruction)
+        self.assertIn("do not change material", analysis_instruction)
+        self.assertIn("do not replace the product with another object type", analysis_instruction)
+        self.assertIn("Listing title generation rules migrated into this product analysis stage", analysis_instruction)
+        self.assertIn("There is no later separate title-generation step", analysis_instruction)
+        self.assertIn("productIdentity.title_cn and productIdentity.title_en are the final listing titles", analysis_instruction)
+
+        mother_prompt = build_mother_prompt_from_plan(
+            {
+                "productUnderstanding": {
+                    "productTitle": "Reference product",
+                    "referenceAnalyses": [
+                        {
+                            "index": 1,
+                            "visualIdentity": "selected product with exact visible material and shape",
+                            "silhouette": "reference silhouette",
+                            "shape": "reference body shape",
+                            "geometry": "reference geometry",
+                            "materials": ["reference material"],
+                            "visibleComponents": ["reference component"],
+                            "mustPreserve": ["exact material attributes", "exact body shape", "component relationship"],
+                            "doNotChange": ["do not change material", "do not change body shape"],
+                        }
+                    ],
+                    "globalMustPreserve": ["exact material attributes and appearance"],
+                    "globalDoNotChange": ["do not transform into another object type"],
+                },
+                "visualTaskPlan": {
+                    "requestedCount": 1,
+                    "layout": "1x1",
+                    "modules": [
+                        {
+                            "position": 1,
+                            "slotType": "detail-texture",
+                            "title": "Product Detail",
+                            "purpose": "explain product material and construction",
+                            "targetSkuName": "1 Pack",
+                            "visualIdentityLock": "Keep the exact material attributes, body shape, proportions, construction, and component relationship.",
+                        }
+                    ],
+                },
+                "panelPromptPlan": {
+                    "panels": [
+                        {
+                            "position": 1,
+                            "slotType": "detail-texture",
+                            "targetSkuName": "1 Pack",
+                            "panelPrompt": "Show the selected product construction.",
+                        }
+                    ]
+                },
+            },
+            "1x1",
+        )
+        self.assertIn("Product identity lock", mother_prompt)
+        self.assertIn("material attributes, surface finish, tactile texture", mother_prompt)
+        self.assertIn("Titles may support function/use/occasion copy only", mother_prompt)
+        self.assertIn("never transform the selected product into another object type", mother_prompt)
+        self.assertIn("Copy truth lock", mother_prompt)
+
+    def test_visual_completion_rewrites_quantity_only_sku_names_from_analysis(self):
+        record = {
+            "id": "record-dice",
+            "productId": "product-dice",
+            "productTitle": "Mixed dice options",
+            "skuEntries": [
+                {
+                    "id": "sku-white",
+                    "kind": "single",
+                    "name": "2pcs",
+                    "componentSkus": [{"name": "2pcs", "specText": "Quantity: 2pcs"}],
+                },
+                {
+                    "id": "sku-wood",
+                    "kind": "single",
+                    "name": "1 Pack",
+                    "componentSkus": [{"name": "1 Pack", "specText": "Pack: 1 Pack"}],
+                },
+            ],
+        }
+        task = {
+            "id": "visual-dice",
+            "analysis": {
+                "productUnderstanding": {
+                    "referenceAnalyses": [
+                        {
+                            "index": 1,
+                            "visualIdentity": "two white printed dice",
+                            "geometry": "six-sided rounded cube-style die",
+                            "facetOrSideCount": "6 sides",
+                            "colors": ["white"],
+                            "printedPattern": "printed icons and text",
+                        },
+                        {
+                            "index": 2,
+                            "visualIdentity": "one natural wood die",
+                            "geometry": "twelve-sided dodecahedron-style die",
+                            "facetOrSideCount": "12 sides",
+                            "materials": ["wood"],
+                        },
+                    ]
+                },
+                "skuBindings": [
+                    {
+                        "skuIndex": 1,
+                        "skuName": "2pcs",
+                        "skuKind": "single",
+                        "components": [
+                            {
+                                "componentIndex": 1,
+                                "componentName": "2pcs",
+                                "specText": "Quantity: 2pcs",
+                                "sourceTitle": "2pcs decision dice",
+                                "referenceImageIndex": 1,
+                            }
+                        ],
+                    },
+                    {
+                        "skuIndex": 2,
+                        "skuName": "1 Pack",
+                        "skuKind": "single",
+                        "components": [
+                            {
+                                "componentIndex": 1,
+                                "componentName": "1 Pack",
+                                "specText": "Pack: 1 Pack",
+                                "sourceTitle": "1 Pack wooden D12 die",
+                                "referenceImageIndex": 2,
+                            }
+                        ],
+                    },
+                ],
+            },
+        }
+
+        rewritten = apply_visual_sku_identity_rewrites(record, task)
+
+        self.assertEqual(rewritten["skuEntries"][0]["name"], "2pcs White Printed Six-Sided Dice")
+        self.assertEqual(rewritten["skuEntries"][0]["originalName"], "2pcs")
+        self.assertEqual(rewritten["skuEntries"][0]["visualGeneratedName"], "2pcs White Printed Six-Sided Dice")
+        self.assertEqual(rewritten["skuEntries"][0]["componentSkus"][0]["name"], "2pcs White Printed Six-Sided Dice")
+        self.assertEqual(rewritten["skuEntries"][1]["name"], "1 Pack Wooden D12 Die")
+        self.assertEqual(rewritten["skuEntries"][1]["originalName"], "1 Pack")
+
+    def test_product_analysis_normalizes_reusable_identity_json(self):
+        record = {
+            "productTitle": "1个木质十二面骰子 + 2个白色印花骰子",
+            "skuEntries": [{"name": "2pcs"}, {"name": "1 Pack"}],
+        }
+        context = {
+            "skuBindings": [
+                {
+                    "skuIndex": 1,
+                    "skuName": "2pcs",
+                    "components": [
+                        {
+                            "componentIndex": 1,
+                            "componentName": "2pcs",
+                            "sourceTitle": "2pcs white printed decision dice",
+                            "referenceImageIndex": 1,
+                        }
+                    ],
+                },
+                {
+                    "skuIndex": 2,
+                    "skuName": "1 Pack",
+                    "components": [
+                        {
+                            "componentIndex": 1,
+                            "componentName": "1 Pack",
+                            "sourceTitle": "1 Pack wooden D12 die",
+                            "referenceImageIndex": 2,
+                        }
+                    ],
+                },
+            ]
+        }
+        analysis = {
+            "overallCategory": "Dice Set",
+            "referenceAnalyses": [
+                {
+                    "index": 1,
+                    "visualIdentity": "two white printed dice",
+                    "geometry": "six-sided rounded cube-style die",
+                    "facetOrSideCount": "6 sides",
+                    "colors": ["white"],
+                    "printedPattern": "printed icons and text",
+                },
+                {
+                    "index": 2,
+                    "visualIdentity": "one natural wood die",
+                    "geometry": "twelve-sided dodecahedron-style die",
+                    "facetOrSideCount": "12 sides",
+                    "materials": ["wood"],
+                },
+            ],
+        }
+
+        normalized = normalize_visual_product_identity(record=record, product_analysis=analysis, context=context)
+
+        identity = normalized["productIdentity"]
+        self.assertEqual(identity["product_type"], "Dice Set")
+        self.assertEqual(identity["skus"][0]["standard_name"], "2pcs White Printed Six-Sided Dice")
+        self.assertEqual(identity["skus"][1]["standard_name"], "1 Pack Wooden D12 Die")
+        self.assertIn("White Printed Six-Sided Dice", identity["title_en"])
+        self.assertIn("Wooden D12 Die", identity["title_en"])
+
+    def test_visual_product_identity_is_written_back_to_record(self):
+        record = {"id": "record-1", "skuEntries": []}
+        task = {
+            "id": "visual-1",
+            "analysis": {
+                "productUnderstanding": {
+                    "productIdentity": {
+                        "product_type": "Dice Set",
+                        "title_cn": "木质十二面骰子与白色印花骰子组合套装",
+                        "title_en": "Wooden D12 Die and White Printed Six-Sided Dice Set",
+                        "skus": [
+                            {"sku_index": 1, "standard_name": "2pcs White Printed Six-Sided Dice"},
+                        ],
+                    }
+                }
+            },
+        }
+
+        updated = apply_visual_product_identity_to_record(record, task)
+
+        self.assertEqual(updated["visualGeneratedProductType"], "Dice Set")
+        self.assertEqual(updated["visualGeneratedTitleEn"], "Wooden D12 Die and White Printed Six-Sided Dice Set")
+        self.assertEqual(updated["visualProductIdentity"]["skus"][0]["standard_name"], "2pcs White Printed Six-Sided Dice")
 
 
 if __name__ == "__main__":

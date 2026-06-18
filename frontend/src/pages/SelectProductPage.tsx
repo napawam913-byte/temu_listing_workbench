@@ -1,7 +1,9 @@
 import {
+  Alert,
   Button,
   Card,
   Checkbox,
+  DatePicker,
   Drawer,
   Empty,
   Form,
@@ -54,8 +56,7 @@ import {
   saveLinkListRecords,
   regeneratePluginCreativeJob,
   syncPluginCreativeJobs,
-  upload1688Links,
-  uploadYunqiFile,
+  uploadDianxiaomiTemplateFile,
 } from '../api/backendApi';
 import type {
   CurrentUser,
@@ -75,8 +76,15 @@ import type { Product, ProductSourceType, SourcingCandidate } from '../types/pro
 
 const { Header, Content } = Layout;
 const { Text } = Typography;
+const { RangePicker } = DatePicker;
 const EXPORT_TEMPLATE_MESSAGE_KEY = 'dianxiaomi-temu-template-export';
 const ALL_CATEGORY_VALUE = '全部类目';
+
+type DateRangeDate = {
+  format: (template: string) => string;
+};
+
+type DateRangeValue = Array<DateRangeDate | null>;
 
 type Filters = {
   keyword?: string;
@@ -87,10 +95,18 @@ type Filters = {
   gmvRange?: string;
 };
 
+type ProductPoolFilters = {
+  keyword?: string;
+  selectedDateRange?: DateRangeValue;
+  priceRange?: string;
+};
+
 const defaultFilters: Filters = {
   period: '全部',
   category: ALL_CATEGORY_VALUE,
 };
+
+const defaultProductPoolFilters: ProductPoolFilters = {};
 
 const PRODUCT_ROUTE_PREFIX = '#/products/';
 
@@ -151,6 +167,36 @@ type VisualQueueItem = {
     statusLabel: string;
     statusColor: string;
   }>;
+};
+
+type ImageManagerGalleryOption = {
+  asset: LinkListImageAsset;
+  imageUrl: string;
+};
+
+type ImageManagerBindingImageOption = ImageManagerGalleryOption & {
+  label: string;
+  sourceLabel: string;
+};
+
+const ACTIVE_VISUAL_BACKEND_STATUSES = new Set(['creating', 'queued', 'running', 'retry_waiting']);
+const LOCAL_VISUAL_QUEUE_FALLBACK_WORKERS = 5;
+const LOCAL_VISUAL_QUEUE_MAX_ATTEMPTS_PER_CLICK = 2;
+
+type SkuImageBindingTarget = {
+  key: string;
+  subjectKey: string;
+  mode: 'sku' | 'component';
+  skuEntryId: string;
+  skuName: string;
+  componentIndex?: number;
+  componentName: string;
+};
+
+type SkuImageBindingSubject = {
+  key: string;
+  label: string;
+  targets: SkuImageBindingTarget[];
 };
 
 const LINK_LIST_STORAGE_KEY = 'temuListingWorkbenchLinkListRecords';
@@ -250,6 +296,27 @@ function matchesRange(value: number, rangeText?: string) {
   const range = parseRangeText(rangeText);
   if (range.min !== undefined && value < range.min) return false;
   if (range.max !== undefined && value > range.max) return false;
+  return true;
+}
+
+function getProductPoolRequestFilters(filters: ProductPoolFilters) {
+  const [start, end] = filters.selectedDateRange || [];
+  return {
+    keyword: filters.keyword?.trim() || undefined,
+    priceRange: filters.priceRange,
+    poolAddedStart: start?.format('YYYY-MM-DD'),
+    poolAddedEnd: end?.format('YYYY-MM-DD'),
+  };
+}
+
+function matchesProductPoolDateRange(product: Product, range?: DateRangeValue) {
+  const [start, end] = range || [];
+  if (!start && !end) return true;
+  const dateValue = product.selectedAt || product.listedAt;
+  if (!dateValue) return false;
+  const normalizedDate = dateValue.slice(0, 10);
+  if (start && normalizedDate < start.format('YYYY-MM-DD')) return false;
+  if (end && normalizedDate > end.format('YYYY-MM-DD')) return false;
   return true;
 }
 
@@ -760,6 +827,46 @@ function getSkuDisplayImageUrl(entry: LinkListRecord['skuEntries'][number]) {
   return getAssetDisplayUrl(entry.imageAsset) || entry.imageUrl;
 }
 
+function normalizeRecordTitleDisplayText(value?: string) {
+  return String(value || '').trim().replace(/\s+/g, ' ');
+}
+
+function getRecordDisplayTitle(record?: LinkListRecord) {
+  if (!record) return '';
+  return (
+    normalizeRecordTitleDisplayText(record.visualGeneratedTitleEn) ||
+    normalizeRecordTitleDisplayText(record.visualGeneratedTitleCn) ||
+    normalizeRecordTitleDisplayText(record.attributeTitleEn) ||
+    normalizeRecordTitleDisplayText(record.productTitleEn) ||
+    normalizeRecordTitleDisplayText(record.attributeTitle) ||
+    normalizeRecordTitleDisplayText(record.productTitle) ||
+    'Untitled product'
+  );
+}
+
+function normalizeSkuDisplayText(value?: string) {
+  return String(value || '').trim().replace(/\s+/g, ' ');
+}
+
+function getSkuEntryDisplayName(entry: LinkListRecord['skuEntries'][number]) {
+  const visualName = normalizeSkuDisplayText(entry.visualGeneratedName);
+  if (visualName) return visualName;
+
+  const componentNames = (entry.componentSkus || [])
+    .map((component) => normalizeSkuDisplayText(component.visualGeneratedName || component.name || component.specText))
+    .filter(Boolean);
+  if (entry.kind === 'combo' && componentNames.length > 0) return componentNames.join(' + ');
+  if (componentNames.length === 1) return componentNames[0];
+
+  const sourceSkuNames = (entry.sourceSkuLinks || [])
+    .map((link) => normalizeSkuDisplayText(link.optionText || link.specText))
+    .filter(Boolean);
+  if (entry.kind === 'combo' && sourceSkuNames.length > 0) return sourceSkuNames.join(' + ');
+  if (sourceSkuNames.length === 1) return sourceSkuNames[0];
+
+  return normalizeSkuDisplayText(entry.name) || `SKU ${entry.order || ''}`.trim();
+}
+
 function getRecordSourceTitle(record: LinkListRecord, sourceId?: string, fallback?: string) {
   const source = sourceId ? record.sourceLinks.find((item) => item.id === sourceId) : undefined;
   return String(source?.title || fallback || '').trim();
@@ -784,7 +891,7 @@ function getSelectedSkuImageRefDescriptors(record: LinkListRecord, selectedSkuId
   };
 
   entries.forEach((entry) => {
-    const skuName = String(entry.name || `SKU ${entry.order || ''}`).trim();
+    const skuName = getSkuEntryDisplayName(entry);
     const components = entry.componentSkus || [];
     const primarySourceLink = (entry.sourceSkuLinks || [])[0];
     const primaryComponent = components[0];
@@ -909,7 +1016,7 @@ function collectRecordImageAssets(record?: LinkListRecord): LinkListImageAsset[]
         role: 'sales-sku',
         sourceUrl: entry.imageUrl,
         displayUrl: entry.imageUrl,
-        alt: entry.name,
+        alt: getSkuEntryDisplayName(entry),
       });
     }
   });
@@ -1003,11 +1110,12 @@ function getRecordPreviewGalleryItems(record?: LinkListRecord) {
 function getRecordProductImageGenerationCount(record?: LinkListRecord) {
   if (!record) return CURATED_EXPORT_IMAGE_COUNT;
   const count = Number(record.productImageGenerationCount);
+  const maxProductImageCount = Math.max(CURATED_EXPORT_IMAGE_COUNT, FULL_MAIN_GALLERY_IMAGE_COUNT);
   if (Number.isFinite(count) && count > 0) {
-    return Math.max(1, Math.min(CURATED_EXPORT_IMAGE_COUNT, Math.floor(count)));
+    return Math.max(1, Math.min(maxProductImageCount, Math.floor(count)));
   }
   const carouselCount = getRecordImageSlots(record).filter((slot) => slot.type === 'carousel').length;
-  return Math.max(1, Math.min(CURATED_EXPORT_IMAGE_COUNT, carouselCount || CURATED_EXPORT_IMAGE_COUNT));
+  return Math.max(1, Math.min(maxProductImageCount, carouselCount || CURATED_EXPORT_IMAGE_COUNT));
 }
 
 function getProductImageKindByOrder(order: number) {
@@ -1081,6 +1189,47 @@ function getVisualReferenceImageOptions(record?: LinkListRecord) {
       seenUrls.add(item.imageUrl);
       return true;
     });
+}
+
+function getSelectedSkuImageBindingOptions(
+  record: LinkListRecord | undefined,
+  selectedSkuIds: string[],
+): ImageManagerBindingImageOption[] {
+  if (!record || selectedSkuIds.length === 0) return [];
+  const selectedSet = new Set(selectedSkuIds);
+  return record.skuEntries
+    .filter((entry) => selectedSet.has(entry.id))
+    .map((entry) => {
+      const sourceAsset = entry.imageAsset && getAssetDisplayUrl(entry.imageAsset) ? entry.imageAsset : undefined;
+      const fallbackSourceLink = (entry.sourceSkuLinks || []).find((link) => link.imageUrl);
+      const fallbackComponent = (entry.componentSkus || []).find((component) => component.imageUrl || component.sourceImageUrl);
+      const imageUrl =
+        getAssetDisplayUrl(sourceAsset) ||
+        entry.imageUrl ||
+        fallbackSourceLink?.imageUrl ||
+        fallbackComponent?.imageUrl ||
+        fallbackComponent?.sourceImageUrl;
+      if (!imageUrl) return undefined;
+      const label = getSkuEntryDisplayName(entry);
+      const asset: LinkListImageAsset = {
+        ...(sourceAsset || {}),
+        id: sourceAsset?.id || `${record.id}-sku-binding-${entry.id}`,
+        role: 'sales-sku',
+        sourceUrl: sourceAsset?.sourceUrl || imageUrl,
+        displayUrl: sourceAsset?.displayUrl || imageUrl,
+        displayCloudUrl: sourceAsset?.displayCloudUrl || sourceAsset?.editedCloudUrl || sourceAsset?.sourceCloudUrl,
+        editedUrl: sourceAsset?.editedUrl,
+        editedCloudUrl: sourceAsset?.editedCloudUrl,
+        alt: sourceAsset?.alt || label,
+      };
+      return {
+        asset,
+        imageUrl,
+        label,
+        sourceLabel: 'SKU 图',
+      };
+    })
+    .filter((item): item is ImageManagerBindingImageOption => Boolean(item));
 }
 
 function updateRecordImageSlot(record: LinkListRecord, slotId: string, assetId: string): LinkListRecord {
@@ -1210,14 +1359,57 @@ function buildSkuImageAsset(record: LinkListRecord, entryId: string, asset: Link
   };
 }
 
-function addSkuImageAssets(record: LinkListRecord, assetIds: string[], selectedSkuIds: string[]): LinkListRecord {
+function getTargetSkuEntries(record: LinkListRecord, selectedSkuIds: string[] = []) {
+  const selectedSet = new Set(selectedSkuIds);
+  return selectedSet.size > 0 ? record.skuEntries.filter((entry) => selectedSet.has(entry.id)) : record.skuEntries;
+}
+
+function getSkuComponentSourceIdentity(component: LinkListRecord['skuEntries'][number]['componentSkus'][number]) {
+  return normalizeSkuBindingText(component.sourceId || component.sourceUrl || component.sourceTitle);
+}
+
+function getSkuEntrySourceIdentities(entry: LinkListRecord['skuEntries'][number]) {
+  const sourceKeys = (entry.componentSkus || [])
+    .map(getSkuComponentSourceIdentity)
+    .filter(Boolean);
+  for (const link of entry.sourceSkuLinks || []) {
+    const key = normalizeSkuBindingText(link.sourceId || link.sourceProductUrl || link.sourceTitle);
+    if (key) sourceKeys.push(key);
+  }
+  return [...new Set(sourceKeys)];
+}
+
+function isComboLikeSkuEntry(entry: LinkListRecord['skuEntries'][number]) {
+  return (
+    entry.kind === 'combo' ||
+    (entry.componentSkus || []).length > 1 ||
+    splitSkuComboName(getSkuEntryDisplayName(entry)).length > 1
+  );
+}
+
+function needsSkuImageBindingDialogEntry(record: LinkListRecord, entry: LinkListRecord['skuEntries'][number]) {
+  if (!isComboLikeSkuEntry(entry)) return false;
+  const sourceKeys = getSkuEntrySourceIdentities(entry);
+  if (sourceKeys.length > 1) return true;
+  const recordSourceCount = new Set(
+    (record.sourceLinks || [])
+      .map((source) => normalizeSkuBindingText(source.id || source.productUrl || source.title))
+      .filter(Boolean),
+  ).size;
+  return recordSourceCount > 1;
+}
+
+function requiresSkuImageBindingDialog(record: LinkListRecord, selectedSkuIds: string[] = []) {
+  return getTargetSkuEntries(record, selectedSkuIds).some((entry) => needsSkuImageBindingDialogEntry(record, entry));
+}
+
+function addSkuImageAssetsDirect(record: LinkListRecord, assetIds: string[], selectedSkuIds: string[]): LinkListRecord {
   const assetMap = getRecordAssetMap(record);
   const assets = assetIds.map((assetId) => assetMap.get(assetId)).filter((asset): asset is LinkListImageAsset => Boolean(asset));
   if (assets.length === 0) return record;
-  const selectedSet = new Set(selectedSkuIds);
-  const targetEntries = record.skuEntries
-    .filter((entry) => (selectedSet.size > 0 ? selectedSet.has(entry.id) : true))
-    .slice(0, selectedSet.size > 0 ? selectedSet.size : assets.length);
+  const scopedEntries = getTargetSkuEntries(record, selectedSkuIds);
+  const emptyEntries = scopedEntries.filter((entry) => !getSkuDisplayImageUrl(entry));
+  const targetEntries = emptyEntries.slice(0, assets.length);
   const targetIds = new Set(targetEntries.map((entry) => entry.id));
 
   return {
@@ -1229,11 +1421,446 @@ function addSkuImageAssets(record: LinkListRecord, assetIds: string[], selectedS
       const displayUrl = getAssetDisplayUrl(asset);
       return {
         ...entry,
-        imageAsset: buildSkuImageAsset(record, entry.id, asset, entry.name),
+        imageAsset: buildSkuImageAsset(record, entry.id, asset, getSkuEntryDisplayName(entry)),
         imageUrl: displayUrl || entry.imageUrl,
       };
     }),
   };
+}
+
+function normalizeSkuBindingText(value?: string) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function getSkuBindingSubjectKey(value?: string) {
+  const normalized = normalizeSkuBindingText(value).toLowerCase();
+  return normalized.replace(/[^a-z0-9\u4e00-\u9fff]+/g, '');
+}
+
+function getSkuComponentBindingSubjectKey(
+  component: LinkListRecord['skuEntries'][number]['componentSkus'][number],
+  fallback: string,
+) {
+  const sourcePart = normalizeSkuBindingText(component.sourceId || component.sourceUrl || component.sourceTitle);
+  const skuPart = normalizeSkuBindingText(
+    component.sourceSkuId || component.sourceSkuKey || component.name || component.specText || fallback,
+  );
+  return getSkuBindingSubjectKey([sourcePart, skuPart].filter(Boolean).join('|')) || getSkuBindingSubjectKey(fallback);
+}
+
+function getSkuEntryBindingSubjectKey(entry: LinkListRecord['skuEntries'][number], fallback: string) {
+  const primaryLink = (entry.sourceSkuLinks || [])[0];
+  const primaryComponent = (entry.componentSkus || [])[0];
+  const sourcePart = normalizeSkuBindingText(
+    primaryLink?.sourceId ||
+      primaryComponent?.sourceId ||
+      primaryLink?.sourceProductUrl ||
+      primaryComponent?.sourceUrl ||
+      primaryLink?.sourceTitle ||
+      primaryComponent?.sourceTitle,
+  );
+  const skuPart = normalizeSkuBindingText(
+    primaryLink?.sourceSkuId ||
+      primaryComponent?.sourceSkuId ||
+      primaryLink?.sourceSkuKey ||
+      primaryComponent?.sourceSkuKey ||
+      primaryLink?.optionText ||
+      primaryLink?.specText ||
+      primaryComponent?.name ||
+      primaryComponent?.specText ||
+      fallback,
+  );
+  return getSkuBindingSubjectKey([sourcePart, skuPart].filter(Boolean).join('|')) || getSkuBindingSubjectKey(fallback);
+}
+
+function skuBindingSubjectKeysMatch(valueKey: string, partKey: string) {
+  if (!valueKey || !partKey) return false;
+  return valueKey === partKey || valueKey.startsWith(partKey) || partKey.startsWith(valueKey);
+}
+
+function splitSkuComboName(value?: string) {
+  const text = normalizeSkuBindingText(value);
+  if (!text) return [];
+  const normalized = text
+    .replace(/[＋&＆]/g, '+')
+    .replace(/\s+(and|with)\s+/gi, '+')
+    .replace(/[，,、;；]/g, '+');
+  if (!normalized.includes('+')) return [text];
+  return normalized
+    .split('+')
+    .map((part) => normalizeSkuBindingText(part))
+    .filter(Boolean);
+}
+
+function getComponentBindingName(
+  component: LinkListRecord['skuEntries'][number]['componentSkus'][number] | undefined,
+  fallback: string,
+) {
+  return normalizeSkuBindingText(component?.name || component?.specText || component?.sourceSkuKey || fallback);
+}
+
+function getSkuImageBindingTargets(record: LinkListRecord, selectedSkuIds: string[] = []): SkuImageBindingTarget[] {
+  const targetEntries = getTargetSkuEntries(record, selectedSkuIds);
+  const comboParts = targetEntries
+    .flatMap((entry) => {
+      const parts = splitSkuComboName(getSkuEntryDisplayName(entry));
+      return parts.length > 1 ? parts : [];
+    })
+    .map((label) => ({ label, key: getSkuBindingSubjectKey(label) }))
+    .filter((part) => part.key);
+  const targets: SkuImageBindingTarget[] = [];
+
+  targetEntries.forEach((entry) => {
+    const skuName = normalizeSkuBindingText(getSkuEntryDisplayName(entry));
+    const components = entry.componentSkus || [];
+    const parsedParts = splitSkuComboName(skuName);
+    const componentTargets =
+      components.length > 1 || (entry.kind === 'combo' && components.length > 0)
+        ? components.map((component, index) => {
+            const componentName = getComponentBindingName(component, parsedParts[index] || skuName);
+            return {
+              componentName,
+              subjectKey: getSkuComponentBindingSubjectKey(component, componentName),
+            };
+          })
+        : parsedParts.length > 1
+          ? parsedParts.map((componentName) => ({
+              componentName,
+              subjectKey: getSkuBindingSubjectKey(componentName),
+            }))
+          : [];
+
+    if (componentTargets.length > 0) {
+      componentTargets.forEach(({ componentName, subjectKey: componentSubjectKey }, index) => {
+        const subjectKey = componentSubjectKey || `${entry.id}-component-${index}`;
+        targets.push({
+          key: `${entry.id}:component:${index}`,
+          subjectKey,
+          mode: 'component' as const,
+          skuEntryId: entry.id,
+          skuName,
+          componentIndex: index,
+          componentName,
+        });
+      });
+      return;
+    }
+
+    const skuNameKey = getSkuBindingSubjectKey(skuName);
+    const sourceSubjectKey = getSkuEntryBindingSubjectKey(entry, skuName);
+    const matchedComboPart = comboParts.find(
+      (part) => skuBindingSubjectKeysMatch(sourceSubjectKey, part.key) || skuBindingSubjectKeysMatch(skuNameKey, part.key),
+    );
+    const subjectKey = matchedComboPart?.key || sourceSubjectKey || skuNameKey || entry.id;
+    targets.push({
+      key: `${entry.id}:sku`,
+      subjectKey,
+      mode: 'sku' as const,
+      skuEntryId: entry.id,
+      skuName,
+      componentName: matchedComboPart?.label || skuName,
+    });
+  });
+
+  return targets;
+}
+
+function getSkuImageBindingDialogSkuIds(record: LinkListRecord, selectedSkuIds: string[] = []) {
+  const targetEntries = getTargetSkuEntries(record, selectedSkuIds);
+  const comboEntries = targetEntries.filter((entry) => needsSkuImageBindingDialogEntry(record, entry));
+  if (comboEntries.length === 0) return [];
+  const comboPartKeys = comboEntries
+    .flatMap((entry) => splitSkuComboName(getSkuEntryDisplayName(entry)))
+    .map(getSkuBindingSubjectKey)
+    .filter(Boolean);
+  const comboSourceKeys = comboEntries
+    .flatMap((entry) => {
+      const skuName = getSkuEntryDisplayName(entry);
+      return (entry.componentSkus || []).map((component, index) =>
+        getSkuComponentBindingSubjectKey(component, splitSkuComboName(skuName)[index] || skuName),
+      );
+    })
+    .filter(Boolean);
+
+  return targetEntries
+    .filter((entry) => {
+      if (needsSkuImageBindingDialogEntry(record, entry)) return true;
+      const skuNameKey = getSkuBindingSubjectKey(getSkuEntryDisplayName(entry));
+      const sourceKey = getSkuEntryBindingSubjectKey(entry, getSkuEntryDisplayName(entry));
+      return (
+        comboPartKeys.some((partKey) => skuBindingSubjectKeysMatch(skuNameKey, partKey)) ||
+        comboSourceKeys.some((partKey) => skuBindingSubjectKeysMatch(sourceKey, partKey))
+      );
+    })
+    .map((entry) => entry.id);
+}
+
+function getSkuImageBindingSubjects(record: LinkListRecord, selectedSkuIds: string[] = []): SkuImageBindingSubject[] {
+  const subjects = new Map<string, SkuImageBindingSubject>();
+  getSkuImageBindingTargets(record, selectedSkuIds).forEach((target) => {
+    const key = `sku:${target.skuEntryId}`;
+    const entry = record.skuEntries.find((item) => item.id === target.skuEntryId);
+    const existing = subjects.get(key);
+    if (existing) {
+      existing.targets.push(target);
+      return;
+    }
+    subjects.set(key, {
+      key,
+      label: entry ? getSkuEntryDisplayName(entry) : target.skuName,
+      targets: [target],
+    });
+  });
+  return Array.from(subjects.values());
+}
+
+function isSkuImageBindingSplitSubject(subject: SkuImageBindingSubject) {
+  return subject.targets.length > 1 || subject.targets.some((target) => target.mode === 'component');
+}
+
+function getSkuImageBindingChoiceKeys(subject: SkuImageBindingSubject) {
+  return isSkuImageBindingSplitSubject(subject) ? subject.targets.map((target) => target.key) : [subject.key];
+}
+
+function createDefaultSkuImageBindingChoices(
+  subjects: SkuImageBindingSubject[],
+  selectedAssets: ImageManagerBindingImageOption[],
+) {
+  const choices: Record<string, string | undefined> = {};
+  subjects.forEach((subject, index) => {
+    if (isSkuImageBindingSplitSubject(subject)) {
+      subject.targets.forEach((target, targetIndex) => {
+        const option = selectedAssets[targetIndex];
+        if (option) {
+          choices[target.key] = option.asset.id;
+        }
+      });
+      return;
+    }
+    const option = selectedAssets[index];
+    if (option) {
+      choices[subject.key] = option.asset.id;
+    }
+  });
+
+  return choices;
+}
+
+function getSkuImageBindingReferenceDescriptors(
+  record: LinkListRecord,
+  subjects: SkuImageBindingSubject[],
+  choices: Record<string, string | undefined>,
+  selectedAssets: ImageManagerBindingImageOption[],
+) {
+  const descriptors = selectedAssets
+    .map((option, index) => {
+      const url = getAssetDisplayUrl(option.asset) || option.imageUrl;
+      if (!url) return undefined;
+      return {
+        assetId: option.asset.id,
+        order: index,
+        url,
+        baseLabel: `图片参数 ${index + 1}: ${option.sourceLabel} / ${option.label || option.asset.alt || `图片 ${index + 1}`}`,
+        bindings: [] as string[],
+      };
+    })
+    .filter((item): item is NonNullable<typeof item> => Boolean(item));
+  const descriptorByAssetId = new Map(descriptors.map((item) => [item.assetId, item]));
+
+  subjects.forEach((subject) => {
+    const splitSubject = isSkuImageBindingSplitSubject(subject);
+    subject.targets.forEach((target) => {
+      const assetId = choices[splitSubject ? target.key : subject.key];
+      const descriptor = assetId ? descriptorByAssetId.get(assetId) : undefined;
+      if (!descriptor) return;
+      const skuLabel = getSkuImageBindingTargetShortLabel(record, target);
+      const bindingLabel = target.mode === 'component'
+        ? `${skuLabel} = ${target.componentName}`
+        : `${skuLabel} = ${subject.label}`;
+      descriptor.bindings.push(bindingLabel);
+    });
+  });
+
+  return descriptors
+    .filter((item) => item.bindings.length > 0)
+    .sort((left, right) => left.order - right.order)
+    .map((item) => ({
+      url: item.url,
+      label: `${item.baseLabel}；绑定：${Array.from(new Set(item.bindings)).join('；')}`,
+    }));
+}
+
+function createComponentFromBindingTarget(
+  record: LinkListRecord,
+  entry: LinkListRecord['skuEntries'][number],
+  target: SkuImageBindingTarget,
+): LinkListRecord['skuEntries'][number]['componentSkus'][number] {
+  const sourceLink = (entry.sourceSkuLinks || [])[0];
+  return {
+    name: target.componentName,
+    specText: target.componentName,
+    sourceId: sourceLink?.sourceId,
+    sourceSkuId: sourceLink?.sourceSkuId,
+    sourceSkuKey: sourceLink?.sourceSkuKey || target.componentName,
+    sourceTitle: sourceLink?.sourceTitle || record.productTitle,
+    sourceUrl: sourceLink?.sourceProductUrl || record.productSourceUrl || '',
+    imageUrl: sourceLink?.imageUrl,
+    sourceImageUrl: sourceLink?.imageUrl,
+    rawSpecs: { sku: target.componentName },
+  };
+}
+
+function applySkuImageBindingChoices(
+  record: LinkListRecord,
+  subjects: SkuImageBindingSubject[],
+  choices: Record<string, string | undefined>,
+  selectedAssets: ImageManagerBindingImageOption[] = [],
+): LinkListRecord {
+  const assetMap = getRecordAssetMap(record);
+  selectedAssets.forEach((option) => assetMap.set(option.asset.id, option.asset));
+  const targetAssetByKey = new Map<string, LinkListImageAsset>();
+  const targetsByEntryId = new Map<string, SkuImageBindingTarget[]>();
+
+  subjects.forEach((subject) => {
+    const splitSubject = isSkuImageBindingSplitSubject(subject);
+    subject.targets.forEach((target) => {
+      const assetId = choices[splitSubject ? target.key : subject.key];
+      const asset = assetId ? assetMap.get(assetId) : undefined;
+      if (!asset) return;
+      targetAssetByKey.set(target.key, asset);
+      const entryTargets = targetsByEntryId.get(target.skuEntryId) || [];
+      entryTargets.push(target);
+      targetsByEntryId.set(target.skuEntryId, entryTargets);
+    });
+  });
+
+  return {
+    ...record,
+    schemaVersion: 3,
+    skuEntries: record.skuEntries.map((entry) => {
+      const targets = targetsByEntryId.get(entry.id) || [];
+      if (targets.length === 0) return entry;
+      const isComponentBinding = entry.kind === 'combo' || targets.some((target) => target.mode === 'component');
+
+      if (!isComponentBinding) {
+        const target = targets[0];
+        const asset = targetAssetByKey.get(target.key);
+        const displayUrl = asset ? getAssetDisplayUrl(asset) : undefined;
+        if (!asset || !displayUrl) return entry;
+        return {
+          ...entry,
+          imageAsset: buildSkuImageAsset(record, entry.id, asset, getSkuEntryDisplayName(entry)),
+          imageUrl: displayUrl,
+          sourceSkuLinks: (entry.sourceSkuLinks || []).map((link) => ({ ...link, imageUrl: displayUrl })),
+          componentSkus: (entry.componentSkus || []).map((component) => ({
+            ...component,
+            imageUrl: displayUrl,
+            sourceImageUrl: displayUrl,
+          })),
+        };
+      }
+
+      const sourceComponents = entry.componentSkus?.length
+        ? entry.componentSkus
+        : targets
+            .filter((target) => target.mode === 'component')
+            .map((target) => createComponentFromBindingTarget(record, entry, target));
+      const nextComponents = sourceComponents.map((component, index) => {
+        const componentName = getComponentBindingName(component, targets[index]?.componentName || getSkuEntryDisplayName(entry));
+        const target =
+          targets.find((item) => item.componentIndex === index) ||
+          targets.find((item) => item.subjectKey === getSkuBindingSubjectKey(componentName));
+        const asset = target ? targetAssetByKey.get(target.key) : undefined;
+        const displayUrl = asset ? getAssetDisplayUrl(asset) : undefined;
+        if (!asset || !displayUrl) return component;
+        return {
+          ...component,
+          name: component.name || componentName,
+          specText: component.specText || componentName,
+          sourceTitle: component.sourceTitle || record.productTitle,
+          sourceUrl: component.sourceUrl || record.productSourceUrl || '',
+          imageUrl: displayUrl,
+          sourceImageUrl: displayUrl,
+        };
+      });
+      const representativeTarget = targets.find((target) => targetAssetByKey.has(target.key));
+      const representativeAsset = representativeTarget ? targetAssetByKey.get(representativeTarget.key) : undefined;
+      const representativeUrl = representativeAsset ? getAssetDisplayUrl(representativeAsset) : undefined;
+
+      return {
+        ...entry,
+        imageAsset: representativeAsset
+          ? buildSkuImageAsset(record, entry.id, representativeAsset, getSkuEntryDisplayName(entry))
+          : entry.imageAsset,
+        imageUrl: representativeUrl || entry.imageUrl,
+        componentSkus: nextComponents,
+      };
+    }),
+  };
+}
+
+function getSkuImageBindingSubjectCurrentUrl(record: LinkListRecord, subject: SkuImageBindingSubject) {
+  for (const target of subject.targets) {
+    const entry = record.skuEntries.find((item) => item.id === target.skuEntryId);
+    if (!entry) continue;
+    if (target.mode === 'component') {
+      const component =
+        typeof target.componentIndex === 'number' ? entry.componentSkus?.[target.componentIndex] : undefined;
+      const url = component?.imageUrl || component?.sourceImageUrl;
+      if (url) return url;
+      continue;
+    }
+    const url = getSkuDisplayImageUrl(entry);
+    if (url) return url;
+  }
+  return undefined;
+}
+
+function getSkuImageBindingTargetSkuNumber(record: LinkListRecord, target: SkuImageBindingTarget) {
+  const index = record.skuEntries.findIndex((entry) => entry.id === target.skuEntryId);
+  return index >= 0 ? index + 1 : undefined;
+}
+
+function getSkuImageBindingTargetShortLabel(record: LinkListRecord, target: SkuImageBindingTarget) {
+  const skuNumber = getSkuImageBindingTargetSkuNumber(record, target);
+  const skuPrefix = skuNumber ? `SKU ${skuNumber}` : 'SKU';
+  if (target.mode === 'component') {
+    const componentIndex = typeof target.componentIndex === 'number' ? target.componentIndex + 1 : undefined;
+    return componentIndex ? `${skuPrefix} 组件 ${componentIndex}` : `${skuPrefix} 组件`;
+  }
+  return skuPrefix;
+}
+
+function getSkuImageBindingSubjectTitle(
+  record: LinkListRecord,
+  subject: SkuImageBindingSubject,
+  subjectIndex: number,
+  total: number,
+) {
+  const skuText =
+    Array.from(
+      new Set(
+        subject.targets
+          .map((target) => getSkuImageBindingTargetSkuNumber(record, target))
+          .filter((skuNumber): skuNumber is number => typeof skuNumber === 'number')
+          .map((skuNumber) => `SKU ${skuNumber}`),
+      ),
+    ).join(' + ') || 'SKU';
+  return {
+    indexLabel: `绑定项 ${subjectIndex + 1}/${total}`,
+    skuLabel: skuText,
+    title: subject.label,
+  };
+}
+
+function getSkuImageBindingTargetLabel(record: LinkListRecord, target: SkuImageBindingTarget) {
+  const skuNumber = getSkuImageBindingTargetSkuNumber(record, target);
+  const skuPrefix = skuNumber ? `SKU ${skuNumber}` : 'SKU';
+  if (target.mode === 'component') {
+    const componentIndex = typeof target.componentIndex === 'number' ? target.componentIndex + 1 : undefined;
+    return `${skuPrefix} 组件 ${componentIndex || ''}：${target.componentName}`.replace(/\s+：/, '：');
+  }
+  return `${skuPrefix}：${target.skuName}`;
 }
 
 function removeSkuImage(record: LinkListRecord, skuEntryId: string): LinkListRecord {
@@ -1436,7 +2063,7 @@ function getRecordVisualTaskPackages(record: LinkListRecord) {
     return {
       id: `${record.id}-module-sku-${entry.id}`,
       order: entry.order,
-      title: entry.name,
+      title: getSkuEntryDisplayName(entry),
       targetLabel: `SKU 图 ${entry.order}`,
       imageKind: entry.kind === 'combo' ? 'sku-combo-image' : 'sku-single-image',
       imageUrl,
@@ -1539,7 +2166,7 @@ function createVisualQueueItem(
   return {
     id: `${task.id}-${Date.now()}`,
     recordId: record.id,
-    productTitle: record.productTitle,
+    productTitle: getRecordDisplayTitle(record),
     taskId: task.id,
     taskName: `${task.name} · ${modeLabel}`,
     typeLabel: task.typeLabel,
@@ -1727,13 +2354,28 @@ function isRemoteImageUrl(url?: string) {
 }
 
 function getVisualQueueProgress(item: VisualQueueItem) {
-  if (item.statusColor === 'red') return 100;
-  if (item.completedCount > 0) return 100;
+  if (item.completedCount > 0) {
+    const total = Math.max(1, item.moduleCount || item.requestedCount || item.completedCount);
+    return Math.min(100, Math.max(80, Math.round(78 + (item.completedCount / total) * 22)));
+  }
   if (item.motherImageUrl || item.motherImagePath) return 78;
   if (item.promptText) return 58;
-  if (item.analysis) return 42;
+  if (hasVisualDetail(item.analysis)) return 42;
   if (item.backendTaskId) return 24;
   return 8;
+}
+
+function isVisualQueueItemCompleted(item: VisualQueueItem) {
+  return item.statusLabel === '已回写' || item.completedCount >= Math.max(1, item.moduleCount || item.requestedCount || 1);
+}
+
+function isVisualQueueItemActive(item: VisualQueueItem) {
+  const backendStatus = String(item.backendStatus || '').toLowerCase();
+  return item.statusColor !== 'red' && ACTIVE_VISUAL_BACKEND_STATUSES.has(backendStatus);
+}
+
+function isVisualQueueItemRunnable(item: VisualQueueItem) {
+  return !isVisualQueueItemCompleted(item) && !isVisualQueueItemActive(item);
 }
 
 function getVisualQueueLayoutLabel(count: number) {
@@ -1803,20 +2445,190 @@ function formatVisualDetail(value?: Record<string, unknown> | string) {
   return JSON.stringify(value, null, 2);
 }
 
+function asVisualRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function asVisualArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function visualText(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  if (Array.isArray(value)) return value.map(visualText).filter(Boolean).join('、');
+  if (typeof value === 'object') return JSON.stringify(value);
+  return String(value).trim();
+}
+
+function visualTextByKeys(source: Record<string, unknown> | undefined, keys: string[]): string {
+  if (!source) return '';
+  for (const key of keys) {
+    const text = visualText(source[key]);
+    if (text) return text;
+  }
+  return '';
+}
+
+function visualListTexts(value: unknown, maxItems = 8): string[] {
+  if (Array.isArray(value)) {
+    return value.map(visualText).filter(Boolean).slice(0, maxItems);
+  }
+  const text = visualText(value);
+  return text ? [text] : [];
+}
+
+function getVisualProductUnderstanding(analysis?: Record<string, unknown>) {
+  if (!analysis) return undefined;
+  return (
+    asVisualRecord(analysis.productUnderstanding) ||
+    asVisualRecord(analysis.productAnalysis) ||
+    analysis
+  );
+}
+
+function renderVisualTagList(items: string[]) {
+  if (items.length === 0) return <Text type="secondary">暂无</Text>;
+  return (
+    <Space size={[4, 4]} wrap>
+      {items.map((item) => (
+        <Tag key={item}>{item}</Tag>
+      ))}
+    </Space>
+  );
+}
+
+function renderVisualAnalysisResult(analysis: Record<string, unknown> | undefined, fallbackText: string) {
+  if (!hasVisualDetail(analysis)) return <pre>{fallbackText}</pre>;
+
+  const understanding = getVisualProductUnderstanding(analysis);
+  const identity = asVisualRecord(understanding?.productIdentity);
+  const titleCn = visualTextByKeys(identity, ['title_cn', 'titleCn']);
+  const titleEn = visualTextByKeys(identity, ['title_en', 'titleEn']);
+  const productType = visualTextByKeys(identity, ['product_type_cn', 'product_type', 'productType']);
+  const category = visualTextByKeys(understanding, ['overallCategory', 'category', 'productName', 'mainObject']);
+  const skuRows = asVisualArray(identity?.skus)
+    .map(asVisualRecord)
+    .filter((item): item is Record<string, unknown> => Boolean(item))
+    .slice(0, 8);
+  const referenceRows = asVisualArray(understanding?.referenceAnalyses)
+    .map(asVisualRecord)
+    .filter((item): item is Record<string, unknown> => Boolean(item))
+    .slice(0, 8);
+  const preserveItems = visualListTexts(
+    understanding?.globalMustPreserve || understanding?.mustPreserve || identity?.mustPreserve,
+    10,
+  );
+  const doNotChangeItems = visualListTexts(
+    understanding?.globalDoNotChange || understanding?.doNotChange || identity?.doNotChange,
+    10,
+  );
+
+  return (
+    <>
+      <div className="visual-workflow-fact-grid visual-analysis-fact-grid">
+        <div>
+          <span>中文标题</span>
+          <strong title={titleCn || undefined}>{titleCn || '未返回'}</strong>
+        </div>
+        <div>
+          <span>英文标题</span>
+          <strong title={titleEn || undefined}>{titleEn || '未返回'}</strong>
+        </div>
+        <div>
+          <span>商品类型</span>
+          <strong title={productType || undefined}>{productType || category || '未返回'}</strong>
+        </div>
+        <div>
+          <span>参考图数量</span>
+          <strong>{referenceRows.length || '未返回'}</strong>
+        </div>
+      </div>
+
+      {skuRows.length > 0 ? (
+        <div className="visual-analysis-section">
+          <Text strong>SKU 标准化与绑定</Text>
+          <div className="visual-analysis-list">
+            {skuRows.map((sku, index) => {
+              const components = asVisualArray(sku.components).map(asVisualRecord).filter(Boolean);
+              const componentText = components
+                .map((component) =>
+                  [
+                    visualTextByKeys(component, ['standard_name', 'standardName', 'product_name', 'productName']),
+                    visualTextByKeys(component, ['quantity']),
+                    visualTextByKeys(component, ['reference_image_index', 'referenceImageIndex']),
+                  ]
+                    .filter(Boolean)
+                    .join(' / '),
+                )
+                .filter(Boolean)
+                .join(' + ');
+              return (
+                <div className="visual-analysis-row" key={`${visualText(sku.sku_index) || index}-${visualText(sku.raw_name)}`}>
+                  <span>{visualText(sku.raw_name) || `SKU ${index + 1}`}</span>
+                  <strong>{visualTextByKeys(sku, ['standard_name', 'standardName', 'product_name', 'productName']) || '未标准化'}</strong>
+                  {componentText ? <small>{componentText}</small> : null}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ) : null}
+
+      {referenceRows.length > 0 ? (
+        <div className="visual-analysis-section">
+          <Text strong>参考图识别结果</Text>
+          <div className="visual-analysis-list">
+            {referenceRows.map((reference, index) => (
+              <div className="visual-analysis-row" key={`${visualText(reference.index) || index}-${visualText(reference.label)}`}>
+                <span>图 {visualText(reference.index) || index + 1}</span>
+                <strong>{visualTextByKeys(reference, ['visualIdentity', 'subject', 'category', 'shape']) || '未返回主体'}</strong>
+                <small>
+                  {[
+                    visualTextByKeys(reference, ['geometry', 'shape', 'silhouette']),
+                    visualText(reference.colors),
+                    visualText(reference.materials),
+                    visualTextByKeys(reference, ['quantity', 'printedPattern']),
+                  ]
+                    .filter(Boolean)
+                    .join('；') || '暂无细节'}
+                </small>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      <div className="visual-analysis-section visual-analysis-guardrails">
+        <div>
+          <Text strong>必须保留</Text>
+          {renderVisualTagList(preserveItems)}
+        </div>
+        <div>
+          <Text strong>禁止变化</Text>
+          {renderVisualTagList(doNotChangeItems)}
+        </div>
+      </div>
+
+      <details className="visual-analysis-raw">
+        <summary>查看阶段一原始返回 JSON</summary>
+        <pre>{formatVisualDetail(analysis)}</pre>
+      </details>
+    </>
+  );
+}
+
 function getVisualWorkflowStates(item: VisualQueueItem) {
   const completed = [
-    true,
-    true,
     hasVisualDetail(item.analysis),
     Boolean(item.promptText),
-    Boolean(item.motherImageUrl || item.motherImagePath),
     item.completedCount > 0,
   ];
   const firstPendingIndex = completed.findIndex((done) => !done);
+  const activeIndex = firstPendingIndex >= 0 ? firstPendingIndex : completed.length - 1;
   return completed.map((done, index) => {
-    if (item.statusColor === 'red' && index === Math.max(0, firstPendingIndex)) return 'error';
+    if (item.statusColor === 'red' && index === Math.max(0, activeIndex)) return 'error';
     if (done) return 'done';
-    if (index === firstPendingIndex) return 'active';
+    if (index === activeIndex) return 'active';
     return 'waiting';
   });
 }
@@ -2049,10 +2861,16 @@ function LinkListPanel({
   const [imageManagerRecord, setImageManagerRecord] = useState<LinkListRecord>();
   const [imageEditorOpen, setImageEditorOpen] = useState(false);
   const [managerActiveSlotId, setManagerActiveSlotId] = useState<string>();
+  const [imageManagerPreviewFocus, setImageManagerPreviewFocus] = useState<'gallery' | 'sku'>('gallery');
   const [imageManagerActiveSkuEntryId, setImageManagerActiveSkuEntryId] = useState<string>();
   const [imageManagerSelectedAssetIds, setImageManagerSelectedAssetIds] = useState<string[]>([]);
   const [imageManagerSelectedSlotIds, setImageManagerSelectedSlotIds] = useState<string[]>([]);
   const [imageManagerSelectedSkuIds, setImageManagerSelectedSkuIds] = useState<string[]>([]);
+  const [skuImageBindingOpen, setSkuImageBindingOpen] = useState(false);
+  const [skuImageBindingChoices, setSkuImageBindingChoices] = useState<Record<string, string | undefined>>({});
+  const [skuImageBindingTargetSkuIds, setSkuImageBindingTargetSkuIds] = useState<string[]>([]);
+  const [skuImageBindingPendingMainGalleryCount, setSkuImageBindingPendingMainGalleryCount] = useState<number | null>(null);
+  const [skuImageBindingPendingMainGallerySkuIds, setSkuImageBindingPendingMainGallerySkuIds] = useState<string[] | undefined>();
   const [draggingProductSlotId, setDraggingProductSlotId] = useState<string>();
   const [draggingSkuEntryId, setDraggingSkuEntryId] = useState<string>();
   const [imageSlotPickerOpen, setImageSlotPickerOpen] = useState(false);
@@ -2103,20 +2921,32 @@ function LinkListPanel({
     const selectedSet = new Set(imageManagerSelectedAssetIds);
     return imageManagerGalleryOptions.filter((option) => selectedSet.has(option.asset.id));
   }, [imageManagerGalleryOptions, imageManagerSelectedAssetIds]);
+  const skuImageBindingCandidateImages = useMemo(() => {
+    const seenUrls = new Set<string>();
+    return imageManagerSelectedAssets
+      .map((option, index): ImageManagerBindingImageOption => ({
+        ...option,
+        label: option.asset.alt || `图库图片 ${index + 1}`,
+        sourceLabel: '图库',
+      }))
+      .filter((option) => {
+      const url = String(option.imageUrl || '').trim();
+      if (!url || seenUrls.has(url)) return false;
+      seenUrls.add(url);
+      return true;
+    });
+  }, [imageManagerSelectedAssets]);
+  const skuImageBindingSubjects = useMemo(
+    () => (imageManagerRecord ? getSkuImageBindingSubjects(imageManagerRecord, skuImageBindingTargetSkuIds) : []),
+    [imageManagerRecord, skuImageBindingTargetSkuIds],
+  );
   const imageManagerSelectedGalleryImageRefs = useMemo(
     () => getSelectedGalleryImageRefDescriptors(imageManagerSelectedAssets, imageManagerRecord),
     [imageManagerRecord, imageManagerSelectedAssets],
   );
-  const imageManagerSelectedSkuImageRefs = useMemo(
-    () =>
-      imageManagerRecord && imageManagerSelectedSkuIds.length > 0
-        ? getSelectedSkuImageRefDescriptors(imageManagerRecord, imageManagerSelectedSkuIds)
-        : [],
-    [imageManagerRecord, imageManagerSelectedSkuIds],
-  );
   const canEnqueueMainGalleryFromImageManager =
     Boolean(imageManagerProductTask) &&
-    (imageManagerSelectedGalleryImageRefs.length > 0 || imageManagerSelectedSkuImageRefs.length > 0);
+    imageManagerSelectedGalleryImageRefs.length > 0;
   const activeVisualQueueItem = useMemo(
     () => visualQueueItems.find((item) => item.id === activeVisualQueueItemId) || visualQueueItems[0],
     [activeVisualQueueItemId, visualQueueItems],
@@ -2132,20 +2962,47 @@ function LinkListPanel({
   const previewActiveImageKind = getProductImageKindForSlot(previewActiveSlot);
   const imageManagerActiveGalleryItem =
     imageManagerPreviewGalleryItems.find((item) => item.slot.id === managerActiveSlotId) || imageManagerPreviewGalleryItems[0];
-  const imageManagerDisplayedImageUrl = imageManagerActiveGalleryItem?.imageUrl || getRecordMainImageUrl(imageManagerRecord);
   const imageManagerPreviewActiveSlot = imageManagerActiveGalleryItem?.slot;
+  const imageManagerActiveGallerySlotItem = imageManagerActiveGalleryItem
+    ? {
+        slot: imageManagerActiveGalleryItem.slot,
+        asset: imageManagerActiveGalleryItem.asset,
+        imageUrl: imageManagerActiveGalleryItem.imageUrl,
+        order: imageManagerActiveGalleryItem.slot.type === 'main' ? 1 : imageManagerActiveGalleryItem.slot.order,
+        imageKind: getProductImageKindForSlot(imageManagerActiveGalleryItem.slot),
+        imageLabel: getImageSlotLabel(imageManagerActiveGalleryItem.slot),
+        job: imageManagerRecord
+          ? getProductSlotJob(imageManagerRecord, getProductImageKindForSlot(imageManagerActiveGalleryItem.slot))
+          : undefined,
+      }
+    : undefined;
   const managerActiveSlotItem =
-    imageManagerSlotItems.find((item) => item.slot.id === managerActiveSlotId) || imageManagerSlotItems[0];
+    imageManagerSlotItems.find((item) => item.slot.id === managerActiveSlotId) ||
+    imageManagerActiveGallerySlotItem ||
+    imageManagerSlotItems[0];
   const managerActiveSlot = managerActiveSlotItem?.slot;
   const activeSlotPickerRecord = previewRecord;
   const activeSlotPickerSlot = previewActiveSlot;
   const activeSlotPickerOptions = previewImageAssetOptions;
   const activePreviewSkuEntry =
     previewRecord?.skuEntries.find((entry) => entry.id === previewActiveSkuEntryId) || previewRecord?.skuEntries[0];
+  const previewDisplayTitle = getRecordDisplayTitle(previewRecord);
   const previewPriceText = formatPreviewPrice(previewRecord);
   const imageManagerActiveSkuEntry =
     imageManagerRecord?.skuEntries.find((entry) => entry.id === imageManagerActiveSkuEntryId) ||
     imageManagerRecord?.skuEntries[0];
+  const imageManagerActiveSkuImageUrl = imageManagerActiveSkuEntry
+    ? getSkuDisplayImageUrl(imageManagerActiveSkuEntry)
+    : undefined;
+  const imageManagerDisplayedImageUrl =
+    imageManagerPreviewFocus === 'sku' && imageManagerActiveSkuImageUrl
+      ? imageManagerActiveSkuImageUrl
+      : imageManagerActiveGalleryItem?.imageUrl || getRecordMainImageUrl(imageManagerRecord);
+  const imageManagerDisplayedImageAlt =
+    imageManagerPreviewFocus === 'sku' && imageManagerActiveSkuImageUrl && imageManagerActiveSkuEntry
+      ? getSkuEntryDisplayName(imageManagerActiveSkuEntry)
+      : getRecordDisplayTitle(imageManagerRecord);
+  const imageManagerDisplayTitle = getRecordDisplayTitle(imageManagerRecord);
   const imageManagerPriceText = formatPreviewPrice(imageManagerRecord);
   const imageManagerProgress = imageManagerRecord ? getRecordProductImageProgress(imageManagerRecord) : undefined;
   const hasPendingCreativeJobs = records.some((record) =>
@@ -2238,18 +3095,28 @@ function LinkListPanel({
     if (!imageManagerRecord) {
       setImageEditorOpen(false);
       setManagerActiveSlotId(undefined);
+      setImageManagerPreviewFocus('gallery');
       setImageManagerActiveSkuEntryId(undefined);
       setImageManagerSelectedAssetIds([]);
       setImageManagerSelectedSlotIds([]);
       setImageManagerSelectedSkuIds([]);
+      setSkuImageBindingOpen(false);
+      setSkuImageBindingChoices({});
+      setSkuImageBindingTargetSkuIds([]);
+      setSkuImageBindingPendingMainGalleryCount(null);
+      setSkuImageBindingPendingMainGallerySkuIds(undefined);
       setDraggingProductSlotId(undefined);
       setDraggingSkuEntryId(undefined);
       return;
     }
 
-    const slots = getRecordProductImageSlotItems(imageManagerRecord);
-    if (!slots.some((item) => item.slot.id === managerActiveSlotId)) {
-      setManagerActiveSlotId(slots[0]?.slot.id);
+    const slotItems = getRecordProductImageSlotItems(imageManagerRecord);
+    const galleryItems = getRecordPreviewGalleryItems(imageManagerRecord);
+    const activeSlotExists =
+      slotItems.some((item) => item.slot.id === managerActiveSlotId) ||
+      galleryItems.some((item) => item.slot.id === managerActiveSlotId);
+    if (!activeSlotExists) {
+      setManagerActiveSlotId(galleryItems[0]?.slot.id || slotItems[0]?.slot.id);
     }
     if (!imageManagerRecord.skuEntries.some((entry) => entry.id === imageManagerActiveSkuEntryId)) {
       setImageManagerActiveSkuEntryId(imageManagerRecord.skuEntries[0]?.id);
@@ -2257,9 +3124,15 @@ function LinkListPanel({
   }, [imageManagerRecord, managerActiveSlotId, imageManagerActiveSkuEntryId]);
 
   useEffect(() => {
+    setImageManagerPreviewFocus('gallery');
     setImageManagerSelectedAssetIds([]);
     setImageManagerSelectedSlotIds([]);
     setImageManagerSelectedSkuIds([]);
+    setSkuImageBindingOpen(false);
+    setSkuImageBindingChoices({});
+    setSkuImageBindingTargetSkuIds([]);
+    setSkuImageBindingPendingMainGalleryCount(null);
+    setSkuImageBindingPendingMainGallerySkuIds(undefined);
     setDraggingProductSlotId(undefined);
     setDraggingSkuEntryId(undefined);
   }, [imageManagerRecord?.id]);
@@ -2457,15 +3330,77 @@ function LinkListPanel({
     if (afterItems.length > 0) setManagerActiveSlotId(afterItems[Math.max(0, afterItems.length - 1)]?.slot.id);
   };
 
+  const openSkuImageBindingDialog = (
+    targetSkuIds: string[] = imageManagerSelectedSkuIds,
+    options: { pendingMainGalleryCount?: number | null; pendingMainGallerySelectedSkuIds?: string[] } = {},
+  ) => {
+    if (!imageManagerRecord) return;
+    if (skuImageBindingCandidateImages.length === 0) {
+      message.warning('请先在图库或 SKU 图中选择要作为绑定参数的图片');
+      return;
+    }
+    const subjects = getSkuImageBindingSubjects(imageManagerRecord, targetSkuIds);
+    if (subjects.length === 0) {
+      message.warning('当前没有可绑定的 SKU');
+      return;
+    }
+    setSkuImageBindingTargetSkuIds(targetSkuIds);
+    setSkuImageBindingChoices(createDefaultSkuImageBindingChoices(subjects, skuImageBindingCandidateImages));
+    setSkuImageBindingPendingMainGalleryCount(options.pendingMainGalleryCount ?? null);
+    setSkuImageBindingPendingMainGallerySkuIds(options.pendingMainGallerySelectedSkuIds);
+    setSkuImageBindingOpen(true);
+  };
+
   const addSelectedAssetsToSkuImages = () => {
     if (!imageManagerRecord) return;
-    const assetIds = imageManagerSelectedAssets.map((option) => option.asset.id);
-    if (assetIds.length === 0) {
+    if (imageManagerSelectedAssets.length === 0) {
       message.warning('请先在左侧图库选择要加入 SKU 的图片');
       return;
     }
-    const nextRecord = addSkuImageAssets(imageManagerRecord, assetIds, imageManagerSelectedSkuIds);
-    commitImageManagerRecord(nextRecord, `已加入 ${Math.min(assetIds.length, imageManagerRecord.skuEntries.length)} 张 SKU 图`);
+    const assetIds = imageManagerSelectedAssets.map((option) => option.asset.id);
+    const targetEntries = getTargetSkuEntries(imageManagerRecord, imageManagerSelectedSkuIds);
+    const emptyTargetEntries = targetEntries.filter((entry) => !getSkuDisplayImageUrl(entry));
+    if (emptyTargetEntries.length === 0) {
+      message.info('当前 SKU 图位没有空缺，请先删除要替换的 SKU 图');
+      return;
+    }
+    const nextRecord = addSkuImageAssetsDirect(imageManagerRecord, assetIds, imageManagerSelectedSkuIds);
+    const addedCount = Math.min(assetIds.length, emptyTargetEntries.length);
+    commitImageManagerRecord(nextRecord, `已按顺序填补 ${addedCount} 张 SKU 图`);
+  };
+
+  const confirmSkuImageBindings = () => {
+    if (!imageManagerRecord) return;
+    const boundCount = skuImageBindingSubjects.filter((subject) =>
+      getSkuImageBindingChoiceKeys(subject).some((choiceKey) => skuImageBindingChoices[choiceKey]),
+    ).length;
+    const pendingMainGalleryCount = skuImageBindingPendingMainGalleryCount;
+    const pendingSkuIds = skuImageBindingPendingMainGallerySkuIds ?? skuImageBindingTargetSkuIds;
+    const pendingReferenceSkuIds = skuImageBindingTargetSkuIds;
+    const boundReferenceImageDescriptors = getSkuImageBindingReferenceDescriptors(
+      imageManagerRecord,
+      skuImageBindingSubjects,
+      skuImageBindingChoices,
+      skuImageBindingCandidateImages,
+    );
+    const nextRecord = applySkuImageBindingChoices(
+      imageManagerRecord,
+      skuImageBindingSubjects,
+      skuImageBindingChoices,
+      skuImageBindingCandidateImages,
+    );
+    commitImageManagerRecord(nextRecord, boundCount > 0 ? `已绑定 ${boundCount} 个 SKU 图片项` : '未绑定新的 SKU 图片');
+    setSkuImageBindingOpen(false);
+    setSkuImageBindingTargetSkuIds([]);
+    setSkuImageBindingPendingMainGalleryCount(null);
+    setSkuImageBindingPendingMainGallerySkuIds(undefined);
+    if (pendingMainGalleryCount !== null) {
+      enqueueMainGalleryWithRecord(nextRecord, pendingMainGalleryCount, pendingSkuIds, {
+        includeSelectedGalleryRefs: false,
+        referenceSkuIds: pendingReferenceSkuIds,
+        referenceImageDescriptors: boundReferenceImageDescriptors,
+      });
+    }
   };
 
   const removeProductImageFromEditor = (slotId: string) => {
@@ -2585,18 +3520,8 @@ function LinkListPanel({
             })
             .catch((error) => {
               const errorMessage = error instanceof Error ? error.message : '\u751f\u56fe\u4efb\u52a1\u6267\u884c\u5931\u8d25';
-              patchVisualQueueItem(item.id, () => ({
-                statusLabel: '\u6267\u884c\u5931\u8d25',
-                statusColor: 'red',
-                backendStatus: 'failed',
-                errorMessage,
-                modules: item.modules.map((module) => ({
-                  ...module,
-                  statusLabel: '\u5931\u8d25',
-                  statusColor: 'red',
-                })),
-              }));
-              message.error(errorMessage);
+              failVisualQueueItemToTail(item.id, errorMessage);
+              message.warning(`生图任务执行失败，已移到队尾：${errorMessage}`);
             })
             .finally(() => {
               setVisualQueueExecuting(false);
@@ -2611,27 +3536,61 @@ function LinkListPanel({
     }
   };
 
-  const enqueueMainGalleryFromSelectedSkus = (requestedCount?: number) => {
-    if (!imageManagerRecord || !imageManagerProductTask) return;
-    const referenceImageDescriptors = mergeImageRefDescriptors(
-      imageManagerSelectedGalleryImageRefs,
-      imageManagerSelectedSkuImageRefs,
-    );
+  const enqueueMainGalleryWithRecord = (
+    record: LinkListRecord,
+    requestedCount?: number,
+    selectedSkuIds: string[] = imageManagerSelectedSkuIds,
+    options: {
+      includeSelectedGalleryRefs?: boolean;
+      referenceSkuIds?: string[];
+      referenceImageDescriptors?: Array<{ url: string; label: string }>;
+    } = {},
+  ) => {
+    if (!imageManagerProductTask) return;
+    const referenceImageDescriptors =
+      options.referenceImageDescriptors && options.referenceImageDescriptors.length > 0
+        ? options.referenceImageDescriptors
+        : mergeImageRefDescriptors(
+            options.includeSelectedGalleryRefs === false ? [] : getSelectedGalleryImageRefDescriptors(imageManagerSelectedAssets, record),
+            options.referenceSkuIds && options.referenceSkuIds.length > 0
+              ? getSelectedSkuImageRefDescriptors(record, options.referenceSkuIds)
+              : [],
+          );
     const referenceImageUrls = referenceImageDescriptors.map((item) => item.url);
     if (referenceImageUrls.length === 0) {
       message.warning('请先在图库或 SKU 中选择要作为主图生成依据的图片');
       return;
     }
-    enqueueVisualTask(imageManagerRecord, imageManagerProductTask, {
+    enqueueVisualTask(record, imageManagerProductTask, {
       mode: 'main_multi',
-      count: requestedCount || getRecordProductImageGenerationCount(imageManagerRecord),
+      count: requestedCount || getRecordProductImageGenerationCount(record),
       referenceImageUrl: referenceImageUrls[0],
       referenceImageUrls,
       referenceImageLabels: referenceImageDescriptors.map((item) => item.label),
-      selectedSkuIds: imageManagerSelectedSkuIds,
+      selectedSkuIds,
       autoRun: true,
       openQueue: false,
     });
+  };
+
+  const enqueueMainGalleryFromSelectedSkus = (requestedCount?: number) => {
+    if (!imageManagerRecord || !imageManagerProductTask) return;
+    const count = requestedCount || getRecordProductImageGenerationCount(imageManagerRecord);
+    if (!canEnqueueMainGalleryFromImageManager) {
+      message.warning('请先在图库或 SKU 中选择要作为主图生成依据的图片');
+      return;
+    }
+    if (skuImageBindingCandidateImages.length > 0 && imageManagerRecord.skuEntries.length > 0) {
+      const bindingTargetSkuIds = getSkuImageBindingDialogSkuIds(imageManagerRecord);
+      if (bindingTargetSkuIds.length > 0) {
+        openSkuImageBindingDialog(bindingTargetSkuIds, {
+          pendingMainGalleryCount: count,
+          pendingMainGallerySelectedSkuIds: [],
+        });
+        return;
+      }
+    }
+    enqueueMainGalleryWithRecord(imageManagerRecord, count, imageManagerSelectedSkuIds);
   };
 
   const enqueueSkuAdaptFromSelectedSkus = () => {
@@ -2711,6 +3670,28 @@ function LinkListPanel({
     );
   };
 
+  const failVisualQueueItemToTail = (queueItemId: string, errorMessage: string) => {
+    setVisualQueueItems((current) => {
+      const failedItem = current.find((item) => item.id === queueItemId);
+      if (!failedItem) return current;
+      const nextFailedItem: VisualQueueItem = {
+        ...failedItem,
+        statusLabel: '执行失败',
+        statusColor: 'red',
+        backendStatus: 'failed',
+        errorMessage,
+        modules: failedItem.modules.map((module) => ({
+          ...module,
+          statusLabel: '失败',
+          statusColor: 'red',
+        })),
+      };
+      return [...current.filter((item) => item.id !== queueItemId), nextFailedItem];
+    });
+    setExpandedVisualQueueItemIds((current) => current.filter((id) => id !== queueItemId));
+    setActiveVisualQueueItemId((current) => (current === queueItemId ? undefined : current));
+  };
+
   const executeVisualQueueItem = async (item: VisualQueueItem, recordMap: Map<string, LinkListRecord>) => {
     const record = recordMap.get(item.recordId) || records.find((candidate) => candidate.id === item.recordId);
     if (!record) {
@@ -2776,6 +3757,7 @@ function LinkListPanel({
       uploadToOss: true,
       useReferenceImage: true,
       applyToLinkRecord: true,
+      reuseExistingOutputs: Boolean(item.backendTaskId),
     });
     const waitingForConcurrency = Boolean(runResult.waitingForConcurrency);
     if (waitingForConcurrency) {
@@ -2856,51 +3838,81 @@ function LinkListPanel({
   };
 
   const executeVisualQueue = async () => {
-    const pendingItems = visualQueueItems.filter((item) => item.statusLabel !== '已回写');
+    const pendingItems = visualQueueItems.filter(isVisualQueueItemRunnable);
     if (pendingItems.length === 0) {
-      message.info('队列中没有待执行任务');
+      const activeCount = visualQueueItems.filter(isVisualQueueItemActive).length;
+      message.info(activeCount > 0 ? '当前已有任务在执行或等待空位，没有新的可执行失败任务' : '队列中没有待执行任务');
       return;
     }
 
     setVisualQueueExecuting(true);
     const recordMap = new Map(records.map((record) => [record.id, record]));
+    let latestSummary = visualQueueSummary;
     try {
-      const results = await Promise.allSettled(
-        pendingItems.map(async (item) => {
-          await executeVisualQueueItem(item, recordMap);
-          return item.id;
-        }),
-      );
+      try {
+        latestSummary = await fetchVisualQueueSummary();
+        setVisualQueueSummary(latestSummary);
+      } catch {
+        // Summary is only used to size the local worker pool; fallback keeps local dev usable.
+      }
 
-      results.forEach((result, index) => {
-        if (result.status === 'fulfilled') return;
-        const item = pendingItems[index];
-        const error = result.reason;
-        const errorMessage = error instanceof Error ? error.message : '生图任务执行失败';
-        patchVisualQueueItem(item.id, () => ({
-          statusLabel: '执行失败',
-          statusColor: 'red',
-          backendStatus: 'failed',
-          errorMessage,
-          modules: item.modules.map((module) => ({
-            ...module,
-            statusLabel: '失败',
-            statusColor: 'red',
-          })),
-        }));
-        message.error(errorMessage);
-      });
+      const fallbackLimit = Math.min(pendingItems.length, LOCAL_VISUAL_QUEUE_FALLBACK_WORKERS);
+      const userLimit = Number(latestSummary?.userConcurrencyLimit || 0);
+      const teamLimit = Number(latestSummary?.teamConcurrencyLimit || 0);
+      const userRunning = Number(latestSummary?.runningCount ?? latestSummary?.activeCount ?? 0);
+      const teamRunning = Number(latestSummary?.teamRunningCount ?? latestSummary?.teamActiveCount ?? 0);
+      const userAvailable = userLimit > 0 ? Math.max(0, userLimit - userRunning) : fallbackLimit;
+      const teamAvailable = teamLimit > 0 ? Math.max(0, teamLimit - teamRunning) : fallbackLimit;
+      const workerCount = Math.max(1, Math.min(pendingItems.length, userAvailable || 1, teamAvailable || 1));
+      const itemQueue = [...pendingItems];
+      const attemptByItemId = new Map<string, number>();
+      let successCount = 0;
+      let failedCount = 0;
+      let retryCount = 0;
 
-      const successCount = results.filter((result) => result.status === 'fulfilled').length;
-      const failedCount = results.length - successCount;
+      const runWorker = async () => {
+        while (itemQueue.length > 0) {
+          const item = itemQueue.shift();
+          if (!item) return;
+          const attempt = (attemptByItemId.get(item.id) || 0) + 1;
+          attemptByItemId.set(item.id, attempt);
+          try {
+            // eslint-disable-next-line no-await-in-loop
+            await executeVisualQueueItem(item, recordMap);
+            successCount += 1;
+          } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : '生图任务执行失败';
+            failVisualQueueItemToTail(item.id, errorMessage);
+            if (attempt < LOCAL_VISUAL_QUEUE_MAX_ATTEMPTS_PER_CLICK) {
+              retryCount += 1;
+              message.warning(`任务执行失败，已移到队尾，稍后自动重试：${errorMessage}`);
+              // eslint-disable-next-line no-await-in-loop
+              await waitForMs(1500);
+              itemQueue.push(item);
+            } else {
+              failedCount += 1;
+              message.warning(`任务执行失败，已达到本轮重试上限：${errorMessage}`);
+            }
+          }
+        }
+      };
+
+      await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+
       if (successCount > 0) {
         message.success(`已执行 ${successCount} 个生图任务，结果已回写到链接列表`);
       }
       if (failedCount > 0) {
-        message.warning(`${failedCount} 个生图任务失败，其他任务已继续执行`);
+        message.warning(`${failedCount} 个生图任务本轮仍失败，已保留在队尾，可稍后再次执行`);
+      }
+      if (retryCount > 0) {
+        message.info(`本轮已自动补位重试 ${retryCount} 次`);
       }
     } finally {
       setVisualQueueExecuting(false);
+      void refreshVisualQueueSummary().catch((error) => {
+        console.warn('Failed to refresh visual queue summary after execution', error);
+      });
     }
   };
 
@@ -2908,85 +3920,87 @@ function LinkListPanel({
     const workflowStates = getVisualWorkflowStates(item);
     const motherImageUrl = getVisualMotherImageUrl(item);
     const splitModules = item.modules.filter((module) => module.outputUrl || module.outputPath);
+    const motherImagePlaceholder = item.motherImagePath || '生成完成后展示九宫格母图。';
     const stages = [
       {
-        title: '任务输入',
-        description: '保留参考图、模式、数量和组批策略。',
+        title: '商品身份分析',
+        description: '读取任务输入并完成商品身份、标题和 SKU 绑定分析。',
         body: (
-          <div className="visual-workflow-fact-grid">
-            <div><span>模式</span><strong>{item.modeLabel}</strong></div>
-            <div><span>请求数量</span><strong>{item.requestedCount}</strong></div>
-            <div><span>网格布局</span><strong>{getVisualQueueLayoutLabel(item.requestedCount)}</strong></div>
-            <div><span>组批策略</span><strong>{item.mixPolicy}</strong></div>
-          </div>
+          <>
+            <div className="visual-workflow-fact-grid">
+              <div><span>模式</span><strong>{item.modeLabel}</strong></div>
+              <div><span>请求数量</span><strong>{item.requestedCount}</strong></div>
+              <div><span>网格布局</span><strong>{getVisualQueueLayoutLabel(item.requestedCount)}</strong></div>
+              <div><span>组批策略</span><strong>{item.mixPolicy}</strong></div>
+            </div>
+            {renderVisualAnalysisResult(item.analysis, getVisualInputPromptText(item))}
+          </>
         ),
       },
       {
-        title: '图片分析前提示词',
-        description: '发送给规划阶段前的任务输入摘要。',
-        body: <pre>{getVisualInputPromptText(item)}</pre>,
+        title: '提示词规划',
+        description: '整合九宫格任务规划和单图提示词生成，展示最终九宫格提示词。',
+        body: <pre>{item.promptText || '等待九宫格提示词规划完成后展示。'}</pre>,
       },
       {
-        title: '图片分析后解读',
-        description: '模型完成图片理解后回填的商品、材质、风险和画风信息。',
-        body: <pre>{formatVisualDetail(item.analysis)}</pre>,
-      },
-      {
-        title: '最终九宫格提示词',
-        description: '真正用于生成母图的最终提示词。',
-        body: <pre>{item.promptText || '等待提示词规划完成后展示。'}</pre>,
-      },
-      {
-        title: '九宫格母图',
-        description: '一次生成的大图，随后按格子切割。',
-        body: motherImageUrl ? (
-          <Image
-            alt="九宫格母图"
-            className="visual-workflow-mother-image"
-            referrerPolicy="no-referrer"
-            src={motherImageUrl}
-          />
-        ) : (
-          <div className="visual-workflow-placeholder">
-            {item.motherImagePath || '生成完成后展示九宫格母图。'}
-          </div>
-        ),
-      },
-      {
-        title: '切割结果',
-        description: '切割后回写到主图、轮播图或 SKU 图的结果。',
-        body: splitModules.length > 0 ? (
-          <div className="visual-workflow-split-grid">
-            {splitModules.map((module, index) => (
-              <div className="visual-workflow-split-item" key={module.id}>
-                <span>{index + 1}</span>
-                {module.outputUrl ? (
-                  <Image
-                    alt={module.title}
-                    height={72}
-                    preview={false}
-                    referrerPolicy="no-referrer"
-                    src={module.outputUrl}
-                    width={72}
-                  />
-                ) : (
-                  <PictureOutlined />
-                )}
-                <Text ellipsis>{module.title}</Text>
+        title: '图片生成',
+        description: '生成母图、切割九宫格，并把结果回写到商品图位。',
+        body: (
+          <>
+            {motherImageUrl ? (
+              <Image
+                alt="九宫格母图"
+                className="visual-workflow-mother-image"
+                referrerPolicy="no-referrer"
+                src={motherImageUrl}
+              />
+            ) : (
+              <div
+                className="visual-workflow-placeholder visual-workflow-path-placeholder"
+                title={item.motherImagePath || undefined}
+              >
+                {motherImagePlaceholder}
               </div>
-            ))}
-          </div>
-        ) : (
-          <div className="visual-workflow-placeholder">切割完成后展示结果。</div>
+            )}
+            {splitModules.length > 0 ? (
+              <div className="visual-workflow-split-grid">
+                {splitModules.map((module, index) => (
+                  <div className="visual-workflow-split-item" key={module.id}>
+                    <span>{index + 1}</span>
+                    {module.outputUrl ? (
+                      <Image
+                        alt={module.title}
+                        height={72}
+                        preview={false}
+                        referrerPolicy="no-referrer"
+                        src={module.outputUrl}
+                        width={72}
+                      />
+                    ) : (
+                      <PictureOutlined />
+                    )}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="visual-workflow-placeholder">切割并回写完成后展示结果。</div>
+            )}
+          </>
         ),
       },
     ];
 
-    const firstActiveStageIndex = workflowStates.findIndex((state) => state === 'active' || state === 'error');
-    const fallbackStageIndex = firstActiveStageIndex >= 0 ? firstActiveStageIndex : Math.max(0, workflowStates.lastIndexOf('done'));
+    const errorStageIndex = workflowStates.findIndex((state) => state === 'error');
+    const firstActiveStageIndex = workflowStates.findIndex((state) => state === 'active');
+    const fallbackStageIndex =
+      errorStageIndex >= 0
+        ? errorStageIndex
+        : firstActiveStageIndex >= 0
+          ? firstActiveStageIndex
+          : Math.max(0, workflowStates.lastIndexOf('done'));
     const selectedStageIndex = Math.min(
       stages.length - 1,
-      Math.max(0, visualWorkflowStageByItemId[item.id] ?? fallbackStageIndex),
+      Math.max(0, errorStageIndex >= 0 ? errorStageIndex : visualWorkflowStageByItemId[item.id] ?? fallbackStageIndex),
     );
     const selectedStage = stages[selectedStageIndex] || stages[0];
     const selectedState = workflowStates[selectedStageIndex] || 'waiting';
@@ -3122,6 +4136,7 @@ function LinkListPanel({
               const productImageCount = getRecordProductImageGenerationCount(record);
               const productImageProgress = getRecordProductImageProgress(record);
               const selected = selectedRecordIds.includes(record.id);
+              const recordDisplayTitle = getRecordDisplayTitle(record);
               return (
             <Card
               className={`link-record-card ${selected ? 'link-record-card-selected' : ''}`}
@@ -3146,7 +4161,7 @@ function LinkListPanel({
                 <div className="link-record-image">
                   {getRecordMainImageUrl(record) ? (
                     <Image
-                      alt={record.productTitle}
+                      alt={recordDisplayTitle}
                       height={56}
                       preview={false}
                       referrerPolicy="no-referrer"
@@ -3161,7 +4176,7 @@ function LinkListPanel({
                 <div className="link-record-summary">
                   <div className="link-record-title-line">
                     <Text className="link-record-title" strong>
-                      {record.productTitle}
+                      {recordDisplayTitle}
                     </Text>
                     <div className="link-record-tags">
                       <Tag color="blue">{record.skuEntries.length} 销售 SKU</Tag>
@@ -3268,7 +4283,7 @@ function LinkListPanel({
                       onClick={() => setPreviewActiveImageSlotId(item.slot.id)}
                     >
                       <Image
-                        alt={`${previewRecord.productTitle} 商品图 ${index + 1}`}
+                      alt={`${previewDisplayTitle} 商品图 ${index + 1}`}
                         height={62}
                         preview={false}
                         referrerPolicy="no-referrer"
@@ -3282,7 +4297,7 @@ function LinkListPanel({
                   <div className="temu-preview-main-image">
                   {previewDisplayedImageUrl ? (
                     <Image
-                      alt={previewRecord.productTitle}
+                      alt={previewDisplayTitle}
                       height="100%"
                       preview={false}
                       referrerPolicy="no-referrer"
@@ -3342,11 +4357,11 @@ function LinkListPanel({
                   <Text type="secondary">›</Text>
                   <Text type="secondary">Accessories</Text>
                   <Text type="secondary">›</Text>
-                  <Text>{previewRecord.productTitle.slice(0, 34)}...</Text>
+                  <Text>{previewDisplayTitle.slice(0, 34)}...</Text>
                 </Space>
 
                 <Typography.Title className="temu-preview-title" level={3}>
-                  {previewRecord.productTitle}
+                  {previewDisplayTitle}
                 </Typography.Title>
 
                 <div className="temu-preview-rating">
@@ -3369,11 +4384,14 @@ function LinkListPanel({
                     <Text strong className="temu-preview-section-title">
                       SKU
                     </Text>
-                    {activePreviewSkuEntry ? <Text type="secondary">Selected: {activePreviewSkuEntry.name}</Text> : null}
+                    {activePreviewSkuEntry ? (
+                      <Text type="secondary">Selected: {getSkuEntryDisplayName(activePreviewSkuEntry)}</Text>
+                    ) : null}
                   </div>
                   <div className="temu-preview-sku-grid">
                     {previewRecord.skuEntries.map((entry) => {
                       const skuImageUrl = getSkuDisplayImageUrl(entry);
+                      const skuDisplayName = getSkuEntryDisplayName(entry);
                       const active = activePreviewSkuEntry?.id === entry.id;
 
                       return (
@@ -3386,7 +4404,7 @@ function LinkListPanel({
                           <span className="temu-preview-sku-image">
                             {skuImageUrl ? (
                               <Image
-                                alt={entry.name}
+                                alt={skuDisplayName}
                                 height={44}
                                 preview={false}
                                 referrerPolicy="no-referrer"
@@ -3398,7 +4416,7 @@ function LinkListPanel({
                             )}
                           </span>
                           <span className="temu-preview-sku-name">
-                            <span>{entry.name}</span>
+                            <span>{skuDisplayName}</span>
                             {entry.price ? <span className="temu-preview-sku-price">CN¥{entry.price}</span> : null}
                           </span>
                         </button>
@@ -3759,44 +4777,6 @@ function LinkListPanel({
       >
         {imageManagerRecord ? (
           <div className="image-manager-shell">
-            <div className="image-manager-head">
-              <div className="image-manager-cover">
-                {getRecordMainImageUrl(imageManagerRecord) ? (
-                  <Image
-                    alt={imageManagerRecord.productTitle}
-                    height={72}
-                    preview={false}
-                    referrerPolicy="no-referrer"
-                    src={getRecordMainImageUrl(imageManagerRecord)}
-                    width={72}
-                  />
-                ) : (
-                  <PictureOutlined />
-                )}
-              </div>
-              <div className="image-manager-title">
-                <Typography.Title level={4}>{imageManagerRecord.productTitle}</Typography.Title>
-                <Space size={8} wrap>
-                  <Button icon={<PictureOutlined />} type="primary" onClick={() => setImageEditorOpen(true)}>
-                    编辑图片
-                  </Button>
-                  <Button icon={<ClockCircleOutlined />} onClick={openUnifiedQueue}>
-                    任务队列{totalQueueTaskCount > 0 ? ` ${totalQueueTaskCount}` : ''}
-                  </Button>
-                </Space>
-                <Space size={6} wrap>
-                  <Tag color="blue">{imageManagerRecord.skuEntries.length} SKU</Tag>
-                  <Tag>{imageManagerRecord.sourceLinks.length} 货源</Tag>
-                  <Tag color={imageManagerProgress && imageManagerProgress.ready >= imageManagerProgress.total ? 'green' : 'blue'}>
-                    商品图 {imageManagerProgress?.ready || 0}/{imageManagerProgress?.total || 0}
-                  </Tag>
-                  {imageManagerProgress?.queued ? <Tag color="blue">队列 {imageManagerProgress.queued}</Tag> : null}
-                  {imageManagerProgress?.running ? <Tag color="gold">生成中 {imageManagerProgress.running}</Tag> : null}
-                  {imageManagerProgress?.failed ? <Tag color="red">失败 {imageManagerProgress.failed}</Tag> : null}
-                </Space>
-              </div>
-            </div>
-
             <div className="image-manager-temu-preview">
               <div className="image-manager-temu-gallery">
                 <div className="temu-preview-thumbs image-manager-temu-thumbs">
@@ -3817,6 +4797,7 @@ function LinkListPanel({
                         type="button"
                         onClick={() => {
                           setManagerActiveSlotId(item.slot.id);
+                          setImageManagerPreviewFocus('gallery');
                           setImageManagerSelectedSlotIds((current) =>
                             current.includes(item.slot.id)
                               ? current.filter((slotId) => slotId !== item.slot.id)
@@ -3826,7 +4807,7 @@ function LinkListPanel({
                       >
                         <span className="image-manager-preview-thumb-index">{index + 1}</span>
                         <Image
-                          alt={`${imageManagerRecord.productTitle} 商品图 ${index + 1}`}
+                          alt={`${imageManagerDisplayTitle} 商品图 ${index + 1}`}
                           height={64}
                           preview={false}
                           referrerPolicy="no-referrer"
@@ -3841,7 +4822,7 @@ function LinkListPanel({
                   <div className="temu-preview-main-image image-manager-temu-main-image">
                     {imageManagerDisplayedImageUrl ? (
                       <Image
-                        alt={imageManagerRecord.productTitle}
+                        alt={imageManagerDisplayedImageAlt || imageManagerDisplayTitle}
                         height="100%"
                         preview={false}
                         referrerPolicy="no-referrer"
@@ -3852,6 +4833,26 @@ function LinkListPanel({
                       <span>商品主图</span>
                     )}
                   </div>
+                  <div className="image-manager-temu-actions">
+                    <div>
+                      <Tag color="blue">{imageManagerRecord.skuEntries.length} SKU</Tag>
+                      <Tag>{imageManagerRecord.sourceLinks.length} 货源</Tag>
+                      <Tag color={imageManagerProgress && imageManagerProgress.ready >= imageManagerProgress.total ? 'green' : 'blue'}>
+                        商品图 {imageManagerProgress?.ready || 0}/{imageManagerProgress?.total || 0}
+                      </Tag>
+                      {imageManagerProgress?.queued ? <Tag color="blue">队列 {imageManagerProgress.queued}</Tag> : null}
+                      {imageManagerProgress?.running ? <Tag color="gold">生成中 {imageManagerProgress.running}</Tag> : null}
+                      {imageManagerProgress?.failed ? <Tag color="red">失败 {imageManagerProgress.failed}</Tag> : null}
+                    </div>
+                    <Space size={8} wrap>
+                      <Button icon={<PictureOutlined />} type="primary" onClick={() => setImageEditorOpen(true)}>
+                        编辑图片
+                      </Button>
+                      <Button icon={<ClockCircleOutlined />} onClick={openUnifiedQueue}>
+                        任务队列{totalQueueTaskCount > 0 ? ` ${totalQueueTaskCount}` : ''}
+                      </Button>
+                    </Space>
+                  </div>
                 </div>
               </div>
 
@@ -3861,11 +4862,11 @@ function LinkListPanel({
                   <Text type="secondary">›</Text>
                   <Text type="secondary">Accessories</Text>
                   <Text type="secondary">›</Text>
-                  <Text>{imageManagerRecord.productTitle.slice(0, 34)}...</Text>
+                  <Text>{imageManagerDisplayTitle.slice(0, 34)}...</Text>
                 </Space>
 
                 <Typography.Title className="temu-preview-title" level={3}>
-                  {imageManagerRecord.productTitle}
+                  {imageManagerDisplayTitle}
                 </Typography.Title>
 
                 <div className="temu-preview-rating">
@@ -3897,6 +4898,7 @@ function LinkListPanel({
                   <div className="temu-preview-sku-grid image-manager-temu-sku-grid">
                     {imageManagerRecord.skuEntries.map((entry) => {
                       const skuImageUrl = getSkuDisplayImageUrl(entry);
+                      const skuDisplayName = getSkuEntryDisplayName(entry);
                       const active = imageManagerActiveSkuEntry?.id === entry.id;
                       const selected = imageManagerSelectedSkuIds.includes(entry.id);
 
@@ -3913,6 +4915,7 @@ function LinkListPanel({
                           type="button"
                           onClick={() => {
                             setImageManagerActiveSkuEntryId(entry.id);
+                            setImageManagerPreviewFocus('sku');
                             setImageManagerSelectedSkuIds((current) =>
                               current.includes(entry.id)
                                 ? current.filter((id) => id !== entry.id)
@@ -3923,7 +4926,7 @@ function LinkListPanel({
                           <span className="temu-preview-sku-image">
                             {skuImageUrl ? (
                               <Image
-                                alt={entry.name}
+                                alt={skuDisplayName}
                                 height={44}
                                 preview={false}
                                 referrerPolicy="no-referrer"
@@ -3935,7 +4938,7 @@ function LinkListPanel({
                             )}
                           </span>
                           <span className="temu-preview-sku-name">
-                            <span>{entry.name}</span>
+                            <span>{skuDisplayName}</span>
                             {entry.price ? <span className="temu-preview-sku-price">CN¥{entry.price}</span> : null}
                           </span>
                         </button>
@@ -4072,6 +5075,9 @@ function LinkListPanel({
                     </Button>
                     <Button size="small" disabled={imageManagerSelectedAssetIds.length === 0} onClick={addSelectedAssetsToSkuImages}>
                       加入 SKU 图
+                    </Button>
+                    <Button size="small" disabled={skuImageBindingCandidateImages.length === 0} onClick={() => openSkuImageBindingDialog()}>
+                      手动绑定
                     </Button>
                     <Button size="small" disabled={imageManagerSelectedAssetIds.length === 0} onClick={() => setImageManagerSelectedAssetIds([])}>
                       清空
@@ -4225,7 +5231,6 @@ function LinkListPanel({
                                 <PictureOutlined />
                               )}
                             </span>
-                            <span className="image-editor-thumb-caption">图片 {item.order}</span>
                           </div>
                         );
                       })}
@@ -4242,6 +5247,7 @@ function LinkListPanel({
                     <div className="image-editor-sku-thumb-grid">
                       {imageManagerRecord.skuEntries.map((entry) => {
                         const skuImageUrl = getSkuDisplayImageUrl(entry);
+                        const skuDisplayName = getSkuEntryDisplayName(entry);
                         const active = imageManagerSelectedSkuIds.includes(entry.id);
                         return (
                           <div
@@ -4268,11 +5274,11 @@ function LinkListPanel({
                               }
                             }}
                           >
-                            <span className="image-editor-sku-thumb-name">{entry.name}</span>
+                            <span className="image-editor-sku-thumb-name">{skuDisplayName}</span>
                             <span className="image-editor-sku-thumb-image">
                               {skuImageUrl ? (
                                 <Image
-                                  alt={entry.name}
+                                  alt={skuDisplayName}
                                   height={48}
                                   preview={false}
                                   referrerPolicy="no-referrer"
@@ -4284,7 +5290,7 @@ function LinkListPanel({
                               )}
                             </span>
                             <button
-                              aria-label={`删除 ${entry.name} 的 SKU 图`}
+                              aria-label={`删除 ${skuDisplayName} 的 SKU 图`}
                               className="image-editor-thumb-remove"
                               type="button"
                               onClick={(event) => {
@@ -4302,6 +5308,181 @@ function LinkListPanel({
                 </div>
               </section>
             </div>
+          </div>
+        ) : null}
+      </Modal>
+      <Modal
+        className="sku-image-binding-modal"
+        open={skuImageBindingOpen}
+        title="绑定 SKU 与图片参数"
+        width={980}
+        okText="确认绑定"
+        cancelText="取消"
+        onCancel={() => {
+          setSkuImageBindingOpen(false);
+          setSkuImageBindingTargetSkuIds([]);
+          setSkuImageBindingPendingMainGalleryCount(null);
+          setSkuImageBindingPendingMainGallerySkuIds(undefined);
+        }}
+        onOk={confirmSkuImageBindings}
+      >
+        {imageManagerRecord ? (
+          <div className="sku-image-binding-shell">
+            <Alert
+              showIcon
+              type="info"
+              message="用于跨货源组合 SKU 或需要人工指定图片关系的情况；确认后会把绑定结果写回 SKU 和组合组件。"
+            />
+
+            <section className="sku-image-binding-selected-assets">
+              <div className="sku-image-binding-section-head">
+                <Text strong>已选图片参数</Text>
+                <Tag>{skuImageBindingCandidateImages.length} 张</Tag>
+              </div>
+              <div className="sku-image-binding-asset-strip">
+                {skuImageBindingCandidateImages.map((option, index) => (
+                  <div className="sku-image-binding-asset" key={option.asset.id}>
+                    <span className="sku-image-binding-asset-index">{index + 1}</span>
+                    <Image
+                      alt={option.label || option.asset.alt || `图片参数 ${index + 1}`}
+                      height={58}
+                      preview={false}
+                      referrerPolicy="no-referrer"
+                      src={option.imageUrl}
+                      width={58}
+                    />
+                    <Text ellipsis title={`${option.sourceLabel} / ${option.label || option.asset.alt || `图片参数 ${index + 1}`}`}>
+                      {option.sourceLabel} / {option.label || option.asset.alt || `图片参数 ${index + 1}`}
+                    </Text>
+                  </div>
+                ))}
+              </div>
+            </section>
+
+            <section className="sku-image-binding-list">
+              {skuImageBindingSubjects.map((subject, subjectIndex) => {
+                const currentUrl = getSkuImageBindingSubjectCurrentUrl(imageManagerRecord, subject);
+                const subjectTitle = getSkuImageBindingSubjectTitle(
+                  imageManagerRecord,
+                  subject,
+                  subjectIndex,
+                  skuImageBindingSubjects.length,
+                );
+                const targetLabels = Array.from(
+                  new Set(subject.targets.map((target) => getSkuImageBindingTargetLabel(imageManagerRecord, target))),
+                );
+                const targetShortLabels = Array.from(
+                  new Set(
+                    subject.targets.map((target) => getSkuImageBindingTargetShortLabel(imageManagerRecord, target)),
+                  ),
+                );
+                const splitSubject = isSkuImageBindingSplitSubject(subject);
+                const renderChoiceGrid = (choiceKey: string) => {
+                  const selectedAssetId = skuImageBindingChoices[choiceKey];
+                  return (
+                    <div className="sku-image-binding-choice-grid">
+                      <button
+                        className={`sku-image-binding-choice ${selectedAssetId ? '' : 'is-active'}`}
+                        type="button"
+                        onClick={() =>
+                          setSkuImageBindingChoices((current) => ({
+                            ...current,
+                            [choiceKey]: undefined,
+                          }))
+                        }
+                      >
+                        <span className="sku-image-binding-no-image">不绑定</span>
+                        <Text type="secondary">保留现状</Text>
+                      </button>
+                      {skuImageBindingCandidateImages.map((option, index) => {
+                        const active = selectedAssetId === option.asset.id;
+                        return (
+                          <button
+                            className={`sku-image-binding-choice ${active ? 'is-active' : ''}`}
+                            key={option.asset.id}
+                            type="button"
+                            onClick={() =>
+                              setSkuImageBindingChoices((current) => ({
+                                ...current,
+                                [choiceKey]: option.asset.id,
+                              }))
+                            }
+                          >
+                            <span className="sku-image-binding-choice-index">{index + 1}</span>
+                            <Image
+                              alt={option.label || option.asset.alt || `图片参数 ${index + 1}`}
+                              height={54}
+                              preview={false}
+                              referrerPolicy="no-referrer"
+                              src={option.imageUrl}
+                              width={54}
+                            />
+                          </button>
+                        );
+                      })}
+                    </div>
+                  );
+                };
+                return (
+                  <div className="sku-image-binding-row" key={subject.key}>
+                    <div className="sku-image-binding-target">
+                      <Space className="sku-image-binding-index-tags" size={[6, 6]} wrap>
+                        <Tag color="blue">{subjectTitle.indexLabel}</Tag>
+                        <Tag color="geekblue">{subjectTitle.skuLabel}</Tag>
+                      </Space>
+                      <div className="sku-image-binding-target-title">
+                        {currentUrl ? (
+                          <Image
+                            alt={`${subjectTitle.title} 当前图`}
+                            height={42}
+                            preview={false}
+                            referrerPolicy="no-referrer"
+                            src={currentUrl}
+                            width={42}
+                          />
+                        ) : (
+                          <span className="sku-image-binding-empty-thumb">空</span>
+                        )}
+                        <div>
+                          <Text strong className="sku-image-binding-subject-name" title={subjectTitle.title}>
+                            {subjectTitle.title}
+                          </Text>
+                          <Text className="sku-image-binding-subject-meta" type="secondary">
+                            确认后会同步写回：{targetShortLabels.join('、')}
+                          </Text>
+                        </div>
+                      </div>
+                      <Space className="sku-image-binding-target-tags" size={[6, 6]} wrap>
+                        {targetLabels.slice(0, 4).map((label) => (
+                          <Tag className="sku-image-binding-target-tag" key={label} title={label}>
+                            {label}
+                          </Tag>
+                        ))}
+                        {targetLabels.length > 4 ? <Tag>+{targetLabels.length - 4}</Tag> : null}
+                      </Space>
+                    </div>
+
+                    {splitSubject ? (
+                      <div className="sku-image-binding-component-stack">
+                        {subject.targets.map((target) => (
+                          <div className="sku-image-binding-component-row" key={target.key}>
+                            <div className="sku-image-binding-component-head">
+                              <Tag color="cyan">{getSkuImageBindingTargetShortLabel(imageManagerRecord, target)}</Tag>
+                              <Text ellipsis title={target.componentName}>
+                                {target.componentName}
+                              </Text>
+                            </div>
+                            {renderChoiceGrid(target.key)}
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      renderChoiceGrid(subject.key)
+                    )}
+                  </div>
+                );
+              })}
+            </section>
           </div>
         ) : null}
       </Modal>
@@ -4437,6 +5618,21 @@ function DataDeskPanel({
     }
   };
 
+  const recordProductToPool = async (product: Product) => {
+    setAddingToPool(true);
+    try {
+      const result = await addProductsToPool([product.id]);
+      setSelectedRowKeys((keys) => keys.filter((key) => key !== product.id));
+      await Promise.all([loadDataDeskProducts(page, pageSize, filters), loadDataDeskStats()]);
+      onProductsAddedToPool();
+      message.success(result.added_count > 0 ? '已录入商品池' : '商品已在商品池中');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '录入商品池失败');
+    } finally {
+      setAddingToPool(false);
+    }
+  };
+
   return (
     <div className="data-desk-page">
       <div className="stats-grid data-desk-stats-grid">
@@ -4448,9 +5644,6 @@ function DataDeskPanel({
         </Card>
         <Card className="metric-card metric-card-yellow">
           <Statistic title="近 30 天高销量" value={productStats.recent_30_count} />
-        </Card>
-        <Card className="metric-card metric-card-gray">
-          <Statistic title="已删除" value={productStats.deleted_count} />
         </Card>
       </div>
 
@@ -4558,16 +5751,7 @@ function DataDeskPanel({
             void loadDataDeskProducts(1, pageSize, filters, undefined, order);
           }}
           onView={onViewProduct}
-          onDelete={(product) => {
-            deleteBackendProduct(product.id, 'all')
-              .then(() => loadDataDeskProducts(page, pageSize, filters))
-              .then(() => loadDataDeskStats())
-              .then(() => {
-                setSelectedRowKeys((keys) => keys.filter((key) => key !== product.id));
-                message.success('商品已删除');
-              })
-              .catch((error) => message.error(error.message || '删除失败'));
-          }}
+          onRecord={recordProductToPool}
         />
       </Card>
     </div>
@@ -4582,19 +5766,17 @@ export function SelectProductPage({
   onLogout: () => void;
 }) {
   const isAdminUser = currentUser.role === 'admin';
-  const [form] = Form.useForm<Filters>();
+  const [form] = Form.useForm<ProductPoolFilters>();
   const [products, setProducts] = useState<Product[]>(mockProducts);
   const [productTotal, setProductTotal] = useState(mockProducts.length);
-  const [productStats, setProductStats] = useState<ProductStats>(defaultStats);
   const [backendReady, setBackendReady] = useState(false);
   const [loadingProducts, setLoadingProducts] = useState(false);
   const [currentPage, setCurrentPage] = useState(1);
   const [pageSize, setPageSize] = useState(10);
   const [selectedRowKeys, setSelectedRowKeys] = useState<Key[]>([]);
-  const [filters, setFilters] = useState<Filters>(defaultFilters);
+  const [filters, setFilters] = useState<ProductPoolFilters>(defaultProductPoolFilters);
   const [priceSortOrder, setPriceSortOrder] = useState<SortOrder>();
   const [gmvSortOrder, setGmvSortOrder] = useState<SortOrder>();
-  const [categories, setCategories] = useState<ProductCategoryOption[]>([]);
   const [importOpen, setImportOpen] = useState(false);
   const [exportingTemplate, setExportingTemplate] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -4618,12 +5800,13 @@ export function SelectProductPage({
     ) => {
       setLoadingProducts(true);
       try {
+        const requestFilters = getProductPoolRequestFilters(nextFilters);
         const response = await fetchProducts({
           page: nextPage,
           pageSize: nextPageSize,
           sortBy: nextPriceSortOrder ? 'price' : nextGmvSortOrder ? 'gmv' : undefined,
           sortOrder: toBackendPriceSortOrder(nextPriceSortOrder || nextGmvSortOrder),
-          ...nextFilters,
+          ...requestFilters,
         });
         setProducts(response.items.map(mapBackendProduct));
         setProductTotal(response.total);
@@ -4631,19 +5814,6 @@ export function SelectProductPage({
       } catch {
         setBackendReady(false);
         const fallbackProducts = mockProducts.filter((product) => {
-          if (nextFilters.period && nextFilters.period !== '全部' && product.period !== nextFilters.period) {
-            return false;
-          }
-          if (
-            nextFilters.category &&
-            nextFilters.category !== ALL_CATEGORY_VALUE &&
-            product.category !== nextFilters.category &&
-            product.categoryLevel1 !== nextFilters.category &&
-            product.categoryLevel2 !== nextFilters.category &&
-            product.categoryPath !== nextFilters.category
-          ) {
-            return false;
-          }
           if (
             nextFilters.keyword &&
             !product.title.toLowerCase().includes(nextFilters.keyword.toLowerCase()) &&
@@ -4652,9 +5822,8 @@ export function SelectProductPage({
           ) {
             return false;
           }
+          if (!matchesProductPoolDateRange(product, nextFilters.selectedDateRange)) return false;
           if (!matchesRange(product.price, nextFilters.priceRange)) return false;
-          if (!matchesRange(product.sales, nextFilters.salesRange)) return false;
-          if (!matchesRange(product.gmv, nextFilters.gmvRange)) return false;
           return product.status !== 'deleted';
         });
         const sortedFallbackProducts = nextPriceSortOrder || nextGmvSortOrder
@@ -4677,16 +5846,6 @@ export function SelectProductPage({
     [currentPage, filters, gmvSortOrder, pageSize, priceSortOrder],
   );
 
-  const loadStats = useCallback(async () => {
-    try {
-      const stats = await fetchProductStats();
-      setProductStats(stats);
-      setBackendReady(true);
-    } catch {
-      setProductStats(defaultStats);
-    }
-  }, []);
-
   const warnLinkPersistenceFailure = useCallback((error: unknown) => {
     console.error(error);
     message.warning('链接列表已先保存在本地，后端持久化失败，请确认后端已启动');
@@ -4695,10 +5854,6 @@ export function SelectProductPage({
   useEffect(() => {
     if (isAdminUser) return;
     void loadProducts(1, pageSize, filters);
-    void loadStats();
-    fetchProductCategories('pool')
-      .then(setCategories)
-      .catch(() => setCategories([]));
     setCurrentPage(1);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -4739,9 +5894,6 @@ export function SelectProductPage({
       active = false;
     };
   }, [currentUser.id, isAdminUser]);
-
-  const activeCount = productStats.active_count;
-  const deletedCount = productStats.deleted_count;
 
   const openProduct = useCallback((product: Product, options: { syncUrl?: boolean; drawerMode?: 'sourcing' | 'sales' } = {}) => {
     setActiveProduct(product);
@@ -4954,11 +6106,6 @@ export function SelectProductPage({
       setProducts((current) =>
         current.map((item) => (item.id === product.id ? { ...item, status: 'deleted' } : item)),
       );
-      setProductStats((current) => ({
-        ...current,
-        active_count: Math.max(0, current.active_count - 1),
-        deleted_count: current.deleted_count + 1,
-      }));
       setSelectedRowKeys((keys) => keys.filter((key) => key !== product.id));
       if (activeProduct?.id === product.id) closeProduct();
       message.success('商品已删除');
@@ -4971,12 +6118,49 @@ export function SelectProductPage({
 
     deleteBackendProduct(product.id)
       .then(() => loadProducts(currentPage, pageSize, filters))
-      .then(() => loadStats())
       .then(() => {
         if (activeProduct?.id === product.id) closeProduct();
         message.success('商品已删除');
       })
       .catch((error) => message.error(error.message || '删除失败'));
+  };
+
+  const deleteSelectedProducts = () => {
+    const productIds = selectedRowKeys.map(String).filter(Boolean);
+    if (productIds.length === 0) {
+      message.warning('请先选择要删除的商品');
+      return;
+    }
+
+    Modal.confirm({
+      title: `确认删除选中的 ${productIds.length} 个商品？`,
+      content: '删除后会从当前商品池中移除，不影响数据台原始商品库。',
+      okText: '批量删除',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      async onOk() {
+        const deletingIdSet = new Set(productIds);
+        if (!backendReady) {
+          setProducts((current) => current.filter((product) => !deletingIdSet.has(product.id)));
+          setProductTotal((current) => Math.max(0, current - deletingIdSet.size));
+          setSelectedRowKeys([]);
+          if (activeProduct && deletingIdSet.has(activeProduct.id)) closeProduct();
+          message.success(`已删除 ${deletingIdSet.size} 个商品`);
+          return;
+        }
+
+        const results = await Promise.allSettled(productIds.map((productId) => deleteBackendProduct(productId)));
+        const failedCount = results.filter((result) => result.status === 'rejected').length;
+        setSelectedRowKeys([]);
+        await loadProducts(currentPage, pageSize, filters);
+        if (activeProduct && deletingIdSet.has(activeProduct.id)) closeProduct();
+        if (failedCount > 0) {
+          message.error(`批量删除完成，但有 ${failedCount} 个商品删除失败`);
+          return;
+        }
+        message.success(`已删除 ${productIds.length} 个商品`);
+      },
+    });
   };
 
   const selectCandidate = (product: Product, candidate: SourcingCandidate) => {
@@ -4989,10 +6173,10 @@ export function SelectProductPage({
   };
 
   const resetFilters = () => {
-    form.setFieldsValue(defaultFilters);
-    setFilters(defaultFilters);
+    form.setFieldsValue(defaultProductPoolFilters);
+    setFilters(defaultProductPoolFilters);
     setCurrentPage(1);
-    void loadProducts(1, pageSize, defaultFilters);
+    void loadProducts(1, pageSize, defaultProductPoolFilters);
   };
 
   return (
@@ -5072,30 +6256,11 @@ export function SelectProductPage({
             <DataDeskPanel
               onProductsAddedToPool={() => {
                 void loadProducts(currentPage, pageSize, filters);
-                void loadStats();
-                fetchProductCategories('pool')
-                  .then(setCategories)
-                  .catch(() => setCategories([]));
               }}
               onViewProduct={(product) => openProduct(product, { drawerMode: 'sales', syncUrl: false })}
             />
           ) : (
             <>
-          <div className="stats-grid">
-            <Card className="metric-card metric-card-blue">
-              <Statistic title={backendReady ? '当前批次商品' : '演示商品'} value={activeCount} />
-            </Card>
-            <Card className="metric-card metric-card-red">
-              <Statistic title="近 7 天高销量" value={productStats.recent_7_count} />
-            </Card>
-            <Card className="metric-card metric-card-yellow">
-              <Statistic title="近 30 天高销量" value={productStats.recent_30_count} />
-            </Card>
-            <Card className="metric-card metric-card-gray">
-              <Statistic title="已删除" value={deletedCount} />
-            </Card>
-          </div>
-
           <Card className="filter-card" title="筛选器">
             <Form
               form={form}
@@ -5105,32 +6270,16 @@ export function SelectProductPage({
                 setCurrentPage(1);
                 void loadProducts(1, pageSize, values);
               }}
-              initialValues={defaultFilters}
+              initialValues={defaultProductPoolFilters}
             >
               <Form.Item label="关键词" name="keyword">
                 <Input allowClear placeholder="搜索商品标题 / ID" />
               </Form.Item>
-              <Form.Item label="类目" name="category">
-                <CategoryCascaderFilterV2 categories={categories} />
-              </Form.Item>
-              <Form.Item label="时间范围" name="period">
-                <Select
-                  style={{ width: 130 }}
-                  options={[
-                    { value: '全部', label: '全部' },
-                    { value: '近7天', label: '近 7 天' },
-                    { value: '近30天', label: '近 30 天' },
-                  ]}
-                />
+              <Form.Item label="时间范围" name="selectedDateRange">
+                <RangePicker allowClear format="YYYY-MM-DD" />
               </Form.Item>
               <Form.Item label="价格区间" name="priceRange">
                 <Input allowClear placeholder="¥0 - ¥999" />
-              </Form.Item>
-              <Form.Item label="销量区间" name="salesRange">
-                <Input allowClear placeholder="不限" />
-              </Form.Item>
-              <Form.Item label="GMV 区间" name="gmvRange">
-                <Input allowClear placeholder="不限" />
               </Form.Item>
               <Form.Item>
                 <Space>
@@ -5145,6 +6294,15 @@ export function SelectProductPage({
 
           <Card
             className="table-card"
+            extra={
+              <Button
+                danger
+                disabled={selectedRowKeys.length === 0}
+                onClick={deleteSelectedProducts}
+              >
+                批量删除
+              </Button>
+            }
             title={
               <Space>
                 <span>商品列表</span>
@@ -5171,13 +6329,10 @@ export function SelectProductPage({
                 setCurrentPage(1);
                 void loadProducts(1, pageSize, filters, order, undefined);
               }}
-              gmvSortOrder={gmvSortOrder}
-              onGmvSortChange={(order) => {
-                setGmvSortOrder(order);
-                setPriceSortOrder(undefined);
-                setCurrentPage(1);
-                void loadProducts(1, pageSize, filters, undefined, order);
-              }}
+              hideGmvColumn
+              dateColumnTitle="选入时间"
+              dateMetaLabel="选入"
+              getDateValue={(product) => product.selectedAt || product.listedAt}
               onView={openProduct}
               onDelete={deleteProduct}
             />
@@ -5191,21 +6346,25 @@ export function SelectProductPage({
         open={importOpen}
         onClose={() => setImportOpen(false)}
         onImport={async (file) => {
-          const result = await uploadYunqiFile(file);
+          const result = await uploadDianxiaomiTemplateFile(file);
           setImportOpen(false);
-          message.success(`导入完成：${result.imported_count} 条商品`);
-          setCurrentPage(1);
-          await Promise.all([loadProducts(1, pageSize, filters), loadStats()]);
-        }}
-        onImport1688Links={async (productUrls) => {
-          const result = await upload1688Links(productUrls);
-          setImportOpen(false);
-          message.success(`1688 采集完成：${result.imported_count} 条商品`);
-          if (result.errors.length > 0) {
-            message.warning(`有 ${result.errors.length} 条使用链接兜底导入`);
+
+          const importedRecords = result.records || [];
+          if (importedRecords.length > 0) {
+            setLinkListRecords((current) => {
+              const importedIdSet = new Set(importedRecords.map((record) => record.id));
+              const next = [
+                ...importedRecords,
+                ...current.filter((record) => !importedIdSet.has(record.id)),
+              ].slice(0, 200);
+              writeLinkListRecords(next, currentUser.id);
+              return next;
+            });
           }
+
+          message.success(`导入完成：${result.imported_count} 个商品，${importedRecords.length} 条 SKU 回显记录`);
           setCurrentPage(1);
-          await Promise.all([loadProducts(1, pageSize, filters), loadStats()]);
+          await loadProducts(1, pageSize, filters);
         }}
       />
 

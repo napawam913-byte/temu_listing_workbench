@@ -342,7 +342,7 @@ def has_moq_marker(value: str) -> bool:
 
 
 def get_title_optimizer_settings(*, user_id: str | None = None) -> TitleOptimizerSettings:
-    settings = get_ai_stage_settings("title", user_id=user_id)
+    settings = get_ai_stage_settings("variant_translation", user_id=user_id)
     return TitleOptimizerSettings(
         api_key=clean_text(settings.get("api_key")),
         base_url=clean_text(settings.get("base_url")).rstrip("/"),
@@ -404,7 +404,7 @@ def generate_titles_with_ai(
                 "source": build_title_source_payload(record, fallback),
                 "required_json": {
                     "title_cn": "optimized Chinese title",
-                    "title_en": "optimized English title, 50-200 characters preferred",
+                    "title_en": "optimized English title, 160-180 English characters preferred",
                 },
             },
             ensure_ascii=False,

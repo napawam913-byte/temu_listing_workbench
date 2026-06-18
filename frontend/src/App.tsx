@@ -66,9 +66,6 @@ export default function App() {
           <Space direction="vertical" size={18} className="auth-card-content">
             <div>
               <Typography.Title level={3}>Temu 选品上架工作台</Typography.Title>
-              <Typography.Text type="secondary">
-                登录后进入自己的商品池和链接池。默认本地账号：admin / admin123
-              </Typography.Text>
             </div>
             <div className="auth-mode-switch">
               <Button type={authMode === 'login' ? 'primary' : 'default'} onClick={() => setAuthMode('login')}>

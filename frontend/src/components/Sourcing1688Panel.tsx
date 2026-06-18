@@ -311,11 +311,11 @@ function getCandidateSourceTitle(candidate: Captured1688Candidate, candidateInde
 function getSkuCombinationDisplayName(items: SkuCombinationItem[]) {
   return items
     .map((item) => {
-      const specText = item.optionText || item.specText;
-      const sourceTitle = getCandidateSourceTitle(item.candidate, item.candidateIndex);
-      return `${specText}${sourceTitle}`;
+      const specText = String(item.optionText || item.specText || '').trim();
+      return specText || getCandidateLabel(item.candidate, item.candidateIndex);
     })
-    .join('+');
+    .filter(Boolean)
+    .join(' + ');
 }
 
 function Smart1688KeywordRecommendations({ product }: { product: Product }) {

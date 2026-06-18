@@ -18,6 +18,7 @@ export type Product = {
   gmv: number;
   reviewCount: number;
   listedAt: string;
+  selectedAt?: string;
   growthRate: number;
   sourceRow: number;
   period: '近7天' | '近30天';

@@ -254,11 +254,17 @@ def analyze_product_for_1688(product: dict[str, Any], *, user_id: str | None = N
                 status="failed",
                 error_message=str(exc),
             )
-            raise ValueError(f"1688 智能推荐中文关键词转换失败：{exc}") from exc
+            analysis = build_fallback_analysis(title, category)
+            return {
+                **analysis,
+                "source": "rule-fallback",
+                "warning": f"AI 推荐关键词生成失败，已使用本地规则推荐：{exc}",
+                "cache": {"hit": False, "key": cache_key},
+            }
 
     analysis = build_fallback_analysis(title, category)
     save_cached_analysis(cache_key, title_hash, analysis, model="rule-fallback")
-    return {**analysis, "cache": {"hit": False, "key": cache_key}}
+    return {**analysis, "source": "rule-fallback", "cache": {"hit": False, "key": cache_key}}
 
 
 def build_analysis_cache_key(product: dict[str, Any], *, title: str, category: str, main_image_url: str) -> str:
@@ -318,6 +324,8 @@ def save_cached_analysis(cache_key: str, title_hash: str, analysis: dict[str, An
     if not cache_key:
         return
     safe_analysis = {
+        "core_product_name": clean_text(analysis.get("core_product_name")),
+        "removed_noise_terms": analysis.get("removed_noise_terms") if isinstance(analysis.get("removed_noise_terms"), list) else [],
         "summary": clean_text(analysis.get("summary")),
         "strategy": clean_text(analysis.get("strategy")),
         "keywords": analysis.get("keywords") if isinstance(analysis.get("keywords"), list) else [],
@@ -345,59 +353,61 @@ def analyze_with_chatgpt(*, title: str, category: str, main_image_url: str, sett
     user_payload = {
         "product_title": title,
         "category": category,
+        "reference_image_url": main_image_url,
         "task": (
-            "Analyze the product title and image. If the title is English or mixed-language, first translate the real product "
-            "subject and key attributes into Simplified Chinese. Then recommend exploratory 1688 sourcing directions for "
-            "adjacent categories, complementary products, bundle add-ons, same-scene items, or same-buyer-intent products. "
-            "The recommendations are references for product expansion, not exact same-item keyword variants. "
-            "For example: if the product is a spoon, recommend bowls, plates, placemats, chopstick holders, or cutlery organizers. "
-            "Do not only recommend the original product with suffixes like different款, 批发, 1688, same material, same shape, or same function."
+            "Complete the whole workflow in this single API call. Step 1: analyze the title and optional image to identify the "
+            "real product. Remove irrelevant adjectives, long marketing copy, audience/occasion filler, logistics words, promo text, "
+            "ratings, sold counts, pack counts, model noise, and raw English fragments. Translate the concrete product name into "
+            "Simplified Chinese. Step 2: based on that concrete product name, expand into useful 1688 Chinese search keywords: "
+            "similar product names, same-category variants with specific attributes, adjacent categories, complementary products, "
+            "same-scene products, and bundle add-ons. For example: if the product is a bowl, recommend spoon, plate, placemat, "
+            "round bowl, printed bowl, or different pattern bowl. If it is a square bowl, recommend round bowl or specific pattern/style bowls. "
+            "Return Chinese search keywords only."
         ),
         "translation_requirement": (
-            "所有 keyword 必须是简体中文 1688 采购搜索词。英文/中英混合标题必须转成中文，不能原样输出英文连写词、型号词、物流词、促销词或数量词。"
+            "所有 keyword 必须是简体中文 1688 采购搜索词。英文/中英混合标题必须先提炼并转成中文商品名，不能原样输出英文连写词、型号词、物流词、促销词、评分销量词或数量词。"
         ),
         "divergent_recommendation_requirement": (
-            "关键词应该发散到相似类目、搭配类目、同使用场景或可组成套装的周边商品；不要只围绕原商品本身扩词。"
+            "关键词应该围绕提炼后的具体商品名，扩散到相似商品名、明确属性变体、相邻类目、搭配类目、同使用场景或可组成套装的周边商品。"
+            "允许同类目变体，但必须是可搜索的具体方向，例如圆形碗、印花碗、卡通碗、陶瓷碗；不要使用不同款、批发、1688、热销、爆款这类空泛后缀。"
         ),
         "good_examples": {
             "勺子": ["陶瓷碗", "餐盘", "餐垫", "筷子筒", "餐具收纳盒"],
+            "正方形陶瓷碗": ["圆形陶瓷碗", "印花陶瓷碗", "卡通陶瓷碗", "勺子", "餐盘", "餐垫"],
             "宠物碗": ["宠物餐垫", "宠物喂食勺", "宠物储粮桶", "宠物饮水器"],
             "纸飞机玩具": ["折纸材料包", "儿童手工材料", "飞机模型玩具", "派对游戏道具"],
         },
-        "bad_examples": ["勺子不同款", "勺子批发", "勺子1688", "36pcs 3d paper airplane 不同款"],
+        "bad_examples": ["勺子不同款", "勺子批发", "勺子1688", "36pcs 3d paper airplane 不同款", "square bowl", "best seller"],
         "must_translate_examples": {
             "3DPaperAirplaneF": "纸飞机玩具",
             "Pale Mini Tote Bags": "迷你托特包",
             "Wood D12 Dice": "木质十二面骰子",
         },
         "required_json": {
-            "summary": "short Chinese summary of product core use and visual traits",
-            "strategy": "short Chinese strategy explaining adjacent category expansion, complementary bundles, or same-scene sourcing",
+            "core_product_name": "提炼后的简体中文具体商品名，不要形容词杂质、数量词、促销词或英文碎片",
+            "removed_noise_terms": ["被去除的英文碎片、促销词、数量词、场景填充词等"],
+            "summary": "short Chinese summary of the cleaned product identity",
+            "strategy": "short Chinese strategy explaining similar-name variants, adjacent category expansion, complementary bundles, or same-scene sourcing",
             "keywords": [
                 {
-                    "keyword": "简体中文 1688 相邻类目/搭配品/同场景商品搜索词，4-16 个中文字符为主，不要英文原词",
-                    "intent": "adjacent-category/complementary-bundle/same-scene/same-buyer-intent",
+                    "keyword": "简体中文 1688 搜索词，2-16 个中文字符为主，不要英文原词",
+                    "intent": "same-product-variant/adjacent-category/complementary-bundle/same-scene/same-buyer-intent",
                     "reason": "why this adjacent product direction is commercially relevant",
                 }
             ],
         },
     }
-    content: list[dict[str, str]] = [
-        {"type": "input_text", "text": json.dumps(user_payload, ensure_ascii=False)}
-    ]
-    if main_image_url.startswith("http"):
-        content.append({"type": "input_image", "image_url": main_image_url})
-
-    response = client.responses.create(
+    response = client.chat.completions.create(
         model=settings.text_model,
-        input=[
+        messages=[
             {
                 "role": "system",
                 "content": (
                     "You are a careful 1688 sourcing analyst for Temu listing operations. "
-                    "Return strict JSON only. Think like a product expansion buyer, not an exact-match keyword splitter. "
-                    "Recommend adjacent categories, complementary items, bundle add-ons, same-scene products, or same-buyer-intent products. "
-                    "Avoid same-item variants that merely add different款, 批发, 1688, material, color, size, shape, or quantity to the original product. "
+                    "Return strict JSON only. First clean the title into one concrete Simplified Chinese product name, then expand search keywords from that product identity. "
+                    "Think like a 1688 buyer who needs similar product names, specific same-category variants, adjacent categories, complementary items, bundle add-ons, same-scene products, or same-buyer-intent products. "
+                    "Same-category variants are allowed when they are specific searchable product names, such as round bowl, printed bowl, cartoon bowl, ceramic bowl, or different pattern bowl translated into Chinese. "
+                    "Reject vague suffixes such as 不同款, 批发, 1688, 热销, 爆款, best seller, free shipping, sold count, rating, or pack-count-only keywords. "
                     "Every keyword must be a Simplified Chinese supplier/search phrase for 1688. "
                     "Do not output raw English title fragments, SKU/model codes, logistics text, promo text, pack counts, "
                     "brand names, medical claims, certification claims, or unsafe marketplace wording. "
@@ -405,7 +415,7 @@ def analyze_with_chatgpt(*, title: str, category: str, main_image_url: str, sett
                     "'LED灯', or 'USB充电线'."
                 ),
             },
-            {"role": "user", "content": content},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
         ],
     )
     return normalize_analysis(parse_ai_response_json(response), title, category)
@@ -452,6 +462,12 @@ def build_fallback_analysis(title: str, category: str) -> dict[str, Any]:
 
 
 def normalize_analysis(raw: dict[str, Any], title: str, category: str) -> dict[str, Any]:
+    core_product_name, _ = sanitize_marketplace_text(clean_text(raw.get("core_product_name")))
+    removed_noise_terms = [
+        clean_text(item)[:40]
+        for item in raw.get("removed_noise_terms", [])
+        if clean_text(item)
+    ][:12] if isinstance(raw.get("removed_noise_terms"), list) else []
     summary, _ = sanitize_marketplace_text(clean_text(raw.get("summary")) or f"当前商品：{title or category}")
     strategy, _ = sanitize_marketplace_text(
         clean_text(raw.get("strategy")) or "推荐相邻类目、搭配品、同场景商品或可组成套装的周边货源。"
@@ -479,6 +495,8 @@ def normalize_analysis(raw: dict[str, Any], title: str, category: str) -> dict[s
         raise ValueError("模型没有返回中文 1688 推荐关键词")
 
     return {
+        "core_product_name": core_product_name or extract_core_product_name_hint(title, category),
+        "removed_noise_terms": removed_noise_terms,
         "summary": summary,
         "strategy": strategy,
         "keywords": unique_keyword_items(keywords)[:8],
@@ -488,6 +506,8 @@ def normalize_analysis(raw: dict[str, Any], title: str, category: str) -> dict[s
 def build_fallback_analysis_without_recursion(title: str, category: str) -> dict[str, Any]:
     keywords = adjacent_fallback_keywords(title, category) or ["同场景搭配品", "礼品包装盒", "收纳展示架"]
     return {
+        "core_product_name": extract_core_product_name_hint(title, category),
+        "removed_noise_terms": [],
         "summary": f"当前商品核心方向：{title or keywords[0]}",
         "strategy": "推荐相邻类目、搭配品、同场景商品或可组成套装的周边货源。",
         "keywords": [
@@ -501,11 +521,17 @@ def build_fallback_analysis_without_recursion(title: str, category: str) -> dict
     }
 
 
+def extract_core_product_name_hint(title: str, category: str) -> str:
+    terms = extract_terms(f"{title} {category}")
+    return " ".join(terms[:3])[:48] or clean_text(title)[:48] or clean_text(category)[:48]
+
+
 def adjacent_fallback_keywords(title: str, category: str) -> list[str]:
     text = clean_text(f"{title} {category}").lower()
     groups: list[tuple[tuple[str, ...], list[str]]] = [
         (("勺", "spoon"), ["陶瓷碗", "餐盘", "餐垫", "筷子筒", "餐具收纳盒", "儿童餐具套装"]),
-        (("碗", "bowl"), ["勺子", "餐盘", "餐垫", "筷子", "餐具收纳盒", "宠物餐垫"]),
+        (("方形碗", "正方形碗", "square bowl"), ["圆形碗", "印花碗", "卡通碗", "勺子", "餐盘", "餐垫"]),
+        (("碗", "bowl"), ["圆形碗", "印花碗", "勺子", "餐盘", "餐垫", "餐具收纳盒"]),
         (("盘", "plate"), ["勺子", "餐垫", "餐具套装", "杯垫", "桌面收纳盘"]),
         (("宠物碗", "pet bowl"), ["宠物餐垫", "宠物饮水器", "宠物储粮桶", "宠物喂食勺", "宠物零食罐"]),
         (("纸飞机", "paper airplane", "airplane"), ["折纸材料包", "儿童手工材料", "飞机模型玩具", "派对游戏道具", "手工收纳盒"]),

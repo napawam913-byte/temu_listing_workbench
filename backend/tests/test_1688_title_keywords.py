@@ -76,7 +76,7 @@ class TitleKeywordSplitTest(unittest.TestCase):
 
     def test_gpt_prompt_requires_chinese_1688_keyword_conversion(self):
         responses = CapturingResponses()
-        fake_client = SimpleNamespace(responses=responses)
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=responses))
         settings = SimpleNamespace(text_model="gpt-5.5")
 
         with patch("app.modules.sourcing_1688.title_keywords.build_openai_client", return_value=fake_client):
@@ -85,7 +85,7 @@ class TitleKeywordSplitTest(unittest.TestCase):
         self.assertEqual(result["primary_keyword"], "纸飞机玩具")
         self.assertEqual(result["keywords"][0]["searchUrl"], build_1688_search_url("纸飞机玩具"))
 
-        sent_prompt = json.dumps(responses.payload["input"], ensure_ascii=False)
+        sent_prompt = json.dumps(responses.payload["messages"], ensure_ascii=False)
         self.assertIn("Simplified Chinese 1688 sourcing keywords", sent_prompt)
         self.assertIn("英文或中英混合标题必须先转成简体中文", sent_prompt)
         self.assertIn("3DPaperAirplaneF", sent_prompt)
@@ -103,7 +103,7 @@ class TitleKeywordSplitTest(unittest.TestCase):
                 ensure_ascii=False,
             )
         )
-        fake_client = SimpleNamespace(responses=responses)
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=responses))
         settings = SimpleNamespace(text_model="gpt-5.5")
 
         with patch("app.modules.sourcing_1688.title_keywords.build_openai_client", return_value=fake_client):
@@ -122,7 +122,7 @@ class TitleKeywordSplitTest(unittest.TestCase):
                 ensure_ascii=False,
             )
         )
-        fake_client = SimpleNamespace(responses=responses)
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=responses))
         settings = SimpleNamespace(text_model="gpt-5.5")
 
         with patch("app.modules.sourcing_1688.title_keywords.build_openai_client", return_value=fake_client):
@@ -134,7 +134,7 @@ class TitleKeywordSplitTest(unittest.TestCase):
             def create(self, **kwargs):
                 raise RuntimeError("provider returned malformed response")
 
-        fake_client = SimpleNamespace(responses=FailingResponses())
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FailingResponses()))
         settings = SimpleNamespace(api_key="sk-test", text_model="gpt-5.5", channel_id="chufan_ai")
 
         with (

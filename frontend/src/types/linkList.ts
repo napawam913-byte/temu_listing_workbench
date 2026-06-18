@@ -71,6 +71,8 @@ export type LinkListSource = {
 export type LinkListComponentSku = {
   name: string;
   specText: string;
+  originalName?: string;
+  visualGeneratedName?: string;
   sourceId?: string;
   sourceSkuId?: string;
   sourceSkuKey?: string;
@@ -97,6 +99,10 @@ export type LinkListSkuEntry = {
   order: number;
   kind: 'single' | 'combo';
   name: string;
+  originalName?: string;
+  visualGeneratedName?: string;
+  visualGeneratedNameSource?: string;
+  visualGeneratedNameTaskId?: string;
   imageAsset?: LinkListImageAsset;
   imageEditTask?: LinkListImageEditTask;
   imageUrl?: string;
@@ -126,6 +132,14 @@ export type LinkListRecord = {
   productId: string;
   productTitle: string;
   productTitleEn?: string;
+  attributeTitle?: string;
+  attributeTitleEn?: string;
+  visualGeneratedTitleCn?: string;
+  visualGeneratedTitleEn?: string;
+  visualGeneratedProductType?: string;
+  visualProductIdentity?: Record<string, unknown>;
+  visualProductIdentityTaskId?: string;
+  visualProductIdentityUpdatedAt?: string;
   category?: string;
   categoryLevel1?: string;
   categoryLevel2?: string;

@@ -7,6 +7,11 @@ from fastapi import Cookie, Depends, Header, HTTPException
 from app.core.config import WORKBENCH_SESSION_COOKIE_NAME
 from app.core.database import get_user_by_session_token
 
+try:
+    from psycopg import OperationalError as PostgresOperationalError
+except Exception:  # pragma: no cover - psycopg is optional in local sqlite modes
+    PostgresOperationalError = None  # type: ignore[assignment]
+
 
 def clean_bearer_token(value: str | None) -> str:
     token = str(value or "").strip()
@@ -20,7 +25,12 @@ def require_current_user(
     session_cookie: str | None = Cookie(None, alias=WORKBENCH_SESSION_COOKIE_NAME),
 ) -> dict[str, Any]:
     token = str(session_cookie or "").strip() or clean_bearer_token(authorization)
-    user = get_user_by_session_token(token)
+    try:
+        user = get_user_by_session_token(token)
+    except Exception as exc:
+        if PostgresOperationalError is not None and isinstance(exc, PostgresOperationalError):
+            raise HTTPException(status_code=503, detail="数据库连接暂时不可用，请稍后重试") from exc
+        raise
     if not user:
         raise HTTPException(status_code=401, detail="请先登录")
     return user

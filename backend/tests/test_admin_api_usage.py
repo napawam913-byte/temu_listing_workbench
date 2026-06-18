@@ -134,7 +134,6 @@ class AdminApiUsageTest(unittest.TestCase):
                     json={"channelId": "chufan_ai", "textModel": "relay-text", "imageModel": "relay-image"},
                 )
                 self.assertEqual(apply_all_response.status_code, 200)
-                self.assertEqual(database.get_app_setting_value("OPENAI_TITLE_MODEL"), "")
                 self.assertEqual(database.get_app_setting_value("OPENAI_RECOMMENDATION_MODEL"), "")
                 self.assertEqual(database.get_app_setting_value("OPENAI_IMAGE_MODEL"), "")
                 self.assertEqual(database.get_app_setting_value("OPENAI_IMAGE_BASE_URL"), "https://backup.example.com/v1")
@@ -172,7 +171,6 @@ class AdminApiUsageTest(unittest.TestCase):
                 self.assertEqual(
                     ids,
                     {
-                        "title",
                         "title_split",
                         "recommendation",
                         "product_attribute",
@@ -203,7 +201,6 @@ class AdminApiUsageTest(unittest.TestCase):
                     image_model="member-image-should-not-win",
                     enabled=True,
                 )
-                database.upsert_app_setting(key="OPENAI_TITLE_MODEL", value="stage-title-model", category="ai")
                 database.upsert_app_setting(key="OPENAI_RECOMMENDATION_MODEL", value="stage-rec-model", category="ai")
                 database.upsert_app_setting(key="OPENAI_VISUAL_ANALYSIS_MODEL", value="stage-vision-model", category="ai")
                 database.upsert_app_setting(key="OPENAI_IMAGE_MODEL", value="stage-image-model", category="ai")
@@ -212,11 +209,11 @@ class AdminApiUsageTest(unittest.TestCase):
                 from app.modules.creative_generation.listing_title_optimizer import get_title_optimizer_settings
                 from app.modules.visual_generation.clients import get_ai_stage_settings
 
-                title_settings = get_title_optimizer_settings(user_id=member["id"])
-                self.assertEqual(title_settings.api_key, "sk-member-channel")
-                self.assertEqual(title_settings.base_url, "https://member-channel.example.com/v1")
-                self.assertEqual(title_settings.text_model, "stage-title-model")
-                self.assertEqual(title_settings.channel_id, "chufan_ai")
+                variant_translation_settings = get_title_optimizer_settings(user_id=member["id"])
+                self.assertEqual(variant_translation_settings.api_key, "sk-member-channel")
+                self.assertEqual(variant_translation_settings.base_url, "https://member-channel.example.com/v1")
+                self.assertEqual(variant_translation_settings.text_model, "member-text-should-not-win")
+                self.assertEqual(variant_translation_settings.channel_id, "chufan_ai")
 
                 recommendation_settings = get_openai_settings("recommendation", user_id=member["id"])
                 self.assertEqual(recommendation_settings.api_key, "sk-member-channel")

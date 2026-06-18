@@ -27,6 +27,8 @@ class CapturingResponses:
         return SimpleNamespace(
             output_text=json.dumps(
                 {
+                    "core_product_name": "纸飞机玩具",
+                    "removed_noise_terms": ["3DPaperAirplaneF"],
                     "summary": "纸飞机玩具",
                     "strategy": "围绕手工玩具场景寻找相邻类目和搭配品。",
                     "keywords": [
@@ -115,7 +117,7 @@ class SmartRecommendationsTest(unittest.TestCase):
 
     def test_recommendation_prompt_requires_adjacent_category_expansion(self):
         responses = CapturingResponses()
-        fake_client = SimpleNamespace(responses=responses)
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=responses))
         settings = SimpleNamespace(text_model="gpt-5.5")
 
         with patch("app.modules.sourcing_1688.smart_recommendations.build_openai_client", return_value=fake_client):
@@ -128,14 +130,20 @@ class SmartRecommendationsTest(unittest.TestCase):
 
         self.assertEqual(result["keywords"][0]["keyword"], "折纸材料包")
 
-        sent_prompt = json.dumps(responses.payload["input"], ensure_ascii=False)
+        sent_prompt = json.dumps(responses.payload["messages"], ensure_ascii=False)
         self.assertIn("adjacent categories", sent_prompt)
         self.assertIn("complementary products", sent_prompt)
+        self.assertIn("specific same-category variants", sent_prompt)
+        self.assertIn("core_product_name", sent_prompt)
+        self.assertIn("提炼后的简体中文具体商品名", sent_prompt)
         self.assertIn("所有 keyword 必须是简体中文", sent_prompt)
         self.assertIn("勺子", sent_prompt)
         self.assertIn("陶瓷碗", sent_prompt)
+        self.assertIn("正方形陶瓷碗", sent_prompt)
+        self.assertIn("圆形陶瓷碗", sent_prompt)
         self.assertIn("3DPaperAirplaneF", sent_prompt)
-        self.assertIn("不要只围绕原商品本身扩词", sent_prompt)
+        self.assertIn("不同款", sent_prompt)
+        self.assertNotIn("input_image", sent_prompt)
 
     def test_recommendation_accepts_plain_string_response_from_compatible_provider(self):
         responses = CapturingResponses(
@@ -148,7 +156,7 @@ class SmartRecommendationsTest(unittest.TestCase):
                 ensure_ascii=False,
             )
         )
-        fake_client = SimpleNamespace(responses=responses)
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=responses))
         settings = SimpleNamespace(text_model="gpt-5.5")
 
         with patch("app.modules.sourcing_1688.smart_recommendations.build_openai_client", return_value=fake_client):
@@ -170,6 +178,16 @@ class SmartRecommendationsTest(unittest.TestCase):
         self.assertNotIn("不锈钢儿童勺子 批发", keyword_values)
         self.assertNotIn("不锈钢儿童勺子 不同款", keyword_values)
 
+    def test_fallback_allows_specific_bowl_variants(self):
+        result = build_fallback_analysis("Square ceramic bowl with cute pattern best seller", "")
+
+        keyword_values = [item["keyword"] for item in result["keywords"]]
+        self.assertIn("圆形碗", keyword_values)
+        self.assertIn("印花碗", keyword_values)
+        self.assertIn("勺子", keyword_values)
+        self.assertNotIn("square bowl", keyword_values)
+        self.assertNotIn("不同款", keyword_values)
+
     def test_recommendation_rejects_raw_english_keywords(self):
         responses = CapturingResponses(
             json.dumps(
@@ -181,7 +199,7 @@ class SmartRecommendationsTest(unittest.TestCase):
                 ensure_ascii=False,
             )
         )
-        fake_client = SimpleNamespace(responses=responses)
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=responses))
         settings = SimpleNamespace(text_model="gpt-5.5")
 
         with patch("app.modules.sourcing_1688.smart_recommendations.build_openai_client", return_value=fake_client):

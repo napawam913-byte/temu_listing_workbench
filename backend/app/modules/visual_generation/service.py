@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import time
 import uuid
@@ -60,7 +61,7 @@ IMAGE_PAYLOAD_RETRY_PROFILES = [
 IMAGE_RATE_LIMIT_RETRY_DELAYS_SECONDS = (0, 8, 16, 30)
 CHUFAN_AI_HOST_MARKER = "aicoming.top"
 CHUFAN_AI_DEFAULT_IMAGE_MODEL = "gpt-image-2-1k"
-VISUAL_PROMPT_LOGIC_VERSION = "sku-image-binding-geometry-lock-2026-06-17"
+VISUAL_PROMPT_LOGIC_VERSION = "analysis-generates-final-title-image-material-100-2026-06-18"
 
 
 class VisualTaskError(ValueError):
@@ -643,37 +644,69 @@ def plan_visual_task(
 
     context = build_visual_prompt_context(task=task, record=record, reference_refs=reference_refs)
     requested_count = int(task.get("requestedCount") or task.get("requested_count") or layout_panel_count(task["layout"]))
+    existing_analysis = task.get("analysis") if isinstance(task.get("analysis"), dict) else {}
+    cached_product_analysis = (
+        existing_analysis.get("productUnderstanding")
+        if isinstance(existing_analysis.get("productUnderstanding"), dict)
+        else existing_analysis.get("productAnalysis")
+        if isinstance(existing_analysis.get("productAnalysis"), dict)
+        else None
+    )
     update_task_status(task_id, user_id, TASK_STATUS_RUNNING, clear_error=True)
     try:
-        assert_user_api_usage_allowed(user_id)
-        try:
-            product_analysis = request_product_analysis_with_payload_retry(
-                api_url=analysis_url,
-                api_key=analysis_settings["api_key"],
-                model=text_model,
-                product_image_path=source_path,
-                product_image_paths=reference_paths,
+        if cached_product_analysis:
+            product_analysis = dict(cached_product_analysis)
+            product_analysis = normalize_visual_product_identity(
+                record=record,
+                product_analysis=product_analysis,
                 context=context,
             )
-            record_visual_api_usage(
-                analysis_settings,
-                user_id=user_id,
-                stage="visual_analysis",
-                api_type="chat",
-                model=text_model,
-                status="success",
-            )
-        except Exception as exc:
-            record_visual_api_usage(
-                analysis_settings,
-                user_id=user_id,
-                stage="visual_analysis",
-                api_type="chat",
-                model=text_model,
-                status="failed",
-                error_message=str(exc),
-            )
-            raise
+        else:
+            assert_user_api_usage_allowed(user_id)
+            try:
+                product_analysis = request_product_analysis_with_payload_retry(
+                    api_url=analysis_url,
+                    api_key=analysis_settings["api_key"],
+                    model=text_model,
+                    product_image_path=source_path,
+                    product_image_paths=reference_paths,
+                    context=context,
+                )
+                product_analysis = normalize_visual_product_identity(
+                    record=record,
+                    product_analysis=product_analysis,
+                    context=context,
+                )
+                persist_product_analysis(
+                    task_id=task_id,
+                    user_id=user_id,
+                    source_image_ref=source_ref,
+                    product_analysis=product_analysis,
+                )
+                existing_analysis = {
+                    "stage": "product_analysis",
+                    "productUnderstanding": product_analysis,
+                    "productAnalysis": product_analysis,
+                }
+                record_visual_api_usage(
+                    analysis_settings,
+                    user_id=user_id,
+                    stage="visual_analysis",
+                    api_type="chat",
+                    model=text_model,
+                    status="success",
+                )
+            except Exception as exc:
+                record_visual_api_usage(
+                    analysis_settings,
+                    user_id=user_id,
+                    stage="visual_analysis",
+                    api_type="chat",
+                    model=text_model,
+                    status="failed",
+                    error_message=str(exc),
+                )
+                raise
         assert_user_api_usage_allowed(user_id)
         try:
             try:
@@ -686,6 +719,13 @@ def plan_visual_task(
                     allow_short_labels=resolved_allow_short_labels,
                     requested_count=requested_count,
                     context=context,
+                    cached_plan=existing_analysis,
+                    on_partial_plan=lambda partial_plan: persist_partial_plan(
+                        task_id=task_id,
+                        user_id=user_id,
+                        source_image_ref=source_ref,
+                        plan=partial_plan,
+                    ),
                 )
             except Exception as exc:
                 if not is_request_too_large_error(exc):
@@ -700,6 +740,13 @@ def plan_visual_task(
                     allow_short_labels=resolved_allow_short_labels,
                     requested_count=requested_count,
                     context=context,
+                    cached_plan=existing_analysis,
+                    on_partial_plan=lambda partial_plan: persist_partial_plan(
+                        task_id=task_id,
+                        user_id=user_id,
+                        source_image_ref=source_ref,
+                        plan=partial_plan,
+                    ),
                 )
             record_visual_api_usage(
                 prompt_settings,
@@ -1035,6 +1082,8 @@ def apply_visual_task_results_to_link_record(*, task_id: str, user_id: str) -> d
         next_record = apply_visual_sku_gallery_result(record, task, modules)
     else:
         next_record = apply_visual_product_gallery_result(record, task, modules)
+    next_record = apply_visual_sku_identity_rewrites(next_record, task)
+    next_record = apply_visual_product_identity_to_record(next_record, task)
 
     now = utc_now_text()
     visual_history = next_record.get("visualGenerationTaskIds")
@@ -1059,6 +1108,576 @@ def load_link_record_for_visual_task(*, link_record_id: str, user_id: str) -> di
 
 def visual_module_result_ref(module: dict[str, Any]) -> str:
     return clean_text(module.get("outputUrl")) or clean_text(module.get("outputPath"))
+
+
+def normalize_visual_product_identity(
+    *,
+    record: dict[str, Any],
+    product_analysis: dict[str, Any],
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Normalize model product identity into a reusable JSON contract for image and Excel flows."""
+    if not isinstance(product_analysis, dict):
+        return {}
+
+    identity = (
+        product_analysis.get("productIdentity")
+        if isinstance(product_analysis.get("productIdentity"), dict)
+        else {}
+    )
+    context = context if isinstance(context, dict) else {}
+    reference_by_index = visual_reference_analysis_by_index(product_analysis)
+    sku_bindings = product_analysis.get("skuBindings") if isinstance(product_analysis.get("skuBindings"), list) else []
+    if not sku_bindings:
+        sku_bindings = context.get("skuBindings") if isinstance(context.get("skuBindings"), list) else []
+    if not sku_bindings:
+        sku_bindings = extract_record_sku_bindings(record, record.get("visualReferenceImages"))
+
+    raw_identity_skus = identity.get("skus") if isinstance(identity.get("skus"), list) else []
+    identity_by_index: dict[int, dict[str, Any]] = {}
+    for item in raw_identity_skus:
+        if not isinstance(item, dict):
+            continue
+        sku_index = safe_int(item.get("sku_index") or item.get("skuIndex"))
+        if sku_index > 0:
+            identity_by_index[sku_index] = item
+
+    normalized_skus: list[dict[str, Any]] = []
+    for binding in sku_bindings:
+        if not isinstance(binding, dict):
+            continue
+        sku_index = safe_int(binding.get("skuIndex") or binding.get("sku_index"))
+        if sku_index <= 0:
+            continue
+        raw_sku = identity_by_index.get(sku_index, {})
+        raw_name = first_clean_text(
+            raw_sku.get("raw_name"),
+            raw_sku.get("rawName"),
+            binding.get("skuName"),
+            f"SKU {sku_index}",
+        )
+        components = [component for component in binding.get("components") or [] if isinstance(component, dict)]
+        normalized_components: list[dict[str, Any]] = []
+        for component_index, component in enumerate(components, start=1):
+            raw_component = visual_identity_component_by_index(raw_sku, component_index)
+            reference_index = safe_int(
+                raw_component.get("reference_image_index")
+                or raw_component.get("referenceImageIndex")
+                or component.get("referenceImageIndex")
+            )
+            reference_analysis = reference_by_index.get(reference_index, {})
+            component_label = first_clean_text(
+                raw_component.get("standard_name"),
+                raw_component.get("standardName"),
+            )
+            if not component_label:
+                component_label = build_visual_component_sku_label(component, reference_analysis)
+            product_name = first_clean_text(
+                raw_component.get("product_name"),
+                raw_component.get("productName"),
+                strip_leading_quantity_label(component_label),
+            )
+            normalized_components.append(
+                {
+                    "component_index": component_index,
+                    "raw_name": first_clean_text(
+                        raw_component.get("raw_name"),
+                        raw_component.get("rawName"),
+                        component.get("componentName"),
+                        component.get("specText"),
+                    ),
+                    "standard_name": component_label,
+                    "product_name": product_name,
+                    "quantity": first_clean_text(
+                        raw_component.get("quantity"),
+                        extract_visual_quantity_prefix(component_label),
+                        extract_visual_quantity_prefix(component.get("componentName")),
+                    ),
+                    "shape": first_clean_text(raw_component.get("shape"), reference_analysis.get("shape"), reference_analysis.get("geometry")),
+                    "material": first_clean_text(
+                        raw_component.get("material"),
+                        visual_identity_material_text(reference_analysis.get("materials")),
+                    ),
+                    "source_title": first_clean_text(raw_component.get("source_title"), raw_component.get("sourceTitle"), component.get("sourceTitle")),
+                    "reference_image_index": reference_index,
+                }
+            )
+
+        component_names = [clean_text(item.get("standard_name")) for item in normalized_components if clean_text(item.get("standard_name"))]
+        standard_name = first_clean_text(
+            raw_sku.get("standard_name"),
+            raw_sku.get("standardName"),
+            "+".join(component_names) if len(component_names) > 1 else (component_names[0] if component_names else ""),
+        )
+        standard_name = clamp_sku_identity_label(standard_name)
+        reference_indexes = [
+            int(item["reference_image_index"])
+            for item in normalized_components
+            if safe_int(item.get("reference_image_index")) > 0
+        ]
+        normalized_skus.append(
+            {
+                "sku_index": sku_index,
+                "raw_name": raw_name,
+                "standard_name": standard_name,
+                "product_name": first_clean_text(
+                    raw_sku.get("product_name"),
+                    raw_sku.get("productName"),
+                    strip_leading_quantity_label(standard_name),
+                ),
+                "quantity": first_clean_text(raw_sku.get("quantity"), extract_visual_quantity_prefix(standard_name)),
+                "shape": first_clean_text(raw_sku.get("shape"), *(item.get("shape") for item in normalized_components)),
+                "material": first_clean_text(raw_sku.get("material"), *(item.get("material") for item in normalized_components)),
+                "reference_image_indexes": sorted({index for index in reference_indexes if index}),
+                "components": normalized_components,
+            }
+        )
+
+    if not normalized_skus and identity_by_index:
+        for sku_index in sorted(identity_by_index):
+            item = identity_by_index[sku_index]
+            standard_name = clamp_sku_identity_label(
+                first_clean_text(item.get("standard_name"), item.get("standardName"), item.get("product_name"), item.get("productName"))
+            )
+            if not standard_name:
+                continue
+            normalized_skus.append(
+                {
+                    "sku_index": sku_index,
+                    "raw_name": first_clean_text(item.get("raw_name"), item.get("rawName"), standard_name),
+                    "standard_name": standard_name,
+                    "product_name": first_clean_text(item.get("product_name"), item.get("productName"), strip_leading_quantity_label(standard_name)),
+                    "quantity": first_clean_text(item.get("quantity"), extract_visual_quantity_prefix(standard_name)),
+                    "shape": clean_text(item.get("shape")),
+                    "material": clean_text(item.get("material")),
+                    "reference_image_indexes": item.get("reference_image_indexes")
+                    if isinstance(item.get("reference_image_indexes"), list)
+                    else [],
+                    "components": item.get("components") if isinstance(item.get("components"), list) else [],
+                }
+            )
+
+    combo_sku_name = first_clean_text(
+        identity.get("combo_sku_name"),
+        identity.get("comboSkuName"),
+        "+".join(item["standard_name"] for item in normalized_skus if clean_text(item.get("standard_name"))),
+    )
+    product_type = first_clean_text(
+        identity.get("product_type"),
+        identity.get("productType"),
+        product_analysis.get("overallCategory"),
+        *(item.get("category") for item in reference_by_index.values()),
+    )
+    title_en = first_clean_text(
+        identity.get("title_en"),
+        identity.get("titleEn"),
+        build_visual_identity_title_en(normalized_skus, product_type),
+    )
+    title_cn = first_clean_text(
+        identity.get("title_cn"),
+        identity.get("titleCn"),
+        record.get("productTitle"),
+        product_analysis.get("productTitle"),
+    )
+
+    normalized_identity = {
+        "product_type": product_type,
+        "product_type_cn": first_clean_text(identity.get("product_type_cn"), identity.get("productTypeCn")),
+        "title_cn": title_cn,
+        "title_en": title_en,
+        "combo_sku_name": clamp_sku_identity_label(combo_sku_name, max_chars=140),
+        "skus": normalized_skus,
+    }
+    next_analysis = dict(product_analysis)
+    next_analysis["productIdentity"] = normalized_identity
+    if title_cn:
+        next_analysis["standardTitleCn"] = title_cn
+    if title_en:
+        next_analysis["standardTitleEn"] = title_en
+    if normalized_skus:
+        next_analysis["skuNames"] = [
+            item["standard_name"]
+            for item in normalized_skus
+            if clean_text(item.get("standard_name"))
+        ]
+    return next_analysis
+
+
+def visual_identity_component_by_index(raw_sku: dict[str, Any], component_index: int) -> dict[str, Any]:
+    components = raw_sku.get("components") if isinstance(raw_sku.get("components"), list) else []
+    for item in components:
+        if not isinstance(item, dict):
+            continue
+        if safe_int(item.get("component_index") or item.get("componentIndex")) == component_index:
+            return item
+    return components[component_index - 1] if component_index <= len(components) and isinstance(components[component_index - 1], dict) else {}
+
+
+def visual_identity_material_text(value: Any) -> str:
+    if isinstance(value, list):
+        return ", ".join(clean_text(item) for item in value if clean_text(item))
+    return clean_text(value)
+
+
+def build_visual_identity_title_en(skus: list[dict[str, Any]], product_type: str = "") -> str:
+    names = [strip_leading_quantity_label(item.get("standard_name")) for item in skus if clean_text(item.get("standard_name"))]
+    names = [name for name in names if name]
+    if not names:
+        return clean_text(product_type)
+    if len(names) == 1:
+        base = names[0]
+    elif len(names) == 2:
+        base = f"{names[0]} and {names[1]}"
+    else:
+        base = ", ".join(names[:-1]) + f", and {names[-1]}"
+    suffix = clean_text(product_type)
+    if suffix and suffix.lower() not in base.lower():
+        return clamp_sku_identity_label(f"{base} {suffix}", max_chars=140)
+    return clamp_sku_identity_label(base, max_chars=140)
+
+
+def visual_product_identity_from_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
+    product_understanding = analysis.get("productUnderstanding") if isinstance(analysis.get("productUnderstanding"), dict) else analysis
+    identity = product_understanding.get("productIdentity") if isinstance(product_understanding.get("productIdentity"), dict) else {}
+    return identity if isinstance(identity, dict) else {}
+
+
+def apply_visual_product_identity_to_record(record: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
+    analysis = task.get("analysis") if isinstance(task.get("analysis"), dict) else {}
+    identity = visual_product_identity_from_analysis(analysis)
+    if not identity:
+        return record
+    next_record = dict(record)
+    next_record["visualProductIdentity"] = identity
+    title_cn = first_clean_text(identity.get("title_cn"), identity.get("titleCn"))
+    title_en = first_clean_text(identity.get("title_en"), identity.get("titleEn"))
+    product_type = first_clean_text(identity.get("product_type"), identity.get("productType"))
+    if title_cn:
+        next_record["visualGeneratedTitleCn"] = title_cn
+    if title_en:
+        next_record["visualGeneratedTitleEn"] = title_en
+    if product_type:
+        next_record["visualGeneratedProductType"] = product_type
+    task_id = clean_text(task.get("id"))
+    if task_id:
+        next_record["visualProductIdentityTaskId"] = task_id
+    next_record["visualProductIdentityUpdatedAt"] = utc_now_text()
+    return next_record
+
+
+def apply_visual_sku_identity_rewrites(record: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
+    """Use completed visual analysis to replace weak SKU labels with product-aware English names."""
+    sku_entries = record.get("skuEntries") if isinstance(record.get("skuEntries"), list) else []
+    if not sku_entries:
+        return record
+
+    analysis = task.get("analysis") if isinstance(task.get("analysis"), dict) else {}
+    if not analysis:
+        return record
+
+    rewrites = build_visual_sku_identity_rewrites(record, analysis)
+    if not rewrites:
+        return record
+
+    task_id = clean_text(task.get("id"))
+    next_record = dict(record)
+    next_skus: list[dict[str, Any]] = []
+    changed = False
+    for index, entry in enumerate(sku_entries, start=1):
+        if not isinstance(entry, dict):
+            continue
+        rewrite = rewrites.get(index)
+        if not rewrite:
+            next_skus.append(entry)
+            continue
+        next_name = clean_text(rewrite.get("name"))
+        if not next_name:
+            next_skus.append(entry)
+            continue
+
+        next_entry = dict(entry)
+        current_name = clean_text(next_entry.get("name"))
+        if current_name and not clean_text(next_entry.get("originalName")):
+            next_entry["originalName"] = current_name
+        next_entry["name"] = next_name
+        next_entry["visualGeneratedName"] = next_name
+        next_entry["visualGeneratedNameSource"] = "visual_generation"
+        if task_id:
+            next_entry["visualGeneratedNameTaskId"] = task_id
+
+        component_labels = rewrite.get("componentLabels") if isinstance(rewrite.get("componentLabels"), dict) else {}
+        component_skus = next_entry.get("componentSkus") if isinstance(next_entry.get("componentSkus"), list) else []
+        if component_skus and component_labels:
+            next_components: list[dict[str, Any]] = []
+            for component_index, component in enumerate(component_skus, start=1):
+                if not isinstance(component, dict):
+                    continue
+                component_label = clean_text(component_labels.get(component_index))
+                if not component_label:
+                    next_components.append(component)
+                    continue
+                next_component = dict(component)
+                component_name = clean_text(next_component.get("name"))
+                if component_name and not clean_text(next_component.get("originalName")):
+                    next_component["originalName"] = component_name
+                next_component["name"] = component_label
+                next_component["visualGeneratedName"] = component_label
+                next_components.append(next_component)
+            next_entry["componentSkus"] = next_components
+            if next_components != component_skus:
+                changed = True
+
+        next_skus.append(next_entry)
+        changed = changed or next_name != current_name
+
+    if not changed:
+        return record
+    next_record["skuEntries"] = next_skus
+    next_record["visualSkuNamesRewrittenAt"] = utc_now_text()
+    if task_id:
+        next_record["visualSkuNamesRewrittenTaskId"] = task_id
+    return next_record
+
+
+def build_visual_sku_identity_rewrites(record: dict[str, Any], analysis: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    product_identity = visual_product_identity_from_analysis(analysis)
+    identity_skus = product_identity.get("skus") if isinstance(product_identity.get("skus"), list) else []
+    identity_rewrites: dict[int, dict[str, Any]] = {}
+    for item in identity_skus:
+        if not isinstance(item, dict):
+            continue
+        sku_index = safe_int(item.get("sku_index") or item.get("skuIndex"))
+        standard_name = clamp_sku_identity_label(
+            first_clean_text(item.get("standard_name"), item.get("standardName"), item.get("combo_sku_name"), item.get("comboSkuName"))
+        )
+        if sku_index <= 0 or not standard_name:
+            continue
+        component_labels: dict[int, str] = {}
+        components = item.get("components") if isinstance(item.get("components"), list) else []
+        for component_index, component in enumerate(components, start=1):
+            if not isinstance(component, dict):
+                continue
+            component_name = clamp_sku_identity_label(
+                first_clean_text(component.get("standard_name"), component.get("standardName"), component.get("product_name"), component.get("productName"))
+            )
+            if component_name:
+                component_labels[component_index] = component_name
+        identity_rewrites[sku_index] = {"name": standard_name, "componentLabels": component_labels}
+    if identity_rewrites:
+        return identity_rewrites
+
+    sku_bindings = analysis.get("skuBindings") if isinstance(analysis.get("skuBindings"), list) else []
+    if not sku_bindings:
+        product_understanding = analysis.get("productUnderstanding") if isinstance(analysis.get("productUnderstanding"), dict) else {}
+        sku_bindings = product_understanding.get("skuBindings") if isinstance(product_understanding.get("skuBindings"), list) else []
+    if not sku_bindings:
+        return {}
+
+    reference_by_index = visual_reference_analysis_by_index(analysis)
+    rewrites: dict[int, dict[str, Any]] = {}
+    for binding in sku_bindings:
+        if not isinstance(binding, dict):
+            continue
+        try:
+            sku_index = int(binding.get("skuIndex") or 0)
+        except (TypeError, ValueError):
+            sku_index = 0
+        if sku_index <= 0:
+            continue
+
+        components = [component for component in binding.get("components") or [] if isinstance(component, dict)]
+        component_labels: dict[int, str] = {}
+        for component_position, component in enumerate(components, start=1):
+            reference_index = safe_int(component.get("referenceImageIndex"))
+            reference_analysis = reference_by_index.get(reference_index, {})
+            label = build_visual_component_sku_label(component, reference_analysis)
+            if label:
+                component_labels[component_position] = label
+
+        labels = [component_labels[key] for key in sorted(component_labels) if component_labels.get(key)]
+        if not labels:
+            continue
+        rewrite_name = "+".join(labels) if len(labels) > 1 else labels[0]
+        rewrite_name = clamp_sku_identity_label(rewrite_name)
+        if rewrite_name:
+            rewrites[sku_index] = {"name": rewrite_name, "componentLabels": component_labels}
+    return rewrites
+
+
+def visual_reference_analysis_by_index(analysis: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    product_understanding = analysis.get("productUnderstanding") if isinstance(analysis.get("productUnderstanding"), dict) else {}
+    if not product_understanding:
+        product_understanding = analysis.get("productAnalysis") if isinstance(analysis.get("productAnalysis"), dict) else {}
+    items = product_understanding.get("referenceAnalyses") if isinstance(product_understanding.get("referenceAnalyses"), list) else []
+    if not items and isinstance(analysis.get("referenceAnalyses"), list):
+        items = analysis.get("referenceAnalyses")
+    result: dict[int, dict[str, Any]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        index = safe_int(item.get("index"))
+        if index > 0:
+            result[index] = item
+    return result
+
+
+def build_visual_component_sku_label(component: dict[str, Any], reference_analysis: dict[str, Any]) -> str:
+    prefix = extract_visual_quantity_prefix(
+        first_clean_text(
+            component.get("componentName"),
+            component.get("optionText"),
+            component.get("specText"),
+        )
+    )
+    descriptor = build_visual_product_descriptor(component, reference_analysis)
+    if not descriptor:
+        descriptor = strip_leading_quantity_label(
+            clean_visual_sku_text(first_clean_text(component.get("sourceTitle"), component.get("componentName")))
+        )
+    if not descriptor:
+        return prefix
+    if prefix and sku_identity_key(descriptor).startswith(sku_identity_key(prefix)):
+        return clamp_sku_identity_label(descriptor)
+    return clamp_sku_identity_label(f"{prefix} {descriptor}".strip() if prefix else descriptor)
+
+
+def build_visual_product_descriptor(component: dict[str, Any], reference_analysis: dict[str, Any]) -> str:
+    text_parts = [
+        reference_analysis.get("visualIdentity"),
+        reference_analysis.get("subject"),
+        reference_analysis.get("category"),
+        reference_analysis.get("shape"),
+        reference_analysis.get("geometry"),
+        reference_analysis.get("facetOrSideCount"),
+        reference_analysis.get("printedPattern"),
+        component.get("sourceTitle"),
+    ]
+    combined = " ".join(clean_text(part) for part in text_parts if clean_text(part)).lower()
+    colors = visual_words(reference_analysis.get("colors"))
+    materials = visual_words(reference_analysis.get("materials"))
+    pattern = clean_text(reference_analysis.get("printedPattern")).lower()
+
+    is_dice = "dice" in combined or "die" in combined
+    if is_dice:
+        has_wood = "wood" in combined or any("wood" in item for item in materials)
+        has_white = "white" in combined or "white" in colors
+        has_printed = "print" in combined or "icon" in combined or "text" in combined or "print" in pattern
+        is_d12 = "d12" in combined or "twelve" in combined or "12" in combined or "dodeca" in combined
+        is_six = "six" in combined or "6" in combined or "cube" in combined
+        if is_d12:
+            return "Wooden D12 Die" if has_wood else "D12 Die"
+        if is_six:
+            adjectives = []
+            if has_white:
+                adjectives.append("White")
+            if has_printed:
+                adjectives.append("Printed")
+            adjectives.append("Six-Sided Dice")
+            return " ".join(adjectives)
+        adjectives = []
+        if has_white:
+            adjectives.append("White")
+        if has_wood:
+            adjectives.append("Wooden")
+        if has_printed:
+            adjectives.append("Printed")
+        adjectives.append("Dice")
+        return " ".join(adjectives)
+
+    for key in ("visualIdentity", "subject", "category"):
+        descriptor = strip_leading_quantity_label(clean_visual_sku_text(reference_analysis.get(key)))
+        if descriptor:
+            return descriptor
+    return ""
+
+
+def visual_words(value: Any) -> set[str]:
+    if isinstance(value, list):
+        return {clean_text(item).lower() for item in value if clean_text(item)}
+    text = clean_text(value).lower()
+    return {text} if text else set()
+
+
+def extract_visual_quantity_prefix(value: Any) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    match = re.search(r"\b(\d+(?:\.\d+)?)\s*(pc|pcs|piece|pieces)\b", text, re.I)
+    if match:
+        amount = match.group(1)
+        return f"{amount}pc" if amount == "1" else f"{amount}pcs"
+    match = re.search(r"\b(\d+(?:\.\d+)?)\s*(pack|packs)\b", text, re.I)
+    if match:
+        amount = match.group(1)
+        unit = "Pack" if amount == "1" else "Packs"
+        return f"{amount} {unit}"
+    return text if is_weak_visual_sku_label(text) else ""
+
+
+def is_weak_visual_sku_label(value: Any) -> bool:
+    text = clean_text(value).lower()
+    if not text:
+        return True
+    return bool(re.fullmatch(r"\d+(?:\.\d+)?\s*(?:pc|pcs|piece|pieces|pack|packs)", text, re.I)) or text in {
+        "mix",
+        "mixed",
+        "random",
+        "assorted",
+        "white",
+        "black",
+        "red",
+        "blue",
+        "green",
+        "yellow",
+        "pink",
+        "purple",
+        "orange",
+        "gray",
+        "grey",
+    }
+
+
+def strip_leading_quantity_label(value: str) -> str:
+    text = clean_text(value)
+    text = re.sub(r"^\s*\d+(?:\.\d+)?\s*(?:pc|pcs|piece|pieces|pack|packs)\.?\s*", "", text, flags=re.I)
+    return text.strip(" -_/,.+")
+
+
+def clean_visual_sku_text(value: Any) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text)
+    text = re.sub(r"(?i)\bno\s+import\s+charges\b", " ", text)
+    text = re.sub(r"(?i)\b\d+(?:,\d+)*\s*sold(?:\s+from\s+this\s+store)?\b", " ", text)
+    text = re.sub(r"(?i)\bbest\s+seller\b", " ", text)
+    text = re.sub(r"(?i)\bsuitable\s+for\b.*?\s+-\s+", " ", text)
+    text = re.sub(r"(?i)\bsuitable\s+for\b.*$", " ", text)
+    text = re.sub(r"(?i)\b(?:valentines?|christmas|birthday|gift|gifts|party|date\s+night)\b", " ", text)
+    text = re.sub(r"[^A-Za-z0-9+\-/().\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" -_/,.+")
+    return text
+
+
+def clamp_sku_identity_label(value: Any, max_chars: int = 48) -> str:
+    text = clean_visual_sku_text(value)
+    if len(text) <= max_chars:
+        return text
+    parts = text.split()
+    while parts and len(" ".join(parts)) > max_chars:
+        parts.pop()
+    return " ".join(parts) or text[:max_chars].rstrip()
+
+
+def sku_identity_key(value: Any) -> str:
+    return re.sub(r"[^0-9a-z]+", "", clean_text(value).lower())
+
+
+def safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def build_visual_result_asset(
@@ -1280,6 +1899,36 @@ def persist_plan(
             )
 
 
+def persist_partial_plan(
+    *,
+    task_id: str,
+    user_id: str,
+    source_image_ref: str,
+    plan: dict[str, Any],
+) -> None:
+    now = utc_now_text()
+    partial_plan = dict(plan or {})
+    partial_plan["visualPromptLogicVersion"] = VISUAL_PROMPT_LOGIC_VERSION
+    partial_plan["promptLogicVersion"] = VISUAL_PROMPT_LOGIC_VERSION
+    with get_connection() as conn:
+        ensure_visual_generation_schema(conn)
+        conn.execute(
+            """
+            UPDATE visual_generation_tasks
+            SET source_image_ref = ?, analysis_json = ?, status = ?, updated_at = ?, error_message = NULL
+            WHERE id = ? AND user_id = ?
+            """,
+            (
+                source_image_ref,
+                json.dumps(partial_plan, ensure_ascii=False),
+                TASK_STATUS_RUNNING,
+                now,
+                task_id,
+                user_id,
+            ),
+        )
+
+
 def persist_split_result(
     *,
     task_id: str,
@@ -1348,6 +1997,40 @@ def persist_split_result(
             ),
         )
     return module_results
+
+
+def persist_product_analysis(
+    *,
+    task_id: str,
+    user_id: str,
+    source_image_ref: str,
+    product_analysis: dict[str, Any],
+) -> None:
+    now = utc_now_text()
+    analysis_payload = {
+        "stage": "product_analysis",
+        "productUnderstanding": product_analysis,
+        "productAnalysis": product_analysis,
+        "visualPromptLogicVersion": VISUAL_PROMPT_LOGIC_VERSION,
+        "promptLogicVersion": VISUAL_PROMPT_LOGIC_VERSION,
+    }
+    with get_connection() as conn:
+        ensure_visual_generation_schema(conn)
+        conn.execute(
+            """
+            UPDATE visual_generation_tasks
+            SET source_image_ref = ?, analysis_json = ?, status = ?, updated_at = ?, error_message = NULL
+            WHERE id = ? AND user_id = ?
+            """,
+            (
+                source_image_ref,
+                json.dumps(analysis_payload, ensure_ascii=False),
+                TASK_STATUS_RUNNING,
+                now,
+                task_id,
+                user_id,
+            ),
+        )
 
 
 def upsert_module(
@@ -1652,8 +2335,10 @@ def build_visual_prompt_context(*, task: dict[str, Any], record: dict[str, Any],
             "and do not rank images as main/material. Use each image label and SKU binding to identify which product or SKU "
             "component it shows. Preserve the exact visible product subject appearance and do not replace selected SKU "
             "components with generic category items. For different-product bundles, keep every reference image tied to its "
-            "own SKU name and source product title. Image facts override title text. Preserve silhouette, geometry, facet/side count, "
-            "shape, visible color, material, quantity, surface texture, edge details, and printed pattern for every bound SKU."
+            "own SKU name and source product title. Image facts override title text. Titles may support function/use/occasion only. "
+            "For appearance, material, surface finish, tactile texture, wrinkles/folds, rigidity/flexibility, color, body shape, construction, "
+            "quantity, and printed pattern, the bound reference image has 100% authority. Preserve silhouette, geometry, facet/side count, "
+            "shape, visible color, material, surface texture, edge details, and printed pattern for every bound SKU."
         ),
         "referenceImages": [
             {
@@ -1689,9 +2374,9 @@ def build_sku_reference_bindings(sku_bindings: list[dict[str, Any]]) -> list[dic
             option_text = clean_text(component.get("optionText"))
             visual_lock = (
                 f"Reference image {reference_index} is the visual source of truth for SKU {sku_name or component_name}. "
-                "Preserve the exact visible silhouette, geometry, facet/side count, shape, color, material, quantity, "
-                "surface texture, edge/rim details, and printed pattern from that image. Titles and SKU names are secondary hints "
-                "and must not override the visible product appearance."
+                "Preserve the exact visible silhouette, geometry, facet/side count, shape, color, material, surface finish, "
+                "tactile texture, wrinkles/folds, rigidity/flexibility, quantity, edge/rim details, and printed pattern from that image. "
+                "Titles and SKU names may support function/use/occasion only and must not override the visible product appearance or material texture."
             )
             bindings.append(
                 {

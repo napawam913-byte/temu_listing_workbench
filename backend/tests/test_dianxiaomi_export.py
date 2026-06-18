@@ -43,29 +43,19 @@ class DianxiaomiExportTest(unittest.TestCase):
         self.image_processing_patcher.stop()
         self.attribute_patcher.stop()
 
-    @patch(
-        "app.modules.exports.dianxiaomi_temu.get_product_attribute_for_export_record",
-        return_value={"category_id": "31075", "product_attribute_text": "[]"},
-    )
-    def test_export_uses_optimized_chinese_and_english_titles(self, _attribute_getter):
-        with patch(
-            "app.modules.exports.dianxiaomi_temu.optimize_listing_titles",
-            return_value={
-                "title_cn": "1个爱心字母钥匙扣包包挂件，流苏钥匙圈汽车装饰配件",
-                "title_en": "1 PCS Heart Initial Keychain Bag Charm, Tassel Key Ring Car Decoration Accessory",
-                "source": "ai",
-            },
-        ):
-            rows = build_rows_for_record(
-                {
-                    "productId": "p1",
-                    "productTitle": "原始中文标题",
-                    "productTitleEn": "Original English Title",
-                    "mainImage": {"sourceUrl": "https://example.com/main.jpg"},
-                    "sourceLinks": [{"productUrl": "https://detail.1688.com/offer/1.html"}],
-                    "skuEntries": [{"id": "sku-1", "name": "默认款", "componentSkus": []}],
-                }
-            )
+    def test_export_uses_visual_generated_chinese_and_english_titles(self):
+        rows = build_rows_for_record(
+            {
+                "productId": "p1",
+                "productTitle": "Original raw title",
+                "productTitleEn": "Original English Title",
+                "visualGeneratedTitleCn": "1个爱心字母钥匙扣包包挂件，流苏钥匙圈汽车装饰配件",
+                "visualGeneratedTitleEn": "1 PCS Heart Initial Keychain Bag Charm, Tassel Key Ring Car Decoration Accessory",
+                "mainImage": {"sourceUrl": "https://example.com/main.jpg"},
+                "sourceLinks": [{"productUrl": "https://detail.1688.com/offer/1.html"}],
+                "skuEntries": [{"id": "sku-1", "name": "默认款", "componentSkus": []}],
+            }
+        )
 
         self.assertEqual(rows[0][0], "1个爱心字母钥匙扣包包挂件，流苏钥匙圈汽车装饰配件")
         self.assertEqual(
@@ -73,57 +63,39 @@ class DianxiaomiExportTest(unittest.TestCase):
             "1 PCS Heart Initial Keychain Bag Charm, Tassel Key Ring Car Decoration Accessory",
         )
 
-    def test_template_rows_uses_best_effort_title_optimizer(self):
-        with (
-            patch(
-                "app.modules.exports.dianxiaomi_temu.optimize_listing_titles",
-                return_value={
-                    "title_cn": "AI Chinese Title",
-                    "title_en": "AI English Title",
-                    "source": "ai",
-                },
-            ) as optimizer,
-            patch(
-                "app.modules.exports.dianxiaomi_temu.get_product_attribute_for_export_record",
-                return_value={"category_id": "31075", "product_attribute_text": "[]"},
-            ),
-        ):
-            build_template_rows(
-                {
-                    "id": "record-1",
-                    "productId": "p1",
-                    "productTitle": "Original Title",
-                    "mainImage": {"sourceUrl": "https://example.com/main.jpg"},
-                    "sourceLinks": [{"productUrl": "https://detail.1688.com/offer/1.html"}],
-                    "skuEntries": [{"id": "sku-1", "name": "Black", "componentSkus": []}],
-                },
-                translate_variants=False,
-                user_id="user-1",
-            )
+    def test_template_rows_uses_visual_generated_title_without_title_api(self):
+        rows = build_template_rows(
+            {
+                "id": "record-visual-title",
+                "productId": "p1",
+                "productTitle": "Original Title",
+                "productTitleEn": "Original English Title",
+                "visualGeneratedTitleCn": "阶段一中文标题",
+                "visualGeneratedTitleEn": "Stage One English Title",
+                "mainImage": {"sourceUrl": "https://example.com/main.jpg"},
+                "sourceLinks": [{"productUrl": "https://detail.1688.com/offer/1.html"}],
+                "skuEntries": [{"id": "sku-1", "name": "Black", "componentSkus": []}],
+            },
+            translate_variants=False,
+            user_id="user-1",
+        )
 
-        self.assertIs(optimizer.call_args.kwargs.get("strict"), False)
+        self.assertEqual(rows[0]["product_title"], "阶段一中文标题")
+        self.assertEqual(rows[0]["product_title_en"], "Stage One English Title")
 
     def test_template_rows_passes_final_titles_to_product_attributes(self):
-        with (
-            patch(
-                "app.modules.exports.dianxiaomi_temu.optimize_listing_titles",
-                return_value={
-                    "title_cn": "最终中文标题 宠物喂食垫",
-                    "title_en": "Final English Pet Feeding Mat Title",
-                    "source": "ai",
-                },
-            ),
-            patch(
-                "app.modules.exports.dianxiaomi_temu.get_product_attribute_for_export_record",
-                return_value={"category_id": "31075", "product_attribute_text": "[]"},
-            ) as attribute_getter,
-        ):
+        with patch(
+            "app.modules.exports.dianxiaomi_temu.get_product_attribute_for_export_record",
+            return_value={"category_id": "31075", "product_attribute_text": "[]"},
+        ) as attribute_getter:
             build_template_rows(
                 {
                     "id": "record-1",
                     "productId": "p1",
                     "productTitle": "原始采集标题",
                     "productTitleEn": "Original scraped title",
+                    "visualGeneratedTitleCn": "最终中文标题 宠物喂食垫",
+                    "visualGeneratedTitleEn": "Final English Pet Feeding Mat Title",
                     "mainImage": {"sourceUrl": "https://example.com/main.jpg"},
                     "sourceLinks": [{"productUrl": "https://detail.1688.com/offer/1.html"}],
                     "skuEntries": [{"id": "sku-1", "name": "Black", "componentSkus": []}],
@@ -136,27 +108,19 @@ class DianxiaomiExportTest(unittest.TestCase):
         self.assertEqual(attribute_getter.call_args.kwargs["title_context"]["title_en"], "Final English Pet Feeding Mat Title")
         self.assertIs(attribute_getter.call_args.kwargs["strict"], True)
 
-    def test_template_rows_continue_when_title_generation_returns_fallback(self):
-        with patch(
-            "app.modules.exports.dianxiaomi_temu.optimize_listing_titles",
-            return_value={
-                "title_cn": "Original Title",
-                "title_en": "Original Title",
-                "source": "fallback",
+    def test_template_rows_uses_original_title_when_visual_title_missing(self):
+        rows = build_template_rows(
+            {
+                "id": "record-1",
+                "productId": "p1",
+                "productTitle": "Original Title",
+                "mainImage": {"sourceUrl": "https://example.com/main.jpg"},
+                "sourceLinks": [{"productUrl": "https://detail.1688.com/offer/1.html"}],
+                "skuEntries": [{"id": "sku-1", "name": "Black", "componentSkus": []}],
             },
-        ):
-            rows = build_template_rows(
-                {
-                    "id": "record-1",
-                    "productId": "p1",
-                    "productTitle": "Original Title",
-                    "mainImage": {"sourceUrl": "https://example.com/main.jpg"},
-                    "sourceLinks": [{"productUrl": "https://detail.1688.com/offer/1.html"}],
-                    "skuEntries": [{"id": "sku-1", "name": "Black", "componentSkus": []}],
-                },
-                translate_variants=False,
-                user_id="user-1",
-            )
+            translate_variants=False,
+            user_id="user-1",
+        )
 
         self.assertEqual(rows[0]["product_title"], "Original Title")
 
@@ -671,6 +635,90 @@ class DianxiaomiExportTest(unittest.TestCase):
         self.assertNotEqual(captured_values[0], "2pcs+1 Pack")
         self.assertIn("Decision", captured_values[0])
         self.assertIn("D12 Dice", captured_values[0])
+
+    def test_visual_generated_sku_name_bypasses_export_variant_rewrite(self):
+        with (
+            patch(
+                "app.modules.exports.dianxiaomi_temu.get_product_attribute_for_export_record",
+                return_value={"category_id": "31075", "product_attribute_text": "[]"},
+            ),
+            patch("app.modules.exports.dianxiaomi_temu.translate_variant_values_to_english") as translator,
+        ):
+            rows = build_template_rows(
+                {
+                    "id": "record-1",
+                    "productId": "p1",
+                    "productTitle": "Dice Combo",
+                    "productTitleEn": "Dice Combo",
+                    "mainImage": {"sourceUrl": "https://example.com/main.jpg"},
+                    "skuEntries": [
+                        {
+                            "id": "sku-white",
+                            "kind": "single",
+                            "name": "2pcs White Printed Six-Sided Dice",
+                            "originalName": "2pcs",
+                            "visualGeneratedName": "2pcs White Printed Six-Sided Dice",
+                            "componentSkus": [
+                                {"name": "2pcs", "rawSpecs": {"Quantity": "2pcs"}, "specText": "Quantity: 2pcs"}
+                            ],
+                        },
+                        {
+                            "id": "sku-wood",
+                            "kind": "single",
+                            "name": "1 Pack Wooden D12 Die",
+                            "originalName": "1 Pack",
+                            "visualGeneratedName": "1 Pack Wooden D12 Die",
+                            "componentSkus": [
+                                {"name": "1 Pack", "rawSpecs": {"Pack": "1 Pack"}, "specText": "Pack: 1 Pack"}
+                            ],
+                        },
+                    ],
+                },
+                optimize_titles=False,
+            )
+
+        translator.assert_not_called()
+        self.assertEqual(rows[0]["variant_attr_name_1"], "\u578b\u53f7")
+        self.assertEqual(rows[0]["variant_attr_value_1"], "2pcs White Printed Six-Sided Dice")
+        self.assertEqual(rows[1]["variant_attr_value_1"], "1 Pack Wooden D12 Die")
+
+    def test_visual_product_identity_supplies_titles_and_sku_names_for_export(self):
+        with (
+            patch(
+                "app.modules.exports.dianxiaomi_temu.get_product_attribute_for_export_record",
+                return_value={"category_id": "31075", "product_attribute_text": "[]"},
+            ) as attribute_getter,
+            patch("app.modules.exports.dianxiaomi_temu.translate_variant_values_to_english") as translator,
+        ):
+            rows = build_template_rows(
+                {
+                    "id": "record-visual-identity",
+                    "productId": "p-visual-identity",
+                    "productTitle": "Old raw title",
+                    "productTitleEn": "Old raw title",
+                    "mainImage": {"sourceUrl": "https://example.com/main.jpg"},
+                    "visualProductIdentity": {
+                        "product_type": "Dice Set",
+                        "title_cn": "木质十二面骰子与白色印花六面骰子组合套装",
+                        "title_en": "Wooden D12 Die and White Printed Six-Sided Dice Set",
+                        "skus": [
+                            {"sku_index": 1, "standard_name": "2pcs White Printed Six-Sided Dice"},
+                            {"sku_index": 2, "standard_name": "1 Pack Wooden D12 Die"},
+                        ],
+                    },
+                    "skuEntries": [
+                        {"id": "sku-white", "name": "2pcs"},
+                        {"id": "sku-wood", "name": "1 Pack"},
+                    ],
+                },
+            )
+
+        translator.assert_not_called()
+        attribute_getter.assert_called_once()
+        self.assertEqual(rows[0]["product_title"], "木质十二面骰子与白色印花六面骰子组合套装")
+        self.assertEqual(rows[0]["product_title_en"], "Wooden D12 Die and White Printed Six-Sided Dice Set")
+        self.assertEqual(rows[0]["variant_attr_value_1"], "2pcs White Printed Six-Sided Dice")
+        self.assertEqual(rows[1]["variant_attr_value_1"], "1 Pack Wooden D12 Die")
 
     def test_combo_sku_translates_model_value_and_variant_name(self):
         raw_combo_value = "\u4e00\u4ef6\u5ba0\u7269\u7897+\u9ed1\u8272\u5582\u98df\u57ab"

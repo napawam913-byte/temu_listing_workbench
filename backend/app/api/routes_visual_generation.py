@@ -34,7 +34,7 @@ from app.modules.visual_generation.queue import (
     visual_queue_length,
     visual_retry_queue_length,
 )
-from app.modules.visual_generation.worker import run_visual_job, run_visual_queue_drain
+from app.modules.visual_generation.worker import run_visual_job_and_refill, run_visual_queue_drain
 from app.modules.visual_generation.splitter import GridSplitError
 
 router = APIRouter(prefix="/api/visual", tags=["visual-generation"])
@@ -80,6 +80,7 @@ class VisualTaskGenerateRequest(BaseModel):
 
 class VisualTaskRunRequest(VisualTaskPlanRequest, VisualTaskGenerateRequest):
     applyToLinkRecord: bool | None = True
+    reuseExistingOutputs: bool | None = None
 
 
 class VisualTaskSplitRequest(BaseModel):
@@ -240,7 +241,8 @@ def run_task(
         "imageSize": payload.imageSize,
         "useReferenceImage": True if payload.useReferenceImage is None else payload.useReferenceImage,
         "applyToLinkRecord": True if payload.applyToLinkRecord is None else payload.applyToLinkRecord,
-        "reuseExistingOutputs": existing_task.get("status") in {TASK_STATUS_FAILED, TASK_STATUS_RETRY_WAITING},
+        "reuseExistingOutputs": bool(payload.reuseExistingOutputs)
+        or existing_task.get("status") in {TASK_STATUS_FAILED, TASK_STATUS_RETRY_WAITING},
     }
     update_task_status(task_id, user_id, TASK_STATUS_QUEUED, clear_error=True)
     queued_in_redis = enqueue_visual_job(run_payload)
@@ -249,7 +251,7 @@ def run_task(
         queue_backend = "redis"
     else:
         background_tasks.add_task(
-            run_visual_job,
+            run_visual_job_and_refill,
             run_payload,
         )
         queue_backend = "background"

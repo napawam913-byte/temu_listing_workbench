@@ -29,6 +29,7 @@ OTHER_FIBER_PERCENT_LIMIT = 5.0
 CATEGORY_LEAF_POOL_LIMIT = 120
 CATEGORY_BRANCH_CANDIDATE_LIMIT = 10
 CATEGORY_FINAL_CANDIDATE_LIMIT = 20
+CATEGORY_TREE_BRANCH_CANDIDATE_LIMIT = 30
 CATEGORY_AI_CONFIDENCE_FLOOR = 0.25
 CATEGORY_VECTOR_CONFIDENT_SCORE = 0.55
 MAX_CATEGORY_REFERENCE_IMAGES = 6
@@ -308,22 +309,22 @@ def resolve_category_by_ai_vector(
         if not isinstance(ai_result, dict) or not ai_result:
             raise ValueError("Category intent API did not return usable category signals")
         intent = merge_category_intent(fallback_intent, ai_result)
-        leaf = resolve_category_leaf_by_vector(record, product_context, leaves, intent, allow_ai_final=True, user_id=user_id)
+        leaf = resolve_category_leaf_by_ai_tree(record, product_context, leaves, intent, user_id=user_id)
         if leaf:
             return load_snapshot_for_category_leaf(conn, leaf)
         raise ValueError("Category intent API did not match a category")
 
+    if is_product_attribute_ai_configured(user_id=user_id):
+        try:
+            ai_intent = build_category_intent(record, product_context, use_ai=True, user_id=user_id)
+            ai_leaf = resolve_category_leaf_by_ai_tree(record, product_context, leaves, ai_intent, user_id=user_id)
+            if ai_leaf:
+                return load_snapshot_for_category_leaf(conn, ai_leaf)
+        except Exception:
+            pass
+
     intent = build_category_intent(record, product_context, use_ai=False, user_id=user_id)
     leaf = resolve_category_leaf_by_vector(record, product_context, leaves, intent, allow_ai_final=False, user_id=user_id)
-    if leaf and float(leaf.get("score") or 0) >= CATEGORY_VECTOR_CONFIDENT_SCORE:
-        return load_snapshot_for_category_leaf(conn, leaf)
-
-    if is_product_attribute_ai_configured(user_id=user_id):
-        ai_intent = build_category_intent(record, product_context, use_ai=True, user_id=user_id)
-        ai_leaf = resolve_category_leaf_by_vector(record, product_context, leaves, ai_intent, allow_ai_final=False, user_id=user_id)
-        if ai_leaf:
-            return load_snapshot_for_category_leaf(conn, ai_leaf)
-
     if leaf:
         return load_snapshot_for_category_leaf(conn, leaf)
     return None
@@ -373,6 +374,124 @@ def resolve_category_leaf_by_vector(
             break
 
     return current_leaves[0] if current_leaves else None
+
+
+def resolve_category_leaf_by_ai_tree(
+    record: dict[str, Any],
+    product_context: dict[str, Any],
+    leaves: list[dict[str, Any]],
+    intent: dict[str, Any],
+    *,
+    user_id: str | None = None,
+) -> dict[str, Any] | None:
+    query_text = category_query_text(record, product_context, intent)
+    query_vector = build_text_vector(query_text)
+    scored_leaves = score_category_leaves(leaves, query_vector, query_text)
+    scored_by_path = {
+        clean_text(leaf.get("path_text")): leaf
+        for leaf in scored_leaves
+        if clean_text(leaf.get("path_text"))
+    }
+
+    selected_parts: list[str] = []
+    current_leaves = leaves[:]
+    for _depth in range(8):
+        current_leaves = [
+            leaf for leaf in leaves
+            if category_path_startswith(leaf.get("path_parts") or [], selected_parts)
+        ]
+        if not current_leaves:
+            return top_scored_leaf(scored_leaves)
+
+        final_candidates = rank_leaves_for_ai(current_leaves, scored_by_path)[:CATEGORY_FINAL_CANDIDATE_LIMIT]
+        if len(final_candidates) == 1:
+            return final_candidates[0]
+        if should_choose_final_leaf(selected_parts, final_candidates):
+            chosen_leaf = choose_final_leaf_with_ai(
+                record=record,
+                intent=intent,
+                leaves=final_candidates,
+                user_id=user_id,
+            )
+            return chosen_leaf or final_candidates[0]
+
+        branches = next_category_tree_branches(
+            leaves=current_leaves,
+            selected_parts=selected_parts,
+            scored_by_path=scored_by_path,
+            limit=CATEGORY_TREE_BRANCH_CANDIDATE_LIMIT,
+        )
+        if not branches:
+            chosen_leaf = choose_final_leaf_with_ai(
+                record=record,
+                intent=intent,
+                leaves=final_candidates,
+                user_id=user_id,
+            )
+            return chosen_leaf or final_candidates[0]
+
+        selected_branch = choose_category_branch_with_ai(
+            record=record,
+            intent=intent,
+            current_path=selected_parts,
+            branches=branches,
+            user_id=user_id,
+        )
+        if not selected_branch:
+            selected_branch = branches[0]
+        next_parts = selected_branch.get("path_parts") or []
+        if next_parts == selected_parts:
+            return final_candidates[0]
+        selected_parts = [clean_text(part) for part in next_parts if clean_text(part)]
+
+    current_leaves = [
+        leaf for leaf in leaves
+        if category_path_startswith(leaf.get("path_parts") or [], selected_parts)
+    ]
+    ranked = rank_leaves_for_ai(current_leaves or leaves, scored_by_path)
+    return ranked[0] if ranked else None
+
+
+def should_choose_final_leaf(selected_parts: list[str], leaves: list[dict[str, Any]]) -> bool:
+    if len(leaves) <= 1:
+        return True
+    if len(leaves) > CATEGORY_FINAL_CANDIDATE_LIMIT:
+        return False
+    next_level = len(selected_parts) + 1
+    branch_keys = {
+        normalize_category_path_for_match("/".join((leaf.get("path_parts") or [])[:next_level]))
+        for leaf in leaves
+        if len(leaf.get("path_parts") or []) >= next_level
+    }
+    return len(branch_keys) <= 1
+
+
+def rank_leaves_for_ai(leaves: list[dict[str, Any]], scored_by_path: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    ranked: list[dict[str, Any]] = []
+    for leaf in leaves:
+        path = clean_text(leaf.get("path_text"))
+        scored = scored_by_path.get(path)
+        ranked.append(
+            {
+                **leaf,
+                "score": float((scored or {}).get("score") or leaf.get("score") or 0),
+                "matched_terms": (scored or {}).get("matched_terms", leaf.get("matched_terms", [])),
+            }
+        )
+    ranked.sort(
+        key=lambda item: (
+            float(item.get("score") or 0),
+            int(item.get("required_count") or 0),
+            int(item.get("attr_count") or 0),
+            clean_text(item.get("path_text")),
+        ),
+        reverse=True,
+    )
+    return ranked
+
+
+def top_scored_leaf(scored_leaves: list[dict[str, Any]]) -> dict[str, Any] | None:
+    return scored_leaves[0] if scored_leaves else None
 
 
 def load_category_snapshots_for_attribute_match(conn: Any) -> list[dict[str, Any]]:
@@ -456,6 +575,8 @@ def request_category_intent_ai(
         "rules": [
             "Use the attached product images and final export title as primary evidence; source titles and SKU names are secondary hints.",
             "Decide what the physical product actually is before matching any category.",
+            "Return concrete product nouns and category words, not quantities, marketing adjectives, shipping text, promotion text, or generic words.",
+            "Treat source titles as unreliable when they conflict with the final export title or product images.",
             "Do not classify by container/storage/organizer words unless the image and title show the product is actually a storage container.",
             "Ignore logistics text, promotions, use-scene marketing, gift occasion words, shop metrics, ratings, and generic package words.",
             "If the product is a party favor bag, party gift bag, favor box, pinata, confetti popper, balloon, garland, or other party supply, keep party-supply category terms explicit.",
@@ -755,6 +876,62 @@ def next_category_branches(scored_leaves: list[dict[str, Any]], selected_parts: 
     return branches[:CATEGORY_BRANCH_CANDIDATE_LIMIT]
 
 
+def next_category_tree_branches(
+    *,
+    leaves: list[dict[str, Any]],
+    selected_parts: list[str],
+    scored_by_path: dict[str, dict[str, Any]],
+    limit: int,
+) -> list[dict[str, Any]]:
+    next_level = len(selected_parts) + 1
+    groups: dict[str, dict[str, Any]] = {}
+    for leaf in leaves:
+        parts = leaf.get("path_parts") or []
+        if len(parts) < next_level or not category_path_startswith(parts, selected_parts):
+            continue
+        branch_parts = [clean_text(part) for part in parts[:next_level] if clean_text(part)]
+        if not branch_parts:
+            continue
+        key = normalize_category_path_for_match("/".join(branch_parts))
+        scored_leaf = scored_by_path.get(clean_text(leaf.get("path_text"))) or {}
+        leaf_score = float(scored_leaf.get("score") or 0)
+        group = groups.setdefault(
+            key,
+            {
+                "name": branch_parts[-1],
+                "path_parts": branch_parts,
+                "path_text": key,
+                "score": 0.0,
+                "leaf_count": 0,
+                "examples": [],
+                "matched_terms": set(),
+            },
+        )
+        group["leaf_count"] += 1
+        group["score"] = max(float(group["score"]), leaf_score)
+        if len(group["examples"]) < 3:
+            group["examples"].append(clean_text(leaf.get("path_text")))
+        for term in scored_leaf.get("matched_terms") or []:
+            group["matched_terms"].add(clean_text(term))
+
+    branches = list(groups.values())
+    for branch in branches:
+        branch["matched_terms"] = sorted(term for term in branch["matched_terms"] if term)[:10]
+    branches.sort(
+        key=lambda item: (
+            float(item.get("score") or 0),
+            int(item.get("leaf_count") or 0),
+            clean_text(item.get("path_text")),
+        ),
+        reverse=True,
+    )
+    if len(branches) <= limit:
+        return branches
+    positive = [branch for branch in branches if float(branch.get("score") or 0) > 0]
+    zero = [branch for branch in branches if float(branch.get("score") or 0) <= 0]
+    return [*positive[:limit], *zero[: max(0, limit - len(positive[:limit]))]][:limit]
+
+
 def choose_category_branch_with_ai(
     *,
     record: dict[str, Any],
@@ -823,7 +1000,8 @@ def request_category_branch_ai(
             "index": index,
             "name": candidate.get("name"),
             "path": candidate.get("path_text"),
-            "vector_score": candidate.get("score"),
+            "local_vector_score": candidate.get("score"),
+            "local_matched_terms": candidate.get("matched_terms", []),
             "leaf_count": candidate.get("leaf_count", 1),
             "examples": candidate.get("examples", []),
         }
@@ -834,10 +1012,13 @@ def request_category_branch_ai(
         "rules": [
             "Select exactly one candidate index from the provided list.",
             "First identify the real product from final title and reference images, then choose the closest category path.",
+            "Treat local_vector_score as a recall hint only. Do not select a category solely because it has the highest local score.",
             "Prefer the real product type over use scenario, decorative words, packaging words, or generic container/storage words.",
             "Do not choose storage/organizer/container categories unless the image and title show the product is actually a storage container.",
             "If the product identity is party favor bag, party gift bag, favor box, pinata, confetti popper, balloon, garland, or party supply, prefer party-supply branches over home storage branches.",
+            "If source titles conflict with the final product title or images, ignore the conflicting source titles for category selection.",
             "Do not invent categories outside the candidate list.",
+            "When the best local_vector_score conflicts with the real product identity, choose the candidate that matches the real product identity and explain briefly.",
         ],
         "output_schema": {"selected_index": 1, "confidence": 0.0, "reason": "short reason"},
         "product": {
