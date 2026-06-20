@@ -382,8 +382,13 @@ export type DianxiaomiExportTask = {
   id: string;
   userId: string;
   exportMode: DianxiaomiExportMode;
-  status: 'queued' | 'running' | 'completed' | 'failed' | string;
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | string;
   recordCount: number;
+  progressPercent?: number;
+  processedCount?: number;
+  totalCount?: number;
+  currentStage?: string | null;
+  currentRecordTitle?: string | null;
   recordIds: string[];
   filename?: string | null;
   downloadUrl?: string | null;
@@ -990,6 +995,29 @@ export async function downloadDianxiaomiExportTask(taskId: string): Promise<Blob
   }
 
   return response.blob();
+}
+
+export async function cancelDianxiaomiExportTask(taskId: string): Promise<DianxiaomiExportTask> {
+  const response = await fetch(`${API_BASE_URL}/api/exports/dianxiaomi/temu-semi-managed/tasks/${encodeURIComponent(taskId)}/cancel`, withSession({
+    method: 'POST',
+    headers: authHeaders(),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.item;
+}
+
+export async function deleteDianxiaomiExportTask(taskId: string): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/api/exports/dianxiaomi/temu-semi-managed/tasks/${encodeURIComponent(taskId)}`, withSession({
+    method: 'DELETE',
+    headers: authHeaders(),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
 }
 
 export async function fetchLinkListRecords(): Promise<LinkListRecord[]> {

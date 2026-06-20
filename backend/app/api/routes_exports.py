@@ -9,7 +9,9 @@ from pydantic import BaseModel, Field
 from app.api.auth import require_current_user
 from app.modules.exports.dianxiaomi_export_tasks import (
     DianxiaomiExportTaskError,
+    cancel_dianxiaomi_export_task,
     create_dianxiaomi_export_task,
+    delete_dianxiaomi_export_task,
     get_completed_export_task_path,
     get_dianxiaomi_export_task,
     list_dianxiaomi_export_tasks,
@@ -92,6 +94,29 @@ def get_dianxiaomi_temu_export_task(
         return {"item": get_dianxiaomi_export_task(task_id=task_id, user_id=str(current_user["id"]))}
     except DianxiaomiExportTaskError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/dianxiaomi/temu-semi-managed/tasks/{task_id}/cancel")
+def cancel_dianxiaomi_temu_export_task(
+    task_id: str,
+    current_user: dict[str, Any] = Depends(require_current_user),
+):
+    try:
+        return {"item": cancel_dianxiaomi_export_task(task_id=task_id, user_id=str(current_user["id"]))}
+    except DianxiaomiExportTaskError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.delete("/dianxiaomi/temu-semi-managed/tasks/{task_id}")
+def delete_dianxiaomi_temu_export_task(
+    task_id: str,
+    current_user: dict[str, Any] = Depends(require_current_user),
+):
+    try:
+        delete_dianxiaomi_export_task(task_id=task_id, user_id=str(current_user["id"]))
+    except DianxiaomiExportTaskError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"ok": True}
 
 
 @router.get("/dianxiaomi/temu-semi-managed/tasks/{task_id}/download")

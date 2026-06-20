@@ -59,6 +59,14 @@ TRANSIENT_UPSTREAM_MARKERS = (
     "bad gateway",
     "service unavailable",
     "gateway timeout",
+    "connection timeout",
+    "timeout expired",
+    "timed out",
+    "connection reset",
+    "connection aborted",
+    "remote end closed",
+    "temporarily failed",
+    "network is unreachable",
 )
 AI_UPSTREAM_RETRY_DELAYS_SECONDS = (0, 3, 8, 15)
 
@@ -253,9 +261,17 @@ def request_json(api_url: str, api_key: str, payload: dict[str, Any], *, timeout
                 continue
             raise error from exc
         except urllib.error.URLError as exc:
-            raise VisualGenerationError(f"AI request failed: {exc}") from exc
+            error = VisualGenerationError(f"AI request failed: {exc}")
+            if should_retry_transient_error(error, attempt):
+                last_error = error
+                continue
+            raise error from exc
         except TimeoutError as exc:
-            raise VisualGenerationError(f"AI request timed out: {exc}") from exc
+            error = VisualGenerationError(f"AI request timed out: {exc}")
+            if should_retry_transient_error(error, attempt):
+                last_error = error
+                continue
+            raise error from exc
 
         try:
             parsed = json.loads(response_body)
@@ -329,9 +345,17 @@ def request_multipart(
                 continue
             raise error from exc
         except urllib.error.URLError as exc:
-            raise VisualGenerationError(f"AI request failed: {exc}") from exc
+            error = VisualGenerationError(f"AI request failed: {exc}")
+            if should_retry_transient_error(error, attempt):
+                last_error = error
+                continue
+            raise error from exc
         except TimeoutError as exc:
-            raise VisualGenerationError(f"AI request timed out: {exc}") from exc
+            error = VisualGenerationError(f"AI request timed out: {exc}")
+            if should_retry_transient_error(error, attempt):
+                last_error = error
+                continue
+            raise error from exc
 
         try:
             parsed = json.loads(response_body)

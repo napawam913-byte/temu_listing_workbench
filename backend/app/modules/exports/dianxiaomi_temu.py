@@ -4,11 +4,11 @@ import io
 import re
 import shutil
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import copy
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from openpyxl import load_workbook
 
@@ -48,6 +48,7 @@ MAX_CAROUSEL_IMAGE_COUNT = 10
 MAX_PRODUCT_MATERIAL_IMAGE_COUNT = 1
 MAX_EXPORT_RECORD_CONCURRENCY = 20
 EXPORT_LISTING_IMAGE_SIZE = 800
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 SKU_PROMOTION_PATTERNS = (
     r"\bno\s+import\s+charges\b",
@@ -75,6 +76,9 @@ def export_dianxiaomi_temu_template(
     export_mode: str = EXPORT_MODE_CURATED,
     *,
     user_id: str | None = None,
+    progress_callback: ProgressCallback | None = None,
+    skip_failed_records: bool = False,
+    failed_records: list[dict[str, Any]] | None = None,
 ) -> Path:
     export_mode = normalize_export_mode(export_mode)
     ensure_runtime_dirs()
@@ -84,11 +88,27 @@ def export_dianxiaomi_temu_template(
     normalized_records = [record for record in records if record.get("skuEntries")]
     if not normalized_records:
         raise DianxiaomiExportError("No exportable SKU link records")
+    emit_export_progress(
+        progress_callback,
+        progress_percent=8,
+        processed_count=0,
+        total_count=len(normalized_records),
+        current_stage="正在准备导出",
+        current_record_title="",
+    )
 
     export_path = EXPORTS_DIR / f"dianxiaomi_temu_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.xlsx"
     shutil.copyfile(DIANXIAOMI_TEMU_TEMPLATE_PATH, export_path)
 
     workbook = load_workbook(export_path)
+    emit_export_progress(
+        progress_callback,
+        progress_percent=10,
+        processed_count=0,
+        total_count=len(normalized_records),
+        current_stage="正在生成属性",
+        current_record_title="",
+    )
     worksheet = workbook[TEMPLATE_SHEET_NAME] if TEMPLATE_SHEET_NAME in workbook.sheetnames else workbook.active
     template_row = DATA_START_ROW
     header_keys = [
@@ -105,15 +125,45 @@ def export_dianxiaomi_temu_template(
         normalized_records,
         export_mode=export_mode,
         user_id=user_id,
+        progress_callback=progress_callback,
+        skip_failed_records=skip_failed_records,
+        failed_records=failed_records,
     )
+    if not output_rows:
+        skipped = len(failed_records or [])
+        raise DianxiaomiExportError(f"No Excel rows were generated; skipped {skipped} failed records")
 
+    emit_export_progress(
+        progress_callback,
+        progress_percent=82,
+        processed_count=len(normalized_records),
+        total_count=len(normalized_records),
+        current_stage="正在写入 Excel",
+        current_record_title="",
+    )
     for offset, values in enumerate(output_rows):
         row_index = DATA_START_ROW + offset
         clone_row_style(worksheet, template_row, row_index)
         for column_index, key in enumerate(header_keys, start=1):
             worksheet.cell(row=row_index, column=column_index, value=values.get(key, "") if key else "")
 
+    emit_export_progress(
+        progress_callback,
+        progress_percent=92,
+        processed_count=len(normalized_records),
+        total_count=len(normalized_records),
+        current_stage="正在保存文件",
+        current_record_title="",
+    )
     workbook.save(export_path)
+    emit_export_progress(
+        progress_callback,
+        progress_percent=100,
+        processed_count=len(normalized_records),
+        total_count=len(normalized_records),
+        current_stage="已完成",
+        current_record_title="",
+    )
     return export_path
 
 
@@ -122,7 +172,68 @@ def build_template_rows_for_export_records(
     export_mode: str = EXPORT_MODE_CURATED,
     *,
     user_id: str | None = None,
+    progress_callback: ProgressCallback | None = None,
+    skip_failed_records: bool = False,
+    failed_records: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    if progress_callback is not None or skip_failed_records:
+        concurrency = export_record_concurrency_limit(len(records))
+        if concurrency > 1:
+            return build_template_rows_for_export_records_concurrent(
+                records,
+                export_mode=export_mode,
+                user_id=user_id,
+                progress_callback=progress_callback,
+                skip_failed_records=skip_failed_records,
+                failed_records=failed_records,
+                concurrency=concurrency,
+            )
+        output_rows: list[dict[str, Any]] = []
+        total_count = len(records)
+        for index, record in enumerate(records, start=1):
+            record_title = export_progress_record_title(record)
+            emit_export_progress(
+                progress_callback,
+                progress_percent=progress_percent_for_record(index - 1, total_count),
+                processed_count=index - 1,
+                total_count=total_count,
+                current_stage=f"正在处理第 {index} / {total_count} 个商品",
+                current_record_title=record_title,
+            )
+            emit_export_progress(
+                progress_callback,
+                progress_percent=progress_percent_for_record(index - 1, total_count),
+                processed_count=index - 1,
+                total_count=total_count,
+                current_stage="正在生成属性",
+                current_record_title=record_title,
+            )
+            try:
+                output_rows.extend(build_template_rows_for_export_record(record, export_mode=export_mode, user_id=user_id))
+            except DianxiaomiExportError as exc:
+                if not skip_failed_records:
+                    raise
+                if failed_records is not None:
+                    failed_records.append({"index": index, "title": record_title, "error": str(exc)})
+                emit_export_progress(
+                    progress_callback,
+                    progress_percent=progress_percent_for_record(index, total_count),
+                    processed_count=index,
+                    total_count=total_count,
+                    current_stage=f"第 {index} / {total_count} 个商品失败，已跳过",
+                    current_record_title=record_title,
+                )
+                continue
+            emit_export_progress(
+                progress_callback,
+                progress_percent=progress_percent_for_record(index, total_count),
+                processed_count=index,
+                total_count=total_count,
+                current_stage=f"正在处理第 {index} / {total_count} 个商品",
+                current_record_title=record_title,
+            )
+        return output_rows
+
     concurrency = export_record_concurrency_limit(len(records))
     if concurrency <= 1:
         output_rows: list[dict[str, Any]] = []
@@ -138,6 +249,107 @@ def build_template_rows_for_export_records(
         ):
             output_rows.extend(record_rows)
     return output_rows
+
+
+def build_template_rows_for_export_records_concurrent(
+    records: list[dict[str, Any]],
+    export_mode: str,
+    *,
+    user_id: str | None,
+    progress_callback: ProgressCallback | None,
+    skip_failed_records: bool,
+    failed_records: list[dict[str, Any]] | None,
+    concurrency: int,
+) -> list[dict[str, Any]]:
+    total_count = len(records)
+    active_count = min(concurrency, total_count)
+    emit_export_progress(
+        progress_callback,
+        progress_percent=progress_percent_for_record(0, total_count),
+        processed_count=0,
+        total_count=total_count,
+        current_stage=f"正在并发处理 {active_count} 个商品",
+        current_record_title="",
+    )
+
+    indexed_rows: list[list[dict[str, Any]] | None] = [None] * total_count
+    completed_count = 0
+    with ThreadPoolExecutor(max_workers=active_count) as executor:
+        future_to_item = {
+            executor.submit(build_template_rows_for_export_record, record, export_mode=export_mode, user_id=user_id): (
+                index,
+                record,
+                export_progress_record_title(record),
+            )
+            for index, record in enumerate(records, start=1)
+        }
+        for future in as_completed(future_to_item):
+            index, _record, record_title = future_to_item[future]
+            try:
+                indexed_rows[index - 1] = future.result()
+            except DianxiaomiExportError as exc:
+                if not skip_failed_records:
+                    raise
+                indexed_rows[index - 1] = []
+                if failed_records is not None:
+                    failed_records.append({"index": index, "title": record_title, "error": str(exc)})
+                stage = f"第 {index} / {total_count} 个商品失败，已跳过"
+            else:
+                stage = f"已完成第 {index} / {total_count} 个商品"
+            completed_count += 1
+            emit_export_progress(
+                progress_callback,
+                progress_percent=progress_percent_for_record(completed_count, total_count),
+                processed_count=completed_count,
+                total_count=total_count,
+                current_stage=stage,
+                current_record_title=record_title,
+            )
+
+    output_rows: list[dict[str, Any]] = []
+    for record_rows in indexed_rows:
+        output_rows.extend(record_rows or [])
+    return output_rows
+
+
+def emit_export_progress(
+    progress_callback: ProgressCallback | None,
+    *,
+    progress_percent: int,
+    processed_count: int,
+    total_count: int,
+    current_stage: str,
+    current_record_title: str,
+) -> None:
+    if progress_callback is None:
+        return
+    progress_callback(
+        {
+            "progressPercent": progress_percent,
+            "processedCount": processed_count,
+            "totalCount": total_count,
+            "currentStage": current_stage,
+            "currentRecordTitle": current_record_title,
+        }
+    )
+
+
+def progress_percent_for_record(processed_count: int, total_count: int) -> int:
+    if total_count <= 0:
+        return 10
+    ratio = max(0, min(processed_count, total_count)) / total_count
+    return min(80, max(10, round(10 + ratio * 70)))
+
+
+def export_progress_record_title(record: dict[str, Any]) -> str:
+    return (
+        clean_text(record.get("visualGeneratedTitleCn"))
+        or clean_text(record.get("productTitle"))
+        or clean_text(record.get("productTitleEn"))
+        or clean_text(record.get("id"))
+        or clean_text(record.get("productId"))
+        or "商品"
+    )
 
 
 def export_record_concurrency_limit(record_count: int) -> int:

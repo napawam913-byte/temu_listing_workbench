@@ -35,8 +35,10 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { Key } from 'react';
 import type { SortOrder } from 'antd/es/table/interface';
 import {
+  cancelDianxiaomiExportTask,
   addProductsToPool,
   createDianxiaomiExportTask,
+  deleteDianxiaomiExportTask,
   createVisualGenerationTask,
   deleteVisualGenerationTask,
   deleteProduct as deleteBackendProduct,
@@ -234,7 +236,11 @@ function writeLinkListRecords(records: LinkListRecord[], userId: string) {
 }
 
 function formatRecordTime(value: string) {
-  const date = new Date(value);
+  const cleanValue = String(value || '').trim();
+  const normalizedValue = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(cleanValue)
+    ? `${cleanValue.replace(' ', 'T')}Z`
+    : cleanValue;
+  const date = new Date(normalizedValue);
   if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleString('zh-CN', { hour12: false });
 }
@@ -2808,16 +2814,21 @@ async function waitForVisualGenerationTask(
 }
 
 function getDianxiaomiExportTaskStatusMeta(task: DianxiaomiExportTask) {
+  const taskProgress = Number(task.progressPercent);
+  const progress = Number.isFinite(taskProgress) ? Math.max(0, Math.min(100, Math.round(taskProgress))) : undefined;
   if (task.status === 'completed') {
     return { label: '已完成', color: 'green', progress: 100, progressStatus: 'success' as const };
   }
   if (task.status === 'failed') {
     return { label: '执行失败', color: 'red', progress: 100, progressStatus: 'exception' as const };
   }
-  if (task.status === 'running') {
-    return { label: '执行中', color: 'processing', progress: 58, progressStatus: 'active' as const };
+  if (task.status === 'cancelled') {
+    return { label: '已停止', color: 'default', progress: 100, progressStatus: 'normal' as const };
   }
-  return { label: '排队中', color: 'blue', progress: 18, progressStatus: 'active' as const };
+  if (task.status === 'running') {
+    return { label: '执行中', color: 'processing', progress: progress ?? 58, progressStatus: 'active' as const };
+  }
+  return { label: '排队中', color: 'blue', progress: progress ?? 18, progressStatus: 'active' as const };
 }
 
 function sortDianxiaomiExportTasks(tasks: DianxiaomiExportTask[]) {
@@ -3222,6 +3233,28 @@ function LinkListPanel({
     const timer = window.setInterval(refresh, exportQueuePendingCount > 0 ? 3000 : 8000);
     return () => window.clearInterval(timer);
   }, [exportQueuePendingCount, refreshExportQueueTasks, visualQueueOpen]);
+
+  const cancelExportQueueTask = useCallback(async (task: DianxiaomiExportTask) => {
+    try {
+      const nextTask = await cancelDianxiaomiExportTask(task.id);
+      setExportQueueTasks((current) =>
+        sortDianxiaomiExportTasks(current.map((item) => (item.id === nextTask.id ? nextTask : item))),
+      );
+      message.success('Excel 导出任务已停止');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'Excel 任务停止失败');
+    }
+  }, []);
+
+  const removeExportQueueTask = useCallback(async (task: DianxiaomiExportTask) => {
+    try {
+      await deleteDianxiaomiExportTask(task.id);
+      setExportQueueTasks((current) => current.filter((item) => item.id !== task.id));
+      message.success('Excel 导出任务已删除');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'Excel 任务删除失败');
+    }
+  }, []);
 
   const toggleLinkRecordSelection = (recordId: string, checked: boolean) => {
     setSelectedRecordIds((current) =>
@@ -4703,13 +4736,13 @@ function LinkListPanel({
                 return (
                   <details className="visual-queue-panel visual-queue-export-panel" key={`export-${task.id}`} open={task.status !== 'completed'}>
                     <summary className="visual-queue-panel-summary">
-                      <span className="visual-queue-reference-thumb visual-queue-export-thumb">
-                        <FileExcelOutlined />
-                      </span>
                       <span className="visual-queue-panel-main">
                         <span className="visual-queue-panel-title">
-                          <strong>Excel 导出</strong>
                           <Text ellipsis>{task.filename || `店小秘导出任务 ${task.id}`}</Text>
+                          <span className="visual-queue-export-stage">
+                            {task.currentStage || statusMeta.label}
+                            {task.totalCount ? ` · ${task.processedCount ?? 0}/${task.totalCount}` : ''}
+                          </span>
                         </span>
                         <span className="visual-queue-panel-meta">
                           <Tag color={statusMeta.color}>{statusMeta.label}</Tag>
@@ -4734,6 +4767,17 @@ function LinkListPanel({
                       >
                         下载
                       </Button>
+                      <Button
+                        danger
+                        size="small"
+                        onClick={(event) => {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          void removeExportQueueTask(task);
+                        }}
+                      >
+                        删除
+                      </Button>
                     </summary>
                     <div className="visual-queue-panel-body">
                       <div className="visual-queue-panel-facts">
@@ -4742,12 +4786,32 @@ function LinkListPanel({
                         <div><span>状态</span><strong>{statusMeta.label}</strong></div>
                         <div><span>更新时间</span><strong>{formatRecordTime(task.updatedAt)}</strong></div>
                       </div>
+                      <div className="visual-queue-panel-facts">
+                        <div><span>当前阶段</span><strong>{task.currentStage || statusMeta.label}</strong></div>
+                        <div><span>处理进度</span><strong>{task.processedCount ?? 0}/{task.totalCount || task.recordCount}</strong></div>
+                        {task.currentRecordTitle ? <div><span>当前商品</span><strong>{task.currentRecordTitle}</strong></div> : null}
+                      </div>
+                      <Space>
+                        <Button
+                          danger
+                          disabled={task.status !== 'queued' && task.status !== 'running'}
+                          size="small"
+                          onClick={() => void cancelExportQueueTask(task)}
+                        >
+                          停止任务
+                        </Button>
+                        <Button danger size="small" onClick={() => void removeExportQueueTask(task)}>
+                          删除任务
+                        </Button>
+                      </Space>
                       {task.filename ? (
                         <div className="visual-queue-panel-facts">
                           <div><span>文件名</span><strong>{task.filename}</strong></div>
                         </div>
                       ) : null}
-                      {task.errorMessage ? <div className="visual-queue-panel-error">{task.errorMessage}</div> : null}
+                      {task.status === 'failed' && task.errorMessage ? (
+                        <div className="visual-queue-panel-error">{task.errorMessage}</div>
+                      ) : null}
                     </div>
                   </details>
                 );
