@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import hmac
 import hashlib
+import random
+import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Any
@@ -32,6 +34,7 @@ AUTH_CIRCUIT_OPEN_SECONDS = 86400
 CLOUD_CONFIG_CACHE_TTL_SECONDS = 20
 _cloud_config_cache: dict[str, Any] | None = None
 _cloud_config_cache_loaded_at = 0.0
+POSTGRES_TRANSIENT_ERROR_CODES = {"40P01", "40001", "55P03"}
 
 
 def ensure_schema() -> None:
@@ -214,20 +217,45 @@ def save_cloud_config(config: dict[str, Any], *, updated_by: str | None = None, 
 
     if not force_insert and config is None:
         return
+    payload = json.dumps(config, ensure_ascii=False)
     try:
-        postgres_store.upsert_app_setting(
-            key=AI_GATEWAY_CLOUD_SETTING_KEY,
-            value=json.dumps(config, ensure_ascii=False),
-            category="ai_gateway",
-            label="API 中枢配置",
-            description="云端保存 API 中枢渠道、Key、路由和熔断状态",
-            is_secret=True,
-            updated_by=updated_by,
-        )
+        for attempt in range(4):
+            try:
+                postgres_store.upsert_app_setting(
+                    key=AI_GATEWAY_CLOUD_SETTING_KEY,
+                    value=payload,
+                    category="ai_gateway",
+                    label="API 中枢配置",
+                    description="云端保存 API 中枢渠道、Key、路由和熔断状态",
+                    is_secret=True,
+                    updated_by=updated_by,
+                )
+                break
+            except Exception as exc:
+                if attempt >= 3 or not is_postgres_transient_error(exc):
+                    raise
+                time.sleep((0.08 * (2**attempt)) + random.uniform(0, 0.08))
         _cloud_config_cache = json.loads(json.dumps(config))
         _cloud_config_cache_loaded_at = datetime.utcnow().timestamp()
     except Exception as exc:
         raise RuntimeError(f"API 中枢云数据库保存失败：{exc}") from exc
+
+
+def is_postgres_transient_error(exc: Exception) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        sqlstate = getattr(current, "sqlstate", "") or getattr(current, "pgcode", "")
+        if str(sqlstate) in POSTGRES_TRANSIENT_ERROR_CODES:
+            return True
+        text = str(current).lower()
+        if (
+            "deadlock detected" in text
+            or "could not serialize access" in text
+            or "lock not available" in text
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def encrypt_cloud_config_secrets(config: dict[str, Any]) -> bool:

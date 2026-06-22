@@ -431,6 +431,13 @@ export type AddProductsToPoolResponse = {
   added_count: number;
 };
 
+export type DeleteProductsResponse = {
+  ok: boolean;
+  deleted_count: number;
+  deleted_ids: string[];
+  missing_ids: string[];
+};
+
 export type ProductCategoryOption = {
   value: string;
   label: string;
@@ -628,6 +635,7 @@ export type VisualGenerationTask = {
   userId: string;
   linkRecordId?: string | null;
   productId?: string | null;
+  runBatchId?: string | null;
   mode: string;
   layout: '1x1' | '2x2' | '3x3' | string;
   requestedCount: number;
@@ -690,6 +698,7 @@ export type VisualTaskCreatePayload = {
   record?: LinkListRecord;
   linkRecordId?: string;
   productId?: string;
+  runBatchId?: string;
   mode?: string;
   layout?: '1x1' | '2x2' | '3x3' | string;
   requestedCount?: number;
@@ -716,6 +725,7 @@ export type VisualTaskGeneratePayload = {
 export type VisualTaskRunPayload = VisualTaskPlanPayload & VisualTaskGeneratePayload & {
   applyToLinkRecord?: boolean;
   reuseExistingOutputs?: boolean;
+  runBatchId?: string;
 };
 
 export type VisualTaskSplitPayload = {
@@ -1060,6 +1070,26 @@ export async function deleteProduct(productId: string, scope: 'pool' | 'all' = '
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
+}
+
+export async function deleteProducts(productIds: string[], scope: 'pool' | 'all' = 'pool'): Promise<DeleteProductsResponse> {
+  const search = new URLSearchParams({ scope });
+  const response = await fetch(`${API_BASE_URL}/api/products/batch-delete?${search.toString()}`, withSession({
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ product_ids: productIds }),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return {
+    ok: Boolean(body.ok),
+    deleted_count: body.deleted_count || 0,
+    deleted_ids: body.deleted_ids || [],
+    missing_ids: body.missing_ids || [],
+  };
 }
 
 export async function prepareDianxiaomiProductAttributes(

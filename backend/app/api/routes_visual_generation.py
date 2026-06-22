@@ -24,6 +24,7 @@ from app.modules.visual_generation.service import (
     split_mother_image_stateless,
     split_visual_task,
     update_task_status,
+    update_visual_task_run_batch_id,
 )
 from app.modules.visual_generation.queue import (
     dead_queue_name,
@@ -56,6 +57,7 @@ class VisualTaskCreateRequest(BaseModel):
     record: dict[str, Any] = Field(default_factory=dict)
     linkRecordId: str | None = None
     productId: str | None = None
+    runBatchId: str | None = None
     mode: str | None = None
     layout: str | None = None
     requestedCount: int | None = Field(default=None, ge=1, le=9)
@@ -82,6 +84,7 @@ class VisualTaskGenerateRequest(BaseModel):
 class VisualTaskRunRequest(VisualTaskPlanRequest, VisualTaskGenerateRequest):
     applyToLinkRecord: bool | None = True
     reuseExistingOutputs: bool | None = None
+    runBatchId: str | None = None
 
 
 class VisualTaskBatchDeleteRequest(BaseModel):
@@ -134,6 +137,7 @@ def create_task(payload: VisualTaskCreateRequest, current_user: dict[str, Any] =
             record=payload.record,
             link_record_id=payload.linkRecordId,
             product_id=payload.productId,
+            run_batch_id=payload.runBatchId,
             mode=payload.mode,
             layout=payload.layout,
             requested_count=payload.requestedCount,
@@ -254,7 +258,9 @@ def run_task(
         "applyToLinkRecord": True if payload.applyToLinkRecord is None else payload.applyToLinkRecord,
         "reuseExistingOutputs": bool(payload.reuseExistingOutputs)
         or existing_task.get("status") in {TASK_STATUS_FAILED, TASK_STATUS_RETRY_WAITING},
+        "runBatchId": payload.runBatchId or existing_task.get("runBatchId"),
     }
+    update_visual_task_run_batch_id(task_id=task_id, user_id=user_id, run_batch_id=run_payload["runBatchId"])
     update_task_status(task_id, user_id, TASK_STATUS_QUEUED, clear_error=True)
     queued_in_redis = enqueue_visual_job(run_payload)
     if queued_in_redis:

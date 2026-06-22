@@ -934,7 +934,7 @@ def upsert_app_setting(
         raise ValueError("缺少配置 key")
     now = utc_now_text()
     stored_value = encrypt_secret_value(str(value or ""), enabled=is_secret)
-    ensure_admin_config_schema()
+    ensure_app_settings_schema()
     with get_pg_connection() as conn:
         row = conn.execute(
             """

@@ -1,5 +1,8 @@
 const API_BASE_URL = "http://127.0.0.1:8000";
 const RETRY_DELAYS_MS = [0, 400, 1200, 2500];
+const LOCAL_MATERIALS_STORAGE_KEY = "temuWorkbench.localCaptureMaterials.v1";
+const LOCAL_MATERIALS_LIMIT = 300;
+const USE_LOCAL_MATERIALS_ONLY = true;
 const SITE_CONFIGS = [
   {
     sourceSite: "1688",
@@ -205,6 +208,14 @@ function configureMode() {
 }
 
 async function loadActiveSession() {
+  if (USE_LOCAL_MATERIALS_ONLY) {
+    activeSession = await readLocalWorkbenchActiveSession();
+    activeProductTextEl.textContent = activeSession?.title || getActiveModeUi().activeText;
+    activeProductTextEl.title = activeSession?.title || "";
+    updateBatchState();
+    renderCaptureList();
+    return;
+  }
   try {
     const response = await fetch(`${API_BASE_URL}/api/sourcing/1688/active-session`, { credentials: "include" });
     if (!response.ok) throw new Error("读取当前商品失败");
@@ -253,7 +264,7 @@ async function addCurrentPageToCaptureList() {
 
   try {
     const payload = await collectCurrentPageWithRetry();
-    const material = await postJson(`${API_BASE_URL}/api/sourcing/1688/materials`, payload);
+    const material = await saveLocalCaptureMaterial(payload);
     latestPayload = material;
     selectedMaterialIds.add(material.id);
     renderPreview(material);
@@ -286,8 +297,12 @@ async function refreshCaptureList() {
 
 async function loadCaptureList() {
   try {
-    const body = await getJson(`${API_BASE_URL}/api/sourcing/1688/materials?limit=300`);
-    captureMaterials = Array.isArray(body?.items) ? body.items : [];
+    if (USE_LOCAL_MATERIALS_ONLY) {
+      captureMaterials = await readLocalCaptureMaterials();
+    } else {
+      const body = await getJson(`${API_BASE_URL}/api/sourcing/1688/materials?limit=300`);
+      captureMaterials = Array.isArray(body?.items) ? body.items : [];
+    }
     const existingIds = new Set(captureMaterials.map((item) => item.id));
     selectedMaterialIds = new Set([...selectedMaterialIds].filter((id) => existingIds.has(id)));
     renderCaptureList();
@@ -335,7 +350,9 @@ async function processMaterialIds(materialIds, actionName, worker, options = {})
 
   await loadActiveSession();
   await loadCaptureList();
-  const refreshedTabs = options.refreshWorkbench && successCount > 0 ? await refreshWorkbenchTabs() : 0;
+  const refreshedTabs = !USE_LOCAL_MATERIALS_ONLY && options.refreshWorkbench && successCount > 0
+    ? await refreshWorkbenchTabs()
+    : 0;
   setBusy(false);
 
   if (failures.length) {
@@ -351,6 +368,24 @@ async function processMaterialIds(materialIds, actionName, worker, options = {})
 }
 
 async function addMaterialToProductList(materialId) {
+  if (USE_LOCAL_MATERIALS_ONLY) {
+    let localProductId = "";
+    await updateLocalCaptureMaterial(materialId, (item) => {
+      localProductId = item.product_list_product_id || buildLocalProductId(item);
+      return {
+        ...item,
+        product_list_product_id: localProductId,
+        local_sync_status: "local",
+        updated_at: nowIsoText(),
+      };
+    });
+    const material = (await readLocalCaptureMaterials()).find((item) => item.id === materialId);
+    if (material) {
+      await syncLocalMaterialToWorkbenchProduct(material, localProductId);
+      await syncLocalMaterialToWorkbenchSourcingCandidate(material, localProductId);
+    }
+    return;
+  }
   await postJson(`${API_BASE_URL}/api/sourcing/1688/materials/${encodeURIComponent(materialId)}/add-to-products`);
 }
 
@@ -371,12 +406,210 @@ async function refreshWorkbenchTabs() {
   }
 }
 
+function buildLocalProductId(material) {
+  const sourceSite = getItemSourceSite(material);
+  const raw = material?.raw_data || {};
+  const sourceId = raw.goods_id || material?.offer_id || stableIdFromUrl(material?.product_url || "") || material?.id || Date.now();
+  return `local-product-${sourceSite}-${sourceId}`;
+}
+
+function localMaterialToWorkbenchProduct(material, productId) {
+  const raw = material?.raw_data || {};
+  const price = parseMarketplacePrice(material?.price ?? raw.price?.current ?? raw.price?.estimated);
+  const listedAt = String(material?.captured_at || material?.created_at || nowIsoText()).slice(0, 10);
+  const sourceSite = getItemSourceSite(material);
+  const sourceProductId = raw.goods_id || material?.offer_id || stableIdFromUrl(material?.product_url || "") || productId;
+  return {
+    id: productId,
+    sourceType: sourceSite,
+    sourceProductId,
+    title: material?.title || `${getSiteLabel(material)} 商品`,
+    titleEn: material?.title || undefined,
+    category: raw.category_path || "插件采集",
+    categoryPath: raw.category_path || undefined,
+    price: Number.isFinite(price) ? price : 0,
+    sales: 0,
+    weeklySales: 0,
+    monthlySales: 0,
+    gmv: 0,
+    reviewCount: 0,
+    listedAt,
+    selectedAt: listedAt,
+    growthRate: 0,
+    sourceRow: 0,
+    period: "近7天",
+    status: "active",
+    inProductPool: true,
+    imageTone: sourceSite === "temu" ? "blue" : "green",
+    mainImageUrl: material?.main_image_url || raw.gallery_image_urls?.[0] || undefined,
+    sourceUrl: material?.product_url || undefined,
+  };
+}
+
+async function syncLocalMaterialToWorkbenchProduct(material, productId) {
+  const product = localMaterialToWorkbenchProduct(material, productId);
+  const tabs = await chrome.tabs.query({});
+  const workbenchTabs = tabs.filter((tab) => {
+    const url = tab.url || "";
+    return /^http:\/\/(?:127\.0\.0\.1|localhost):5173(?:\/|#|\?|$)/.test(url);
+  });
+
+  await Promise.all(
+    workbenchTabs.map((tab) => (
+      tab.id
+        ? chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            args: [product],
+            func: (nextProduct) => {
+              const storageKey = "temuListingWorkbenchLocalPluginProducts";
+              const eventName = "temu-workbench-local-plugin-products-updated";
+              const current = JSON.parse(window.localStorage.getItem(storageKey) || "[]");
+              const items = Array.isArray(current) ? current : [];
+              const merged = [
+                nextProduct,
+                ...items.filter((item) => item && item.id !== nextProduct.id),
+              ].slice(0, 500);
+              window.localStorage.setItem(storageKey, JSON.stringify(merged));
+              window.dispatchEvent(new CustomEvent(eventName, { detail: { product: nextProduct, products: merged } }));
+            },
+          })
+        : Promise.resolve()
+    ))
+  );
+}
+
+async function readLocalWorkbenchActiveSession() {
+  try {
+    const tabs = await chrome.tabs.query({});
+    const workbenchTabs = tabs.filter((tab) => {
+      const url = tab.url || "";
+      return /^http:\/\/(?:127\.0\.0\.1|localhost):5173(?:\/|#|\?|$)/.test(url);
+    });
+
+    for (const tab of workbenchTabs) {
+      if (!tab.id) continue;
+      try {
+        const results = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: () => {
+            const storageKey = "temuListingWorkbenchActiveSourcingProduct";
+            try {
+              const value = JSON.parse(window.localStorage.getItem(storageKey) || "null");
+              return value && value.temu_product_id ? value : null;
+            } catch {
+              return null;
+            }
+          },
+        });
+        const session = results?.[0]?.result;
+        if (session?.temu_product_id) return session;
+      } catch {
+        // Ignore tabs that are not ready for script injection.
+      }
+    }
+  } catch {
+    // Local workbench discovery is best-effort.
+  }
+  return null;
+}
+
+function localMaterialToWorkbenchSourcingCandidate(material, productId) {
+  const raw = material?.raw_data || {};
+  const now = nowIsoText();
+  const galleryImageUrls = Array.isArray(material?.gallery_image_urls)
+    ? material.gallery_image_urls
+    : Array.isArray(raw.gallery_image_urls)
+      ? raw.gallery_image_urls
+      : [];
+  const materialId = material?.id || stableIdFromUrl(material?.product_url || "") || String(Date.now());
+
+  return {
+    id: `local-candidate-${productId}-${materialId}`,
+    temu_product_id: productId,
+    offer_id: material?.offer_id || raw.offer_id || raw.goods_id || null,
+    product_url: material?.product_url || raw.product_url || "",
+    title: material?.title || raw.title || "本地采集货源",
+    main_image_url: material?.main_image_url || galleryImageUrls[0] || null,
+    gallery_image_urls: galleryImageUrls,
+    price: parseMarketplacePrice(material?.price ?? raw.goods_price ?? raw.price?.current),
+    price_range: material?.price_range || raw.price_range || null,
+    moq: material?.moq ?? raw.moq ?? null,
+    shop_name: material?.shop_name || raw.shop_name || null,
+    shop_url: material?.shop_url || raw.shop_url || null,
+    sku_list: Array.isArray(material?.sku_list) ? material.sku_list : [],
+    raw_data: raw,
+    captured_at: material?.captured_at || now,
+    created_at: material?.created_at || now,
+    updated_at: material?.updated_at || now,
+  };
+}
+
+async function syncLocalMaterialToWorkbenchSourcingCandidate(material, productId) {
+  const candidate = localMaterialToWorkbenchSourcingCandidate(material, productId);
+  const tabs = await chrome.tabs.query({});
+  const workbenchTabs = tabs.filter((tab) => {
+    const url = tab.url || "";
+    return /^http:\/\/(?:127\.0\.0\.1|localhost):5173(?:\/|#|\?|$)/.test(url);
+  });
+
+  await Promise.all(
+    workbenchTabs.map((tab) => (
+      tab.id
+        ? chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            args: [productId, candidate],
+            func: (targetProductId, nextCandidate) => {
+              const storageKey = "temuListingWorkbenchLocalSourcingCandidates";
+              const eventName = "temu-workbench-local-sourcing-candidates-updated";
+              let map = {};
+              try {
+                const current = JSON.parse(window.localStorage.getItem(storageKey) || "{}");
+                map = current && typeof current === "object" && !Array.isArray(current) ? current : {};
+              } catch {
+                map = {};
+              }
+
+              const currentItems = Array.isArray(map[targetProductId]) ? map[targetProductId] : [];
+              const candidates = [
+                nextCandidate,
+                ...currentItems.filter((item) => item && item.id !== nextCandidate.id),
+              ].slice(0, 100);
+              map[targetProductId] = candidates;
+              window.localStorage.setItem(storageKey, JSON.stringify(map));
+              window.dispatchEvent(new CustomEvent(eventName, {
+                detail: { productId: targetProductId, candidate: nextCandidate, candidates },
+              }));
+            },
+          })
+        : Promise.resolve()
+    ))
+  );
+}
+
 async function assignMaterialToActiveProduct(materialId) {
-  if (!activeSession?.temu_product_id) {
+  if (USE_LOCAL_MATERIALS_ONLY) {
+    activeSession = await readLocalWorkbenchActiveSession();
+  } else if (!activeSession?.temu_product_id) {
     await loadActiveSession();
   }
   if (!activeSession?.temu_product_id) {
-    throw new Error("请先在前端打开一个商品详情，让插件监听当前商品");
+    throw new Error("请先在前端打开一个商品详情，再点击加入货源素材");
+  }
+
+  if (USE_LOCAL_MATERIALS_ONLY) {
+    const activeProductId = activeSession.temu_product_id;
+    await updateLocalCaptureMaterial(materialId, (item) => ({
+      ...item,
+      assigned_product_id: activeProductId,
+      assigned_at: nowIsoText(),
+      local_sync_status: "local",
+      updated_at: nowIsoText(),
+    }));
+    const material = (await readLocalCaptureMaterials()).find((item) => item.id === materialId);
+    if (material) {
+      await syncLocalMaterialToWorkbenchSourcingCandidate(material, activeProductId);
+    }
+    return;
   }
 
   await postJson(`${API_BASE_URL}/api/sourcing/1688/materials/${encodeURIComponent(materialId)}/assign`, {
@@ -389,7 +622,11 @@ async function deleteMaterialFromCaptureList(materialId) {
   processingMaterialIds.add(materialId);
   renderCaptureList();
   try {
-    await deleteJson(`${API_BASE_URL}/api/sourcing/1688/materials/${encodeURIComponent(materialId)}`);
+    if (USE_LOCAL_MATERIALS_ONLY) {
+      await deleteLocalCaptureMaterial(materialId);
+    } else {
+      await deleteJson(`${API_BASE_URL}/api/sourcing/1688/materials/${encodeURIComponent(materialId)}`);
+    }
     selectedMaterialIds.delete(materialId);
     await loadCaptureList();
     setStatus("已从商品素材删除。", false);
@@ -399,6 +636,81 @@ async function deleteMaterialFromCaptureList(materialId) {
     processingMaterialIds.delete(materialId);
     setBusy(false);
   }
+}
+
+async function saveLocalCaptureMaterial(payload) {
+  const material = buildLocalCaptureMaterial(payload);
+  const materials = await readLocalCaptureMaterials();
+  const nextMaterials = upsertLocalCaptureMaterial(materials, material);
+  await writeLocalCaptureMaterials(nextMaterials);
+  return nextMaterials.find((item) => item.id === material.id) || material;
+}
+
+function buildLocalCaptureMaterial(payload) {
+  const raw = payload.raw_data || {};
+  const sourceSite = getItemSourceSite(payload);
+  const sourceId = sourceSite === "temu"
+    ? (raw.goods_id || payload.offer_id || stableIdFromUrl(payload.product_url))
+    : (payload.offer_id || stableIdFromUrl(payload.product_url));
+  const materialId = `local-${sourceSite}-${sourceId || stableIdFromUrl(payload.product_url) || Date.now()}`;
+  const now = nowIsoText();
+  return {
+    ...payload,
+    id: materialId,
+    local_id: materialId,
+    local_sync_status: "local",
+    created_at: payload.created_at || now,
+    updated_at: now,
+    captured_at: payload.captured_at || now,
+  };
+}
+
+function upsertLocalCaptureMaterial(materials, material) {
+  const materialKey = localMaterialIdentityKey(material);
+  const filtered = materials.filter((item) => item.id !== material.id && localMaterialIdentityKey(item) !== materialKey);
+  return [material, ...filtered]
+    .sort((left, right) => String(right.captured_at || right.updated_at || "").localeCompare(String(left.captured_at || left.updated_at || "")))
+    .slice(0, LOCAL_MATERIALS_LIMIT);
+}
+
+function localMaterialIdentityKey(item) {
+  const raw = item?.raw_data || {};
+  const sourceSite = getItemSourceSite(item);
+  const sourceId = raw.goods_id || item?.offer_id || stableIdFromUrl(item?.product_url || "");
+  return `${sourceSite}:${sourceId || item?.product_url || item?.id || ""}`;
+}
+
+async function updateLocalCaptureMaterial(materialId, updater) {
+  const materials = await readLocalCaptureMaterials();
+  let changed = false;
+  const nextMaterials = materials.map((item) => {
+    if (item.id !== materialId) return item;
+    changed = true;
+    return updater(item);
+  });
+  if (!changed) throw new Error("本地商品素材不存在");
+  await writeLocalCaptureMaterials(nextMaterials);
+}
+
+async function deleteLocalCaptureMaterial(materialId) {
+  const materials = await readLocalCaptureMaterials();
+  await writeLocalCaptureMaterials(materials.filter((item) => item.id !== materialId));
+}
+
+async function readLocalCaptureMaterials() {
+  const result = await chrome.storage.local.get(LOCAL_MATERIALS_STORAGE_KEY);
+  const items = result?.[LOCAL_MATERIALS_STORAGE_KEY];
+  return Array.isArray(items) ? items : [];
+}
+
+async function writeLocalCaptureMaterials(items) {
+  await chrome.storage.local.set({
+    [LOCAL_MATERIALS_STORAGE_KEY]: items.slice(0, LOCAL_MATERIALS_LIMIT),
+  });
+}
+
+function nowIsoText() {
+  return new Date().toISOString();
 }
 
 async function collectCurrentPageWithRetry({ tab = null, token = null } = {}) {
@@ -1299,8 +1611,9 @@ function uniqueStrings(values) {
 function stableIdFromUrl(url) {
   const text = String(url || "").trim();
   const temuId = text.match(/[?&](?:goods_id|goodsId)=([0-9A-Za-z_-]+)/)?.[1];
+  const temuPathId = text.match(/-g-([0-9A-Za-z_-]+)\.html/i)?.[1];
   const offerId = text.match(/offer\/(\d+)\.html/i)?.[1];
-  if (temuId || offerId) return temuId || offerId;
+  if (temuId || temuPathId || offerId) return temuId || temuPathId || offerId;
   let hash = 0;
   for (let index = 0; index < text.length; index += 1) {
     hash = (hash * 31 + text.charCodeAt(index)) >>> 0;

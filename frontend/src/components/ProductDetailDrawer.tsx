@@ -120,17 +120,6 @@ export function ProductDetailDrawer({
               </button>
             </Title>
           </Tooltip>
-          <Text type="secondary">
-            原始行：{product.sourceRow} · {product.category}
-          </Text>
-          <Descriptions column={2} className="product-descriptions">
-            <Descriptions.Item label="价格">{formatProductPrice(product)}</Descriptions.Item>
-            <Descriptions.Item label="销量">{product.sales.toLocaleString()}</Descriptions.Item>
-            <Descriptions.Item label="GMV">{formatUsd(product.gmv)}</Descriptions.Item>
-            <Descriptions.Item label="评论数">{product.reviewCount.toLocaleString()}</Descriptions.Item>
-            <Descriptions.Item label="上架时间">{product.listedAt}</Descriptions.Item>
-            <Descriptions.Item label="增长率">+{product.growthRate}%</Descriptions.Item>
-          </Descriptions>
         </aside>
 
         <main className="drawer-sourcing-side">

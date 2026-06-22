@@ -1,5 +1,5 @@
 (function initTemuPageCollector() {
-  const COLLECTOR_VERSION = "2026-06-15-temu-title-price-v4";
+  const COLLECTOR_VERSION = "2026-06-22-temu-main-image-v7";
   if (globalThis.__marketplaceTemuCollectorVersion === COLLECTOR_VERSION) return;
   globalThis.__marketplaceTemuCollectorLoaded = true;
   globalThis.__marketplaceTemuCollectorVersion = COLLECTOR_VERSION;
@@ -26,11 +26,18 @@
     const pageSignals = collectPageSignals();
     const parsedContexts = collectParsedContexts(mainWorldSnapshot);
     const deepSignals = collectDeepSignals(parsedContexts);
-    const images = uniqueUrls([
+    const pageImages = rankTemuProductImages([
       pageSignals.image,
       ...(pageSignals.images || []),
-      ...(deepSignals.images || []),
-    ]).slice(0, 120);
+    ]).slice(0, 80);
+    const images = rankTemuProductImages(
+      pageImages.length >= 3
+        ? pageImages
+        : [
+            ...pageImages,
+            ...(deepSignals.images || []).slice(0, 20),
+          ]
+    ).slice(0, 80);
     const title = cleanTemuTitle(firstText(pageSignals.title, deepSignals.title, pageSignals.metaTitle, document.title));
     if (!title) throw new Error("未识别到 Temu 商品标题");
 
@@ -44,7 +51,7 @@
       ...(deepSignals.selectedOptions || {}),
       ...(pageSignals.selectedOptions || {}),
     };
-    const goodsId = firstText(deepSignals.goods_id, pageSignals.goods_id, extractGoodsIdFromUrl(location.href));
+    const goodsId = firstText(extractGoodsIdFromUrl(location.href), pageSignals.goods_id, deepSignals.goods_id);
     const price = normalizePrice({
       ...deepSignals.price,
       ...pageSignals.price,
@@ -101,10 +108,18 @@
   }
 
   function collectPageSignals() {
-    const images = uniqueUrls([
-      ...collectVisibleProductImages(),
-      ...collectImagesFromDom(),
-    ]).slice(0, 120);
+    const visibleProductImages = collectVisibleProductImages();
+    const trustedImages = rankTemuProductImages([
+      ...collectUrlHintImages(),
+      ...visibleProductImages,
+      normalizeTemuImageUrl(readMeta("meta[property='og:image']")),
+      ...collectPreloadImages(),
+    ]).slice(0, 80);
+    const fallbackImages = trustedImages.length >= 3 ? [] : collectImagesFromDom().slice(0, 20);
+    const images = rankTemuProductImages([
+      ...trustedImages,
+      ...fallbackImages,
+    ]).slice(0, 80);
     const text = normalizeWhitespace(document.body?.innerText || "");
     const price = normalizePrice({
       ...collectVisiblePrice(text),
@@ -117,7 +132,7 @@
       metaTitle: readMeta("meta[property='og:title']"),
       description: readMeta("meta[name='description']") || readMeta("meta[property='og:description']"),
       goods_id: extractGoodsIdFromUrl(location.href) || extractGoodsIdFromText(text),
-      image: images[0] || readMeta("meta[property='og:image']"),
+      image: images[0] || normalizeTemuImageUrl(readMeta("meta[property='og:image']")),
       images,
       video_url: collectVideoUrls()[0] || "",
       price,
@@ -188,7 +203,7 @@
     for (const value of rootValues) {
       title = firstText(title, cleanTemuTitle(findFirstDeep(value, ["title", "goodsName", "productName", "productTitle", "name"])));
       description = firstText(description, findFirstDeep(value, ["description", "desc", "goodsDesc", "productDescription"]));
-      goodsId = firstText(goodsId, findFirstDeep(value, ["goods_id", "goodsId", "goodsID", "productId", "product_id", "id"]));
+      goodsId = firstText(goodsId, findFirstDeep(value, ["goods_id", "goodsId", "goodsID", "productId", "product_id"]));
       videoUrl = firstText(videoUrl, findFirstUrlDeep(value, /video|mp4|m3u8/i));
       shopId = firstText(shopId, findFirstDeep(value, ["storeId", "shopId", "mallId", "sellerId"]));
       shopName = firstText(shopName, findFirstDeep(value, ["storeName", "shopName", "mallName", "sellerName"]));
@@ -257,21 +272,78 @@
     return false;
   }
 
+  function isRecommendationOrNoiseElement(element) {
+    const contextParts = [];
+    let ancestor = element;
+    for (let index = 0; index < 8 && ancestor; index += 1) {
+      contextParts.push(
+        ancestor.getAttribute?.("aria-label") || "",
+        ancestor.id || "",
+        String(ancestor.className || ""),
+        normalizeWhitespace(ancestor.innerText || "").slice(0, 600)
+      );
+      ancestor = ancestor.parentElement;
+    }
+    const contextText = contextParts.filter(Boolean).join(" ");
+    return /recommend|recommended|related|similar|also viewed|you may also like|customers also|popular|trending|sponsored|ad\b|ads\b|promotion|promo|search_result|search-result|waterfall|feed|mallrec|rec-?list|guess|guess you like|more to love|发现更多|推荐|相似|相关|猜你喜欢|更多商品|广告|赞助|热卖|榜单|瀑布流|搜索结果/i.test(contextText);
+  }
+
   function collectVisibleProductImages() {
     const root = getTemuProductRoot();
     const rootRect = root.getBoundingClientRect();
     const images = [];
     root.querySelectorAll("img").forEach((img) => {
       if (isStoreOrProfileImage(img)) return;
+      if (isRecommendationOrNoiseElement(img)) return;
       const rect = img.getBoundingClientRect();
       const area = rect.width * rect.height;
-      const src = normalizeUrl(img.currentSrc || img.src || img.getAttribute("data-src"));
+      const src = pickBestImageUrl(img);
       const insideRoot = rect.left >= rootRect.left - 4 && rect.right <= rootRect.right + 4;
       const leftMediaZone = rect.left < rootRect.left + rootRect.width * 0.62;
       const productSized = rect.width >= 48 && rect.height >= 48 && area >= 2500;
-      if (insideRoot && leftMediaZone && productSized && isLikelyProductImageUrl(src)) images.push(src);
+      if (insideRoot && leftMediaZone && productSized && isLikelyProductImageUrl(src)) {
+        images.push({
+          url: src,
+          score: scoreVisibleProductImage(img, rect, rootRect),
+        });
+      }
     });
-    return uniqueUrls([readMeta("meta[property='og:image']"), ...images]).filter(isLikelyProductImageUrl).slice(0, 60);
+    return rankTemuProductImages([
+      ...images.sort((left, right) => right.score - left.score).map((item) => item.url),
+      readMeta("meta[property='og:image']"),
+    ]).slice(0, 60);
+  }
+
+  function collectUrlHintImages() {
+    const images = [];
+    try {
+      const parsed = new URL(location.href);
+      for (const key of ["top_gallery_url", "gallery_url", "image_url", "img_url"]) {
+        const value = parsed.searchParams.get(key);
+        if (value) images.push(value);
+      }
+    } catch (_error) {
+      return [];
+    }
+    return images;
+  }
+
+  function collectPreloadImages() {
+    const images = [];
+    document.querySelectorAll("link[rel='preload'][as='image']").forEach((link) => {
+      images.push(link.getAttribute("href") || link.href || "");
+    });
+    return images;
+  }
+
+  function scoreVisibleProductImage(img, rect, rootRect) {
+    const area = Math.max(0, rect.width) * Math.max(0, rect.height);
+    const inMainStage = rect.width >= 260 && rect.height >= 260 ? 1200 : 0;
+    const inThumbRail = rect.width >= 48 && rect.width <= 140 && rect.height >= 48 && rect.height <= 180 ? 450 : 0;
+    const nearLeft = Math.max(0, 320 - Math.abs(rect.left - rootRect.left));
+    const nearTop = Math.max(0, 420 - Math.abs(rect.top - rootRect.top));
+    const url = pickBestImageUrl(img);
+    return area + inMainStage + inThumbRail + nearLeft + nearTop + scoreTemuImageUrl(url);
   }
 
   function collectVisibleProductTitle() {
@@ -344,24 +416,21 @@
   function collectImagesFromDom() {
     const imageUrls = [readMeta("meta[property='og:image']")];
     for (const image of Array.from(document.images || [])) {
-      imageUrls.push(image.currentSrc, image.src, image.getAttribute("data-src"));
+      if (isStoreOrProfileImage(image) || isRecommendationOrNoiseElement(image)) continue;
+      imageUrls.push(pickBestImageUrl(image), image.currentSrc, image.src, image.getAttribute("data-src"));
       imageUrls.push(...extractUrlsFromSrcset(image.srcset || ""));
       const lazyValue = image.getAttribute("data-original") || image.getAttribute("data-lazy") || "";
       imageUrls.push(lazyValue);
     }
     for (const source of Array.from(document.querySelectorAll("source[srcset]"))) {
+      if (isRecommendationOrNoiseElement(source)) continue;
       imageUrls.push(...extractUrlsFromSrcset(source.getAttribute("srcset") || ""));
     }
     for (const element of Array.from(document.querySelectorAll("[style*='background']"))) {
+      if (isRecommendationOrNoiseElement(element)) continue;
       imageUrls.push(...extractUrlsFromText(element.getAttribute("style") || ""));
     }
-    for (const script of Array.from(document.scripts || [])) {
-      const text = script.textContent || "";
-      if (/image|img|pic|kwcdn|cdn/i.test(text)) {
-        imageUrls.push(...extractUrlsFromText(text));
-      }
-    }
-    return uniqueUrls(imageUrls).filter(isLikelyProductImageUrl).slice(0, 120);
+    return rankTemuProductImages(imageUrls).slice(0, 120);
   }
 
   function collectVideoUrls() {
@@ -828,6 +897,7 @@
         parsed.searchParams.get("goods_id") ||
         parsed.searchParams.get("goodsId") ||
         parsed.searchParams.get("_oak_goods_id") ||
+        (parsed.pathname.match(/-g-([0-9A-Za-z_-]+)\.html/i) || [])[1] ||
         (parsed.pathname.match(/(?:goods|product)[/_-]?([0-9]{8,})/i) || [])[1] ||
         ""
       );
@@ -855,15 +925,78 @@
 
   function pickImageFromElement(element) {
     const image = element.querySelector?.("img");
-    return normalizeUrl(image?.currentSrc || image?.src || image?.getAttribute("data-src") || "");
+    return pickBestImageUrl(image);
   }
 
   function isLikelyProductImageUrl(url) {
     return (
       /^https?:\/\//i.test(url || "") &&
       /img|image|cdn|kwcdn|product|goods|scene|fancy|jpg|jpeg|png|webp/i.test(url) &&
-      !/avatar|logo|icon|badge|footer|recommend|search_result|chat|message|coupon/i.test(url)
+      !/avatar|logo|icon|badge|footer|recommend|recommended|related|similar|search_result|search-result|searchresult|waterfall|feed|mallrec|rec-?list|sponsor|ad_|ads|chat|message|coupon|flag|sprite|web\/c965|upload_aimg\/(?:web|goods-icon|channel|promo|rec)\//i.test(url) &&
+      !isLowQualityTemuImageUrl(url)
     );
+  }
+
+  function pickBestImageUrl(image) {
+    if (!image) return "";
+    return rankTemuProductImages([
+      image.currentSrc,
+      image.src,
+      image.getAttribute("data-src"),
+      image.getAttribute("data-original"),
+      image.getAttribute("data-lazy"),
+      ...extractUrlsFromSrcset(image.srcset || ""),
+    ])[0] || "";
+  }
+
+  function rankTemuProductImages(values) {
+    const candidates = [];
+    for (const raw of values || []) {
+      const rawUrl = typeof raw === "string" ? raw : raw?.url;
+      const normalized = normalizeTemuImageUrl(rawUrl);
+      if (!isLikelyProductImageUrl(normalized)) continue;
+      const score = scoreTemuImageUrl(normalized) + (typeof raw === "object" ? Number(raw.score || 0) : 0);
+      candidates.push({ url: normalized, score });
+    }
+    candidates.sort((left, right) => right.score - left.score);
+    return uniqueUrls(candidates.map((item) => item.url));
+  }
+
+  function scoreTemuImageUrl(url) {
+    const text = String(url || "");
+    let score = 0;
+    if (/img\.kwcdn\.com\/product\/open\//i.test(text)) score += 5000;
+    if (/-goods\.(?:jpe?g|png|webp|avif)/i.test(text)) score += 4000;
+    if (/goods|product|scene|fancy/i.test(text)) score += 1200;
+    if (/\/w\/([0-9]+)/i.test(text)) score += Math.min(900, Number((text.match(/\/w\/([0-9]+)/i) || [])[1] || 0));
+    if (/\/q\/([0-9]+)/i.test(text)) score += Math.min(100, Number((text.match(/\/q\/([0-9]+)/i) || [])[1] || 0));
+    if (/imageView2|format\/(?:avif|webp)|thumbnail|thumb|slim|_300x300/i.test(text)) score -= 900;
+    if (/aimg\.kwcdn\.com\/upload_aimg\/(?:web|goods-icon|channel|promo|rec)\//i.test(text)) score -= 2500;
+    if (/recommend|recommended|related|similar|search_result|search-result|waterfall|feed|mallrec|rec-?list|sponsor|ad_|ads/i.test(text)) score -= 5000;
+    return score;
+  }
+
+  function isLowQualityTemuImageUrl(url) {
+    const text = String(url || "");
+    const width = Number((text.match(/\/w\/([0-9]+)/i) || [])[1] || 0);
+    if (width > 0 && width < 220) return true;
+    return /(?:\.slim\.png|_300x300|\/goods-icon\/|\/channel\/|\/promo\/|\/rec\/|recommend|recommended|related|similar|search_result|search-result|waterfall|feed|mallrec|rec-?list|sponsor|ad_|ads)/i.test(text);
+  }
+
+  function normalizeTemuImageUrl(url) {
+    const normalized = normalizeUrl(url);
+    if (!normalized) return "";
+    try {
+      const parsed = new URL(normalized);
+      if (/kwcdn\.com$/i.test(parsed.hostname)) {
+        parsed.search = "";
+        parsed.hash = "";
+        return parsed.href;
+      }
+    } catch (_error) {
+      return normalized;
+    }
+    return normalized;
   }
 
   function extractUrlsFromSrcset(srcset) {
@@ -876,8 +1009,9 @@
 
   function extractUrlsFromText(text) {
     const urls = [];
+    const source = decodeEscapedUrlText(text);
     const pattern = /https?:\\?\/\\?\/[^"'\s\\)]+/gi;
-    for (const match of String(text || "").matchAll(pattern)) {
+    for (const match of String(source || "").matchAll(pattern)) {
       urls.push(normalizeUrl(match[0].replaceAll("\\/", "/")));
     }
     return urls;
@@ -896,13 +1030,20 @@
   }
 
   function normalizeUrl(url) {
-    const clean = String(url || "").trim().replaceAll("\\/", "/");
+    const clean = decodeEscapedUrlText(url).trim().replaceAll("\\/", "/").replaceAll("&amp;", "&");
     if (!clean) return "";
     try {
       return new URL(clean, location.href).href;
     } catch (_error) {
       return "";
     }
+  }
+
+  function decodeEscapedUrlText(value) {
+    return String(value || "")
+      .replaceAll("\\u002F", "/")
+      .replaceAll("\\u002f", "/")
+      .replaceAll("\\/", "/");
   }
 
   function normalizeList(value) {

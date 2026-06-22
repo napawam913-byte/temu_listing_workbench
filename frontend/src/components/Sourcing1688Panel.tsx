@@ -26,6 +26,9 @@ const MIN_PRODUCT_IMAGE_GENERATION_COUNT = 1;
 const MAX_PRODUCT_IMAGE_GENERATION_COUNT = 8;
 const SMART_RECOMMEND_CACHE_STORAGE_KEY = 'temuListingWorkbenchSmart1688CacheV6';
 const SMART_RECOMMEND_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const LOCAL_SOURCING_ACTIVE_PRODUCT_STORAGE_KEY = 'temuListingWorkbenchActiveSourcingProduct';
+const LOCAL_SOURCING_CANDIDATES_STORAGE_KEY = 'temuListingWorkbenchLocalSourcingCandidates';
+const LOCAL_SOURCING_CANDIDATES_UPDATED_EVENT = 'temu-workbench-local-sourcing-candidates-updated';
 const DEFAULT_STYLE_PROMPT =
   '先分析，再执行。先分析商品品类、主体组件、SKU/组合售卖内容、可复用画风和禁用元素；再统一光线、背景、色温、质感和构图。保留 SKU 的真实款式、颜色、数量和关键细节，组合 SKU 必须把购买会收到的所有组件同框展示，生成干净一致的 Temu 电商商品图。';
 
@@ -72,6 +75,38 @@ type FinalSkuEntry = {
 };
 
 type PanelTab = 'search' | 'recommend' | 'combo' | 'preview';
+
+function readLocalSourcingCandidateMap(): Record<string, Captured1688Candidate[]> {
+  try {
+    const value = JSON.parse(localStorage.getItem(LOCAL_SOURCING_CANDIDATES_STORAGE_KEY) || '{}');
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+function readLocalSourcingCandidates(productId: string): Captured1688Candidate[] {
+  const items = readLocalSourcingCandidateMap()[productId];
+  return Array.isArray(items) ? items.filter((item) => Boolean(item?.id && item?.title)) : [];
+}
+
+function writeLocalSourcingCandidates(productId: string, candidates: Captured1688Candidate[]) {
+  const map = readLocalSourcingCandidateMap();
+  map[productId] = candidates;
+  localStorage.setItem(LOCAL_SOURCING_CANDIDATES_STORAGE_KEY, JSON.stringify(map));
+}
+
+function removeLocalSourcingCandidate(productId: string, candidateId: string) {
+  writeLocalSourcingCandidates(
+    productId,
+    readLocalSourcingCandidates(productId).filter((candidate) => candidate.id !== candidateId),
+  );
+}
+
+function mergeCapturedCandidates(items: Captured1688Candidate[], localItems: Captured1688Candidate[]) {
+  const localIdSet = new Set(localItems.map((item) => item.id));
+  return [...localItems, ...items.filter((item) => !localIdSet.has(item.id))];
+}
 
 type SmartRecommendCacheEntry = {
   productKey: string;
@@ -861,22 +896,32 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
 
   const loadCapturedCandidates = useCallback(async () => {
     setLoadingCandidates(true);
+    const localItems = readLocalSourcingCandidates(product.id);
     try {
       const items = await fetchCaptured1688Candidates(product.id);
-      setCapturedCandidates(items);
-      if (!selectedCandidate && items.length > 0) {
-        setSelectedCandidate(items[0]);
+      const mergedItems = mergeCapturedCandidates(items, localItems);
+      setCapturedCandidates(mergedItems);
+      if (!selectedCandidate && mergedItems.length > 0) {
+        setSelectedCandidate(mergedItems[0]);
       }
     } catch {
-      setCapturedCandidates([]);
+      setCapturedCandidates(localItems);
+      if (!selectedCandidate && localItems.length > 0) {
+        setSelectedCandidate(localItems[0]);
+      }
     } finally {
       setLoadingCandidates(false);
     }
   }, [product.id, selectedCandidate]);
 
   const deleteCapturedCandidate = async (candidate: Captured1688Candidate) => {
+    const isLocalCandidate = candidate.id.startsWith('local-candidate-');
     try {
-      await deleteCaptured1688Candidate(candidate.id);
+      if (isLocalCandidate) {
+        removeLocalSourcingCandidate(product.id, candidate.id);
+      } else {
+        await deleteCaptured1688Candidate(candidate.id);
+      }
 
       const remainingCandidates = capturedCandidates.filter((item) => item.id !== candidate.id);
       const keepSkuKey = (key: string) => {
@@ -914,6 +959,14 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
 
   const bindCaptureSession = useCallback(
     async ({ showMessage = false }: { showMessage?: boolean } = {}) => {
+      localStorage.setItem(
+        LOCAL_SOURCING_ACTIVE_PRODUCT_STORAGE_KEY,
+        JSON.stringify({
+          temu_product_id: product.id,
+          title: product.title || product.titleEn || product.id,
+          updated_at: new Date().toISOString(),
+        }),
+      );
       try {
         await setActive1688CaptureSession(product.id);
         setCaptureStarted(true);
@@ -954,13 +1007,6 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
     void bindCaptureSession();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [product.id]);
-
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      void loadCapturedCandidates();
-    }, 3000);
-    return () => window.clearInterval(timer);
-  }, [loadCapturedCandidates]);
 
   useEffect(() => {
     setSelectedSkuKeys((current) => {
@@ -1038,8 +1084,9 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
   }, [selectedEntryCount, tab]);
 
   const startCapture = async () => {
+    if (loadingCandidates) return;
     await bindCaptureSession({ showMessage: true });
-    void loadCapturedCandidates();
+    await loadCapturedCandidates();
   };
 
   const toggleSkuSelection = (key: string) => {
@@ -1056,6 +1103,21 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
       return current.filter((item) => item !== key);
     });
   };
+
+  useEffect(() => {
+    const syncLocalSourcingCandidates = () => {
+      const localItems = readLocalSourcingCandidates(product.id);
+      setCapturedCandidates((current) => mergeCapturedCandidates(current, localItems));
+      setSelectedCandidate((current) => current || localItems[0]);
+    };
+
+    window.addEventListener(LOCAL_SOURCING_CANDIDATES_UPDATED_EVENT, syncLocalSourcingCandidates);
+    window.addEventListener('storage', syncLocalSourcingCandidates);
+    return () => {
+      window.removeEventListener(LOCAL_SOURCING_CANDIDATES_UPDATED_EVENT, syncLocalSourcingCandidates);
+      window.removeEventListener('storage', syncLocalSourcingCandidates);
+    };
+  }, [product.id]);
 
   const toggleAllVisibleSkus = (checked: boolean) => {
     setPendingComboSkuKeys((current) => {
@@ -1450,7 +1512,7 @@ export function Sourcing1688Panel({ product, onSearch, onRecordLinkEntry }: Prop
             <Button loading={opening1688} onClick={() => void open1688()}>
               {opening1688 ? '转换中' : '打开 1688'}
             </Button>
-            <Button type="primary" onClick={startCapture}>
+            <Button loading={loadingCandidates} type="primary" onClick={startCapture}>
               刷新货源素材
             </Button>
           </div>

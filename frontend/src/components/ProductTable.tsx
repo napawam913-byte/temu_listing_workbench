@@ -1,4 +1,4 @@
-import { Button, Image, InputNumber, Popconfirm, Space, Table, Tag, Tooltip } from 'antd';
+import { Button, Image, InputNumber, Popconfirm, Space, Table, Tooltip } from 'antd';
 import type { ColumnsType, SortOrder, TableRowSelection } from 'antd/es/table/interface';
 import { useEffect, useState } from 'react';
 import type { Product } from '../types/product';
@@ -82,7 +82,6 @@ function ProductTitleBlock({
   dateValue?: string;
 }) {
   const visibleTitle = product.titleEn || product.title;
-  const shouldShowFulfillmentTag = product.sourceType !== '1688';
 
   const handleTitleClick = () => {
     onView(product);
@@ -103,11 +102,6 @@ function ProductTitleBlock({
           {visibleTitle}
         </button>
       </Tooltip>
-      {shouldShowFulfillmentTag ? (
-        <div className="product-title-tags">
-          <Tag color="orange">半托管</Tag>
-        </div>
-      ) : null}
       <div className="product-title-meta">{dateMetaLabel}：{dateValue || '-'}</div>
     </div>
   );

@@ -117,7 +117,9 @@ function pickGalleryImages() {
 
   imageUrls.push(...extractImageUrlsFromText(getInlineContextScriptText()));
 
-  return uniqueImageUrls(imageUrls).filter(isLikelyProductImageUrl).slice(0, 30);
+  return uniqueImageUrls(imageUrls.map(normalizeHighQualityImageUrl))
+    .filter(isLikelyGalleryImageUrl)
+    .slice(0, 30);
 }
 
 function pickPrice() {
@@ -274,17 +276,19 @@ function isLikelyCategoryPart(value) {
 
 function pickSkuList() {
   const contextItems = pickSkuListFromContext();
-  const strongContextItems = contextItems.filter(isStrongSkuItem);
+  const rowItems = pickSkuRowsFromDom();
+  const domImageItems = pickSkuImageItemsFromDom();
+  const allItems = mergeSkuItems([...contextItems, ...rowItems, ...domImageItems]);
+  const strongContextItems = allItems.filter(isStrongSkuItem);
   if (strongContextItems.length > 0) {
     return mergeSkuItems(strongContextItems).slice(0, 80);
   }
 
-  const weakContextItems = contextItems.filter(hasUsefulSpecValue);
+  const weakContextItems = allItems.filter(hasUsefulSpecValue);
   if (weakContextItems.length > 0 && hasExplicitSkuChoiceSignal()) {
     return mergeSkuItems(weakContextItems).slice(0, 80);
   }
 
-  const rowItems = pickSkuRowsFromDom();
   const strongRowItems = rowItems.filter(isStrongSkuItem);
   if (strongRowItems.length > 0) {
     return mergeSkuItems(strongRowItems).slice(0, 80);
@@ -318,12 +322,12 @@ function buildSkuImageLookupFromPage() {
   const lookup = new Map();
   const rows = Array.from(
     document.querySelectorAll(
-      "#skuSelection .expand-view-item, .module-od-sku-selection .expand-view-item, [class*='sku'] .expand-view-item, [class*='Sku'] .expand-view-item"
+      "#skuSelection .expand-view-item, .module-od-sku-selection .expand-view-item, [class*='sku'] .expand-view-item, [class*='Sku'] .expand-view-item, [class*='sku'] button, [class*='Sku'] button, [class*='sku'] li, [class*='Sku'] li, [class*='sku'] [role='button'], [class*='Sku'] [role='button']"
     )
   );
 
   for (const row of rows) {
-    const imageUrl = pickImageFromElement(row);
+    const imageUrl = normalizeHighQualityImageUrl(pickImageFromElement(row));
     if (!imageUrl) continue;
 
     const label =
@@ -345,11 +349,67 @@ function buildSkuImageLookupFromPage() {
   return lookup;
 }
 
+function pickSkuImageItemsFromDom() {
+  const selectors = [
+    "#skuSelection .expand-view-item",
+    ".module-od-sku-selection .expand-view-item",
+    "#skuSelection .sku-filter-button",
+    ".module-od-sku-selection .sku-filter-button",
+    "#skuSelection .feature-item button",
+    ".module-od-sku-selection .feature-item button",
+    "[class*='sku'] button",
+    "[class*='Sku'] button",
+    "[class*='sku'] li",
+    "[class*='Sku'] li",
+    "[class*='sku'] [role='button']",
+    "[class*='Sku'] [role='button']",
+    "[class*='sku'] [class*='item']",
+    "[class*='Sku'] [class*='item']",
+  ];
+  const elements = uniqueElements(selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector))));
+
+  return elements
+    .map((element, index) => {
+      const imageUrl = normalizeHighQualityImageUrl(pickImageFromElement(element));
+      if (!imageUrl || !isLikelySkuImageUrl(imageUrl)) return null;
+
+      const text = extractSkuTextFromImageChoice(element);
+      if (!isUsefulSkuText(text)) return null;
+
+      return cleanSkuItem({
+        sku_id: element.getAttribute("data-sku-id") || element.getAttribute("data-id") || `sku-image-${index + 1}`,
+        specs: { [inferSkuPropNameNearElement(element) || "规格"]: text },
+        image_url: imageUrl,
+      });
+    })
+    .filter(Boolean);
+}
+
+function extractSkuTextFromImageChoice(element) {
+  const ariaText = cleanText(element.getAttribute?.("aria-label") || element.getAttribute?.("title"));
+  if (isUsefulSkuText(ariaText)) return ariaText;
+
+  const ownText = cleanText(element.innerText || element.textContent);
+  if (isUsefulSkuText(ownText)) return ownText;
+
+  const image = element.matches?.("img") ? element : element.querySelector?.("img");
+  const imageText = cleanText(image?.getAttribute("alt") || image?.getAttribute("title"));
+  return isUsefulSkuText(imageText) ? imageText : "";
+}
+
+function inferSkuPropNameNearElement(element) {
+  const container = element.closest?.("[class*='sku'], [class*='Sku'], [class*='prop'], [class*='Prop']") || element.parentElement;
+  const text = cleanText(container?.innerText || "");
+  const match = text.match(/^(颜色|色彩|Color|Colour|尺寸|Size|规格|款式|Style)\b/i);
+  return match?.[1] || "";
+}
+
 function pickSkuListFromContext() {
   const scriptText = getInlineContextScriptText();
+  const contextData = getWindowContextData();
   const skuInfoMap = parseObjectAfterKey(scriptText, "skuInfoMap");
-  const skuMap = parseObjectAfterKey(scriptText, "skuMap");
-  const skuProps = parseObjectAfterKey(scriptText, "skuProps");
+  const skuMap = contextData?.tradeModel?.skuMap || contextData?.offerModel?.skuMap || parseObjectAfterKey(scriptText, "skuMap");
+  const skuProps = contextData?.offerModel?.skuProps || contextData?.tradeModel?.skuProps || parseObjectAfterKey(scriptText, "skuProps");
   const skuWeightMap = parseObjectAfterKey(scriptText, "skuWeight");
   const propMeta = collectSkuPropMeta(skuProps);
   const skuItems = [];
@@ -486,6 +546,15 @@ function pickSkuListFromContext() {
   return collectSkuValueItemsFromProps(propMeta);
 }
 
+function getWindowContextData() {
+  try {
+    const context = window.context || {};
+    return context?.result?.data || context?.data || null;
+  } catch {
+    return null;
+  }
+}
+
 function pickSkuRowsFromDom() {
   const selectors = [
     "#skuSelection .expand-view-item",
@@ -506,7 +575,7 @@ function pickSkuRowsFromDom() {
 
 function parseSkuRow(row, index) {
   const rowText = cleanText(row.innerText || row.textContent);
-  const imageUrl = pickImageFromElement(row);
+  const imageUrl = normalizeHighQualityImageUrl(pickImageFromElement(row));
   const price = parsePriceFromText(rowText) ?? parsePriceFromElements(row);
   const stock = parseStockFromText(rowText);
   const { propName, value } = extractSkuSpecFromRow(row, rowText);
@@ -658,6 +727,12 @@ function findImageForSkuValue(value, propMeta) {
   const exactMeta = propMeta.valuesByName.get(text);
   if (exactMeta?.imageUrl) return exactMeta.imageUrl;
 
+  const specParts = splitSkuSpecTextSafe(text);
+  for (const part of specParts) {
+    const partMeta = propMeta.valuesByName.get(part);
+    if (partMeta?.imageUrl) return partMeta.imageUrl;
+  }
+
   const skuKey = skuImageMatchKey(text);
   if (!skuKey) return null;
 
@@ -671,6 +746,29 @@ function skuImageMatchKey(value) {
     .replace(/不含链|含链|链条|项链|吊坠|挂坠|坠子/g, "")
     .replace(/\s+/g, "")
     .trim();
+}
+
+function splitSkuSpecText(value) {
+  return decodeHtmlText(value)
+    .split(/\s*(?:>|&gt;|\/|／|\+|＋|,|，|、|\|)\s*/g)
+    .map(normalizeWhitespace)
+    .filter(Boolean);
+}
+
+function splitSkuSpecTextSafe(value) {
+  return decodeHtmlText(value)
+    .split(/\s*(?:>|\/|\+|,|\||／|＋|，|、)\s*/g)
+    .map(normalizeWhitespace)
+    .filter(Boolean);
+}
+
+function decodeHtmlText(value) {
+  return String(value ?? "")
+    .replace(/&gt;/gi, ">")
+    .replace(/&lt;/gi, "<")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#039;|&apos;/gi, "'");
 }
 
 function parseObjectAfterKey(sourceText, key) {
@@ -755,7 +853,7 @@ function splitSkuKey(rawKey) {
 function cleanSkuItem(item) {
   const cleaned = {
     sku_id: item.sku_id ? String(item.sku_id) : undefined,
-    specs: normalizeSpecObject(item.specs || {}),
+    specs: normalizeSpecObject(expandCompositeSkuSpecs(item.specs || {})),
   };
   if (item.price !== null && item.price !== undefined) cleaned.price = Number(item.price);
   if (item.stock !== null && item.stock !== undefined) cleaned.stock = Number(item.stock);
@@ -765,6 +863,31 @@ function cleanSkuItem(item) {
     if (weight !== null) cleaned.weight_kg = weight;
   }
   return cleaned;
+}
+
+function expandCompositeSkuSpecs(specs) {
+  const entries = Object.entries(specs || {});
+  if (entries.length !== 1) return specs;
+
+  const [[key, value]] = entries;
+  const parts = splitSkuSpecTextSafe(value);
+  if (parts.length < 2) return specs;
+
+  const propNames = inferPropNamesForSkuParts(parts, key);
+  return parts.reduce((nextSpecs, part, index) => {
+    nextSpecs[propNames[index] || `规格${index + 1}`] = part;
+    return nextSpecs;
+  }, {});
+}
+
+function inferPropNamesForSkuParts(parts, fallbackKey) {
+  const knownColorNames = ["颜色", "色彩", "Color"];
+  const knownSizeNames = ["尺寸", "尺码", "Size"];
+  return parts.map((part, index) => {
+    if (index === 0 && /(色|黑|白|红|粉|蓝|绿|紫|灰|黄|橙|棕|银|金|color)/i.test(part)) return knownColorNames[0];
+    if (/^\d+(?:\.\d+)?\s*[x*×]\s*\d+/i.test(part) || /(cm|mm|m|inch|in|码|号)$/i.test(part)) return knownSizeNames[0];
+    return index === 0 ? fallbackKey || "规格" : `规格${index + 1}`;
+  });
 }
 
 function mergeSkuItems(items) {
@@ -961,7 +1084,7 @@ function pickImageUrlsFromElement(element) {
   const style = element.getAttribute?.("style") || "";
   urls.push(...extractBackgroundImageUrls(style));
 
-  return uniqueImageUrls(urls).filter(isLikelyProductImageUrl);
+  return uniqueImageUrls(urls.map(normalizeHighQualityImageUrl)).filter(isLikelyProductImageUrl);
 }
 
 function extractImageUrlsFromSrcset(srcset) {
@@ -999,12 +1122,42 @@ function uniqueImageUrls(urls) {
   return normalized;
 }
 
+function normalizeHighQualityImageUrl(url) {
+  const cleanUrl = normalizeUrl(url);
+  if (!cleanUrl) return null;
+  return cleanUrl
+    .replace(/\.(jpg|jpeg|png|webp)_sum\.(?:jpg|jpeg|png|webp)(?=$|\?)/i, ".$1")
+    .replace(/_sum(?=\.(?:jpg|jpeg|png|webp)(?:$|\?))/i, "")
+    .replace(/_(?:\d+x\d+|\.webp)(?=$|\?)/i, "");
+}
+
 function isLikelyProductImageUrl(url) {
   const src = String(url || "");
   if (!src || src.startsWith("data:") || src.startsWith("blob:")) return false;
   if (!/\.(jpg|jpeg|png|webp)(?:[?#._-]|$)/i.test(src)) return false;
   if (/icon|sprite|logo|avatar|loading|placeholder|transparent|grey\.gif/i.test(src)) return false;
+  if (isLikelyPlatformNoiseImageUrl(src)) return false;
   return true;
+}
+
+function isLikelyGalleryImageUrl(url) {
+  const src = normalizeHighQualityImageUrl(url);
+  if (!isLikelyProductImageUrl(src)) return false;
+  if (/_sum\.(?:jpg|jpeg|png|webp)/i.test(String(url || ""))) return false;
+  if (/-55-tps-\d+-\d+|-\d+-tps-\d+-\d+|-\d+-gg_dtc/i.test(src)) return false;
+  return true;
+}
+
+function isLikelySkuImageUrl(url) {
+  const src = normalizeHighQualityImageUrl(url);
+  if (!isLikelyProductImageUrl(src)) return false;
+  if (isLikelyPlatformNoiseImageUrl(src)) return false;
+  return true;
+}
+
+function isLikelyPlatformNoiseImageUrl(url) {
+  const src = String(url || "");
+  return /!!600000000\d+-(?:\d+-)?(?:tps|gg_dtc)|-55-tps-\d+-\d+|-\d+-tps-\d+-\d+|-\d+-gg_dtc|alibar|sidebar|service|credit|badge|icon/i.test(src);
 }
 
 function getFirstTextInElement(root, selectors) {
@@ -1330,6 +1483,7 @@ function normalizeUrl(url) {
   if (cleanUrl.startsWith("http:\\/\\/") || cleanUrl.startsWith("https:\\/\\/")) {
     return cleanUrl.replaceAll("\\/", "/");
   }
+  if (cleanUrl.startsWith("./")) return new URL(cleanUrl, location.href).href;
   if (cleanUrl.startsWith("/")) return `${location.origin}${cleanUrl}`;
   return cleanUrl;
 }

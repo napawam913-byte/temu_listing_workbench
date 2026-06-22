@@ -466,6 +466,49 @@ def soft_delete_product(product_id: str, scope: str = "pool", *, user_id: str = 
             return deleted
 
 
+def soft_delete_products(product_ids: list[str], scope: str = "pool", *, user_id: str = DEFAULT_USER_ID) -> dict[str, Any]:
+    clean_ids = list(dict.fromkeys(product_id.strip() for product_id in product_ids if product_id and product_id.strip()))
+    if not clean_ids:
+        return {"ok": True, "deleted_count": 0, "deleted_ids": [], "missing_ids": []}
+
+    now = utc_now_text()
+    with get_pg_connection() as conn:
+        with conn.cursor() as cur:
+            if scope == "pool":
+                cur.execute(
+                    """
+                    UPDATE product_pool_memberships
+                    SET status = 'deleted', updated_at = %s
+                    WHERE user_id = %s AND product_id = ANY(%s) AND status != 'deleted'
+                    RETURNING product_id
+                    """,
+                    (now, user_id, clean_ids),
+                )
+                deleted_ids = [row["product_id"] for row in cur.fetchall()]
+            else:
+                cur.execute(
+                    """
+                    UPDATE products
+                    SET status = 'deleted', updated_at = %s
+                    WHERE id = ANY(%s) AND status != 'deleted'
+                    RETURNING id
+                    """,
+                    (now, clean_ids),
+                )
+                deleted_ids = [row["id"] for row in cur.fetchall()]
+
+            if deleted_ids:
+                clear_product_count_cache()
+
+    deleted_id_set = set(deleted_ids)
+    return {
+        "ok": True,
+        "deleted_count": len(deleted_ids),
+        "deleted_ids": deleted_ids,
+        "missing_ids": [product_id for product_id in clean_ids if product_id not in deleted_id_set],
+    }
+
+
 def build_product_where(
     *,
     keyword: str | None = None,

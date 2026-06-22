@@ -13,6 +13,10 @@ class AddProductsToPoolRequest(BaseModel):
     product_ids: list[str]
 
 
+class DeleteProductsRequest(BaseModel):
+    product_ids: list[str]
+
+
 @router.get("")
 def get_products(
     page: int = Query(1, ge=1),
@@ -86,5 +90,14 @@ def delete_product(
 ):
     deleted = postgres_store.soft_delete_product(product_id, scope=scope, user_id=current_user["id"])
     if not deleted:
-        raise HTTPException(status_code=404, detail="商品不存在")
+        raise HTTPException(status_code=404, detail="Product does not exist")
     return {"ok": True}
+
+
+@router.post("/batch-delete")
+def batch_delete_products(
+    payload: DeleteProductsRequest,
+    scope: str = Query("pool", pattern="^(pool|all)$"),
+    current_user: dict[str, Any] = Depends(require_current_user),
+):
+    return postgres_store.soft_delete_products(payload.product_ids, scope=scope, user_id=current_user["id"])

@@ -355,6 +355,7 @@ def create_visual_task(
     record: dict[str, Any] | None = None,
     link_record_id: str | None = None,
     product_id: str | None = None,
+    run_batch_id: str | None = None,
     mode: str | None = None,
     layout: str | None = None,
     requested_count: int | None = None,
@@ -367,6 +368,10 @@ def create_visual_task(
     reference_refs = normalize_reference_image_refs(reference_image_refs or record.get("visualReferenceImages"))
     clean_link_record_id = clean_text(link_record_id) or clean_text(record.get("id"))
     clean_product_id = clean_text(product_id) or clean_text(record.get("productId"))
+    clean_run_batch_id = clean_text(run_batch_id) or clean_text((record.get("visualQueueMeta") or {}).get("runBatchId") if isinstance(record.get("visualQueueMeta"), dict) else "")
+    if clean_run_batch_id:
+        queue_meta = record.get("visualQueueMeta") if isinstance(record.get("visualQueueMeta"), dict) else {}
+        record["visualQueueMeta"] = {**queue_meta, "runBatchId": clean_run_batch_id}
     clean_source_image_ref = clean_text(source_image_ref) or (reference_refs[0]["url"] if reference_refs else "") or pick_record_image(record)
     if reference_refs:
         record["visualReferenceImages"] = reference_refs
@@ -437,6 +442,33 @@ def get_visual_task(*, task_id: str, user_id: str) -> dict[str, Any]:
             raise VisualTaskError("visual task not found")
         modules = fetch_modules(conn, task_id)
     return task_row_to_api(row, modules=modules)
+
+
+def update_visual_task_run_batch_id(*, task_id: str, user_id: str, run_batch_id: str | None) -> None:
+    clean_run_batch_id = clean_text(run_batch_id)
+    if not clean_run_batch_id:
+        return
+    with get_connection() as conn:
+        ensure_visual_generation_schema(conn)
+        row = conn.execute(
+            "SELECT record_json FROM visual_generation_tasks WHERE id = ? AND user_id = ?",
+            (task_id, user_id),
+        ).fetchone()
+        if row is None:
+            raise VisualTaskError("visual task not found")
+        record = parse_json(row["record_json"], {})
+        queue_meta = record.get("visualQueueMeta") if isinstance(record.get("visualQueueMeta"), dict) else {}
+        if clean_text(queue_meta.get("runBatchId")) == clean_run_batch_id:
+            return
+        record["visualQueueMeta"] = {**queue_meta, "runBatchId": clean_run_batch_id}
+        conn.execute(
+            """
+            UPDATE visual_generation_tasks
+            SET record_json = ?, updated_at = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (json.dumps(record, ensure_ascii=False), utc_now_text(), task_id, user_id),
+        )
 
 
 def assert_visual_task_not_cancelled(task_id: str, user_id: str) -> None:
@@ -2302,6 +2334,38 @@ def update_task_status(task_id: str, user_id: str, status: str, *, clear_error: 
             )
 
 
+def try_mark_visual_task_running(task_id: str, user_id: str, *, exclude_task_id: str | None = None) -> tuple[bool, str]:
+    user_limit = visual_int_setting("VISUAL_USER_CONCURRENCY_LIMIT", 5, minimum=0, maximum=100)
+    now = utc_now_text()
+    with get_connection() as conn:
+        ensure_visual_generation_schema(conn)
+        conn.execute("SELECT pg_advisory_xact_lock(hashtext(?)::bigint)", (f"visual-generation:user:{user_id}",))
+        row = conn.execute(
+            "SELECT status FROM visual_generation_tasks WHERE id = ? AND user_id = ? FOR UPDATE",
+            (task_id, user_id),
+        ).fetchone()
+        if row is None:
+            raise VisualTaskCancelled("visual task was removed")
+        if row["status"] == TASK_STATUS_CANCELLED:
+            raise VisualTaskCancelled("visual task was cancelled")
+
+        if user_limit > 0:
+            running_count = count_running_visual_tasks_for_user(conn, user_id, exclude_task_id=exclude_task_id or task_id)
+            running_count += running_runtime_slot_count(user_id)
+            if running_count >= user_limit:
+                return False, f"当前成员已有 {running_count} 个模型任务正在运行，成员并发上限为 {user_limit}"
+
+        conn.execute(
+            """
+            UPDATE visual_generation_tasks
+            SET status = ?, error_message = NULL, updated_at = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (TASK_STATUS_RUNNING, now, task_id, user_id),
+        )
+    return True, ""
+
+
 def mark_task_failed(task_id: str, user_id: str, error_message: str) -> None:
     with get_connection() as conn:
         ensure_visual_generation_schema(conn)
@@ -2421,11 +2485,13 @@ def task_row_to_api(row, *, modules: list[dict[str, Any]]) -> dict[str, Any]:
     analysis = parse_json(row["analysis_json"], {})
     manifest = parse_json(row["manifest_json"], {})
     record = parse_json(row["record_json"], {})
+    queue_meta = record.get("visualQueueMeta") if isinstance(record.get("visualQueueMeta"), dict) else {}
     api_task = {
         "id": row["id"],
         "userId": row["user_id"],
         "linkRecordId": row["link_record_id"],
         "productId": row["product_id"],
+        "runBatchId": clean_text(queue_meta.get("runBatchId")),
         "mode": row["mode"],
         "layout": row["layout"],
         "requestedCount": int(row["requested_count"] or 0),

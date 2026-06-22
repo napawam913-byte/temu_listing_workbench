@@ -43,6 +43,7 @@ import {
   deleteVisualGenerationTask,
   deleteVisualGenerationTasks,
   deleteProduct as deleteBackendProduct,
+  deleteProducts as deleteBackendProducts,
   deleteLinkListRecord,
   downloadDianxiaomiExportTask,
   fetchDianxiaomiExportTasks,
@@ -140,6 +141,7 @@ type VisualQueueItem = {
   statusColor: string;
   backendTaskId?: string;
   backendStatus?: string;
+  runBatchId?: string;
   progressState?: string | null;
   activeCredentialName?: string | null;
   activeCredentialId?: string | null;
@@ -217,6 +219,9 @@ type SkuImageBindingSubject = {
 };
 
 const LINK_LIST_STORAGE_KEY = 'temuListingWorkbenchLinkListRecords';
+const LOCAL_PLUGIN_PRODUCTS_STORAGE_KEY = 'temuListingWorkbenchLocalPluginProducts';
+const LOCAL_PLUGIN_PRODUCTS_UPDATED_EVENT = 'temu-workbench-local-plugin-products-updated';
+const LOCAL_SOURCING_ACTIVE_PRODUCT_STORAGE_KEY = 'temuListingWorkbenchActiveSourcingProduct';
 const CURATED_EXPORT_IMAGE_COUNT = 8;
 const FULL_MAIN_GALLERY_IMAGE_COUNT = 9;
 const COMPACT_MAIN_GALLERY_IMAGE_COUNT = 4;
@@ -248,6 +253,49 @@ function readLinkListRecords(userId: string): LinkListRecord[] {
 
 function writeLinkListRecords(records: LinkListRecord[], userId: string) {
   localStorage.setItem(getLinkListStorageKey(userId), JSON.stringify(records));
+}
+
+function mergeLinkListRecords(primaryRecords: LinkListRecord[], secondaryRecords: LinkListRecord[]) {
+  const recordsById = new Map<string, LinkListRecord>();
+  [...primaryRecords, ...secondaryRecords].forEach((record) => {
+    if (!record?.id || recordsById.has(record.id)) return;
+    recordsById.set(record.id, record);
+  });
+  return Array.from(recordsById.values()).slice(0, 200);
+}
+
+function readLocalPluginProducts(): Product[] {
+  try {
+    const value = JSON.parse(localStorage.getItem(LOCAL_PLUGIN_PRODUCTS_STORAGE_KEY) || '[]');
+    if (!Array.isArray(value)) return [];
+    return value.filter((item): item is Product => Boolean(item?.id && item?.title));
+  } catch {
+    return [];
+  }
+}
+
+function removeLocalPluginProducts(productIds: string[]) {
+  const idSet = new Set(productIds);
+  const nextProducts = readLocalPluginProducts().filter((product) => !idSet.has(product.id));
+  localStorage.setItem(LOCAL_PLUGIN_PRODUCTS_STORAGE_KEY, JSON.stringify(nextProducts));
+}
+
+function writeLocalSourcingActiveProduct(product: Product) {
+  localStorage.setItem(
+    LOCAL_SOURCING_ACTIVE_PRODUCT_STORAGE_KEY,
+    JSON.stringify({
+      temu_product_id: product.id,
+      title: product.title || product.titleEn || product.id,
+      source_type: product.sourceType,
+      source_product_id: product.sourceProductId,
+      drawer_open: true,
+      updated_at: new Date().toISOString(),
+    }),
+  );
+}
+
+function clearLocalSourcingActiveProduct() {
+  localStorage.removeItem(LOCAL_SOURCING_ACTIVE_PRODUCT_STORAGE_KEY);
 }
 
 function formatRecordTime(value: string) {
@@ -320,6 +368,16 @@ const defaultStats: ProductStats = {
   recent_30_count: mockProducts.filter((product) => product.period === '近30天').length,
   deleted_count: mockProducts.filter((product) => product.status === 'deleted').length,
 };
+
+function mergeLocalPluginProducts(products: Product[], localProducts = readLocalPluginProducts()) {
+  const visibleLocalProducts = localProducts.filter((product) => product.status !== 'deleted');
+  if (visibleLocalProducts.length === 0) return products;
+  const existingIds = new Set(visibleLocalProducts.map((product) => product.id));
+  return [
+    ...visibleLocalProducts,
+    ...products.filter((product) => !existingIds.has(product.id)),
+  ];
+}
 
 function matchesRange(value: number, rangeText?: string) {
   const range = parseRangeText(rangeText);
@@ -2145,6 +2203,7 @@ function createVisualQueueItem(
     referenceImageLabels?: string[];
     selectedSkuIds?: string[];
     selectedSlotIds?: string[];
+    runBatchId?: string;
   },
 ): VisualQueueItem {
   const safeCount = Math.max(1, Math.min(30, Math.floor(options.count || 1)));
@@ -2194,6 +2253,7 @@ function createVisualQueueItem(
   const modeLabel = getVisualPublishModeLabel(options.mode);
   return {
     id: `${task.id}-${Date.now()}`,
+    runBatchId: options.runBatchId,
     recordId: record.id,
     productTitle: getRecordDisplayTitle(record),
     taskId: task.id,
@@ -2252,12 +2312,17 @@ function getVisualTaskResultUrl(module: VisualGenerationTask['modules'][number])
 type VisualQueueMeta = {
   queueItemId?: string;
   taskId?: string;
+  runBatchId?: string;
   mode?: VisualPublishMode;
   selectedSkuIds?: string[];
   selectedSlotIds?: string[];
   referenceImageLabels?: string[];
   createdAt?: string;
 };
+
+function createVisualRunBatchId() {
+  return `visual-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
 
 function getVisualTaskRecordForQueue(record: LinkListRecord, item: VisualQueueItem): LinkListRecord {
   if (['main_multi', 'sku_adapt'].includes(item.mode) && item.selectedSkuIds?.length) {
@@ -2279,6 +2344,7 @@ function getVisualTaskRecordWithQueueMeta(record: LinkListRecord, item: VisualQu
     visualQueueMeta: {
       queueItemId: item.id,
       taskId: item.taskId,
+      runBatchId: item.runBatchId,
       mode: item.mode,
       selectedSkuIds: item.selectedSkuIds || [],
       selectedSlotIds: item.selectedSlotIds || [],
@@ -2345,6 +2411,7 @@ function createVisualQueueItemFromBackendTask(
     referenceImageLabels,
     selectedSkuIds,
     selectedSlotIds,
+    runBatchId: task.runBatchId || embeddedRecord.visualQueueMeta.runBatchId,
   });
 
   const modulesByPanel = new Map(task.modules.map((module) => [module.panelIndex || 0, module]));
@@ -2356,6 +2423,7 @@ function createVisualQueueItemFromBackendTask(
     id: embeddedRecord.visualQueueMeta.queueItemId || `queue-${task.id}`,
     backendTaskId: task.id,
     backendStatus: task.status,
+    runBatchId: task.runBatchId || embeddedRecord.visualQueueMeta.runBatchId || baseItem.runBatchId,
     progressState: task.progressState,
     activeCredentialName: task.activeCredentialName || undefined,
     activeCredentialId: task.activeCredentialId || undefined,
@@ -3001,6 +3069,8 @@ function LinkListPanel({
   const [visualWorkflowStageByItemId, setVisualWorkflowStageByItemId] = useState<Record<string, number>>({});
   const pendingVisualQueueDeleteIdsRef = useRef(new Set<string>());
   const retryWarningShownTaskIdsRef = useRef(new Set<string>());
+  const runningVisualBatchIdsRef = useRef(new Set<string>());
+  const visualQueueExecutingRef = useRef(false);
   const [exportQueueTasks, setExportQueueTasks] = useState<DianxiaomiExportTask[]>([]);
   const [visualQueueFilter, setVisualQueueFilter] = useState<QueueTaskFilter>('all');
   const exportQueuePendingCount = useMemo(
@@ -3663,6 +3733,7 @@ function LinkListPanel({
         record: getVisualTaskRecordWithQueueMeta(record, optimisticItem),
         linkRecordId: record.id,
         productId: record.productId,
+        runBatchId: optimisticItem.runBatchId,
         mode: getVisualTaskApiMode(optimisticItem.mode),
         layout: getVisualTaskLayout(optimisticItem.requestedCount),
         requestedCount: optimisticItem.requestedCount,
@@ -3692,8 +3763,13 @@ function LinkListPanel({
         message.success('已创建生图任务，正在自动执行');
         window.setTimeout(() => {
           const recordMap = new Map(records.map((candidate) => [candidate.id, candidate]));
+          const runBatchId = item.runBatchId || createVisualRunBatchId();
+          const runnableItem = { ...item, runBatchId };
+          setVisualQueueItems((current) =>
+            current.map((candidate) => (candidate.id === item.id ? { ...candidate, runBatchId } : candidate)),
+          );
           setVisualQueueExecuting(true);
-          void executeVisualQueueItem(item, recordMap)
+          void executeVisualQueueItem(runnableItem, recordMap)
             .then(() => {
               message.success('生图任务已完成，结果已回写到链接列表');
             })
@@ -3937,6 +4013,7 @@ function LinkListPanel({
   };
 
   const executeVisualQueueItem = async (item: VisualQueueItem, recordMap: Map<string, LinkListRecord>) => {
+    const runBatchId = item.runBatchId || createVisualRunBatchId();
     const record = recordMap.get(item.recordId) || records.find((candidate) => candidate.id === item.recordId);
     if (!record) {
       throw new Error('找不到该链接记录，请刷新后重试');
@@ -3953,6 +4030,7 @@ function LinkListPanel({
       statusLabel: '创建中',
       statusColor: 'processing',
       backendStatus: 'creating',
+      runBatchId,
       progressState: undefined,
       activeCredentialName: undefined,
       activeCredentialId: undefined,
@@ -3988,9 +4066,10 @@ function LinkListPanel({
     const created = item.backendTaskId
       ? await fetchVisualGenerationTask(item.backendTaskId)
       : await createVisualGenerationTask({
-          record: getVisualTaskRecordWithQueueMeta(record, item),
+          record: getVisualTaskRecordWithQueueMeta(record, { ...item, runBatchId }),
           linkRecordId: record.id,
           productId: record.productId,
+          runBatchId,
           mode: getVisualTaskApiMode(item.mode),
           layout: getVisualTaskLayout(item.requestedCount),
           requestedCount: item.requestedCount,
@@ -4016,6 +4095,7 @@ function LinkListPanel({
       useReferenceImage: true,
       applyToLinkRecord: true,
       reuseExistingOutputs: Boolean(item.backendTaskId),
+      runBatchId,
     });
     const waitingForConcurrency = Boolean(runResult.waitingForConcurrency);
     if (waitingForConcurrency) {
@@ -4164,6 +4244,10 @@ function LinkListPanel({
   };
 
   const executeVisualQueue = async () => {
+    if (visualQueueExecutingRef.current || visualQueueExecuting) {
+      message.warning('本批生图任务正在执行，请勿重复点击');
+      return;
+    }
     const pendingItems = visualQueueItems.filter(isVisualQueueItemRunnable);
     if (pendingItems.length === 0) {
       const activeCount = visualQueueItems.filter(isVisualQueueItemActive).length;
@@ -4171,6 +4255,21 @@ function LinkListPanel({
       return;
     }
 
+    const activeBatchItem = pendingItems.find((item) => item.runBatchId && runningVisualBatchIdsRef.current.has(item.runBatchId));
+    if (activeBatchItem) {
+      message.warning('本批生图任务正在执行，请勿重复点击');
+      return;
+    }
+    const runBatchId = createVisualRunBatchId();
+    visualQueueExecutingRef.current = true;
+    runningVisualBatchIdsRef.current.add(runBatchId);
+    const batchedPendingItems = pendingItems.map((item) => ({ ...item, runBatchId: item.runBatchId || runBatchId }));
+    setVisualQueueItems((current) =>
+      current.map((item) => {
+        const batchedItem = batchedPendingItems.find((candidate) => candidate.id === item.id);
+        return batchedItem || item;
+      }),
+    );
     setVisualQueueExecuting(true);
     const recordMap = new Map(records.map((record) => [record.id, record]));
     let latestSummary = visualQueueSummary;
@@ -4182,12 +4281,12 @@ function LinkListPanel({
         // Summary is only used to size the local worker pool; fallback keeps local dev usable.
       }
 
-      const fallbackLimit = Math.min(pendingItems.length, LOCAL_VISUAL_QUEUE_FALLBACK_WORKERS);
+      const fallbackLimit = Math.min(batchedPendingItems.length, LOCAL_VISUAL_QUEUE_FALLBACK_WORKERS);
       const userLimit = Number(latestSummary?.userConcurrencyLimit || 0);
       const userRunning = Number(latestSummary?.runningCount ?? latestSummary?.activeCount ?? 0);
       const userAvailable = userLimit > 0 ? Math.max(0, userLimit - userRunning) : fallbackLimit;
-      const workerCount = Math.max(1, Math.min(pendingItems.length, userAvailable || 1));
-      const itemQueue = [...pendingItems];
+      const workerCount = Math.max(1, Math.min(batchedPendingItems.length, userAvailable || 1));
+      const itemQueue = [...batchedPendingItems];
       const attemptByItemId = new Map<string, number>();
       let successCount = 0;
       let failedCount = 0;
@@ -4237,6 +4336,8 @@ function LinkListPanel({
         message.info(`本轮已自动补位重试 ${retryCount} 次`);
       }
     } finally {
+      runningVisualBatchIdsRef.current.delete(runBatchId);
+      visualQueueExecutingRef.current = false;
       setVisualQueueExecuting(false);
       void refreshVisualQueueSummary().catch((error) => {
         console.warn('Failed to refresh visual queue summary after execution', error);
@@ -6180,8 +6281,9 @@ export function SelectProductPage({
           includeTotal,
           ...requestFilters,
         });
-        setProducts(response.items.map(mapBackendProduct));
-        if (response.total !== null) setProductTotal(response.total);
+        const localPluginProducts = readLocalPluginProducts();
+        setProducts(mergeLocalPluginProducts(response.items.map(mapBackendProduct), localPluginProducts));
+        if (response.total !== null) setProductTotal(response.total + localPluginProducts.filter((product) => product.status !== 'deleted').length);
         setBackendReady(true);
       } catch {
         setBackendReady(false);
@@ -6209,8 +6311,10 @@ export function SelectProductPage({
                   : right.gmv - left.gmv,
             )
           : fallbackProducts;
-        setProducts(sortedFallbackProducts.slice((nextPage - 1) * nextPageSize, nextPage * nextPageSize));
-        setProductTotal(fallbackProducts.length);
+        const pagedFallbackProducts = sortedFallbackProducts.slice((nextPage - 1) * nextPageSize, nextPage * nextPageSize);
+        const localPluginProducts = readLocalPluginProducts();
+        setProducts(mergeLocalPluginProducts(pagedFallbackProducts, localPluginProducts));
+        setProductTotal(fallbackProducts.length + localPluginProducts.filter((product) => product.status !== 'deleted').length);
       } finally {
         setLoadingProducts(false);
       }
@@ -6232,6 +6336,23 @@ export function SelectProductPage({
 
   useEffect(() => {
     if (isAdminUser) return undefined;
+    const syncLocalPluginProducts = () => {
+      const localPluginProducts = readLocalPluginProducts().filter((product) => product.status !== 'deleted');
+      setProducts((current) => mergeLocalPluginProducts(current, localPluginProducts));
+      setProductTotal((current) => Math.max(current, localPluginProducts.length));
+    };
+
+    syncLocalPluginProducts();
+    window.addEventListener(LOCAL_PLUGIN_PRODUCTS_UPDATED_EVENT, syncLocalPluginProducts);
+    window.addEventListener('storage', syncLocalPluginProducts);
+    return () => {
+      window.removeEventListener(LOCAL_PLUGIN_PRODUCTS_UPDATED_EVENT, syncLocalPluginProducts);
+      window.removeEventListener('storage', syncLocalPluginProducts);
+    };
+  }, [isAdminUser]);
+
+  useEffect(() => {
+    if (isAdminUser) return undefined;
     let active = true;
 
     const loadLinkRecords = async () => {
@@ -6240,20 +6361,30 @@ export function SelectProductPage({
         const backendRecords = await fetchLinkListRecords();
         if (!active) return;
 
-        if (backendRecords.length > 0 || localRecords.length === 0) {
-          setLinkListRecords(backendRecords);
-          writeLinkListRecords(backendRecords, currentUser.id);
-          return;
-        }
+        const mergedRecords = mergeLinkListRecords(localRecords, backendRecords);
+        setLinkListRecords(mergedRecords);
+        writeLinkListRecords(mergedRecords, currentUser.id);
 
-        await saveLinkListRecords(localRecords);
-        if (!active) return;
-        setLinkListRecords(localRecords);
-        writeLinkListRecords(localRecords, currentUser.id);
+        const backendRecordIds = new Set(backendRecords.map((record) => record.id));
+        const recordsMissingFromBackend = localRecords
+          .filter((record) => record?.id && !backendRecordIds.has(record.id))
+          .slice(0, 200);
+        if (recordsMissingFromBackend.length > 0) {
+          void saveLinkListRecords(recordsMissingFromBackend)
+            .then((savedRecords) => {
+              if (!active) return;
+              const syncedRecords = mergeLinkListRecords(savedRecords, mergedRecords);
+              setLinkListRecords(syncedRecords);
+              writeLinkListRecords(syncedRecords, currentUser.id);
+            })
+            .catch(warnLinkPersistenceFailure);
+        }
       } catch (error) {
         if (!active) return;
         if (localRecords.length > 0) {
-          setLinkListRecords(localRecords);
+          const cappedLocalRecords = localRecords.slice(0, 200);
+          setLinkListRecords(cappedLocalRecords);
+          writeLinkListRecords(cappedLocalRecords, currentUser.id);
         }
         console.error(error);
         message.warning('链接列表后端读取失败，当前使用本地缓存');
@@ -6265,10 +6396,11 @@ export function SelectProductPage({
     return () => {
       active = false;
     };
-  }, [currentUser.id, isAdminUser]);
+  }, [currentUser.id, isAdminUser, warnLinkPersistenceFailure]);
 
   const openProduct = useCallback((product: Product, options: { syncUrl?: boolean; drawerMode?: 'sourcing' | 'sales' } = {}) => {
     setActiveProduct(product);
+    writeLocalSourcingActiveProduct(product);
     setDrawerMode(options.drawerMode || 'sourcing');
     setSourcingSearched(product.status === 'sourced');
     setActiveCandidate(undefined);
@@ -6279,6 +6411,7 @@ export function SelectProductPage({
 
   const closeProduct = useCallback(() => {
     setDrawerOpen(false);
+    clearLocalSourcingActiveProduct();
     clearProductRoute();
   }, []);
 
@@ -6474,27 +6607,31 @@ export function SelectProductPage({
   }, [openProductFromRoute]);
 
   const deleteProduct = (product: Product) => {
-    const applyLocalDelete = () => {
-      setProducts((current) =>
-        current.map((item) => (item.id === product.id ? { ...item, status: 'deleted' } : item)),
-      );
-      setSelectedRowKeys((keys) => keys.filter((key) => key !== product.id));
-      if (activeProduct?.id === product.id) closeProduct();
-      message.success('商品已删除');
-    };
+    const isLocalPluginProduct = product.id.startsWith('local-product-');
+    setProducts((current) => current.filter((item) => item.id !== product.id));
+    setProductTotal((current) => Math.max(0, current - 1));
+    setSelectedRowKeys((keys) => keys.filter((key) => key !== product.id));
+    if (activeProduct?.id === product.id) closeProduct();
+    message.success('商品已删除');
+
+    if (isLocalPluginProduct) {
+      removeLocalPluginProducts([product.id]);
+      return;
+    }
 
     if (!backendReady) {
-      applyLocalDelete();
       return;
     }
 
     deleteBackendProduct(product.id)
-      .then(() => loadProducts(currentPage, pageSize, filters))
       .then(() => {
-        if (activeProduct?.id === product.id) closeProduct();
-        message.success('商品已删除');
+        void fetchProductStats('pool').then((stats) => setProductTotal(stats.active_count)).catch(() => undefined);
       })
-      .catch((error) => message.error(error.message || '删除失败'));
+      .catch((error) => {
+        setProducts((current) => (current.some((item) => item.id === product.id) ? current : [product, ...current]));
+        setProductTotal((current) => current + 1);
+        message.error(error.message || '删除失败，已恢复商品');
+      });
   };
 
   const deleteSelectedProducts = () => {
@@ -6512,25 +6649,41 @@ export function SelectProductPage({
       cancelText: '取消',
       async onOk() {
         const deletingIdSet = new Set(productIds);
-        if (!backendReady) {
-          setProducts((current) => current.filter((product) => !deletingIdSet.has(product.id)));
-          setProductTotal((current) => Math.max(0, current - deletingIdSet.size));
-          setSelectedRowKeys([]);
-          if (activeProduct && deletingIdSet.has(activeProduct.id)) closeProduct();
-          message.success(`已删除 ${deletingIdSet.size} 个商品`);
+        const rollbackProducts = products.filter((product) => deletingIdSet.has(product.id));
+        const localPluginIds = rollbackProducts.filter((product) => product.id.startsWith('local-product-')).map((product) => product.id);
+        const backendProductIds = productIds.filter((productId) => !localPluginIds.includes(productId));
+        setProducts((current) => current.filter((product) => !deletingIdSet.has(product.id)));
+        setProductTotal((current) => Math.max(0, current - rollbackProducts.length));
+        setSelectedRowKeys([]);
+        if (activeProduct && deletingIdSet.has(activeProduct.id)) closeProduct();
+        message.success(`已删除 ${deletingIdSet.size} 个商品`);
+
+        if (localPluginIds.length > 0) {
+          removeLocalPluginProducts(localPluginIds);
+        }
+
+        if (!backendReady || backendProductIds.length === 0) {
           return;
         }
 
-        const results = await Promise.allSettled(productIds.map((productId) => deleteBackendProduct(productId)));
-        const failedCount = results.filter((result) => result.status === 'rejected').length;
-        setSelectedRowKeys([]);
-        await loadProducts(currentPage, pageSize, filters);
-        if (activeProduct && deletingIdSet.has(activeProduct.id)) closeProduct();
-        if (failedCount > 0) {
-          message.error(`批量删除完成，但有 ${failedCount} 个商品删除失败`);
-          return;
+        try {
+          const result = await deleteBackendProducts(backendProductIds);
+          const missingIdSet = new Set(result.missing_ids || []);
+          if (missingIdSet.size > 0) {
+            const rollbackItems = rollbackProducts.filter((product) => missingIdSet.has(product.id));
+            if (rollbackItems.length > 0) {
+              setProducts((current) => [...rollbackItems, ...current]);
+              setProductTotal((current) => current + rollbackItems.length);
+            }
+            message.warning(`有 ${missingIdSet.size} 个商品后台未删除，已恢复可见项`);
+            return;
+          }
+          void fetchProductStats('pool').then((stats) => setProductTotal(stats.active_count)).catch(() => undefined);
+        } catch (error) {
+          setProducts((current) => [...rollbackProducts, ...current]);
+          setProductTotal((current) => current + rollbackProducts.length);
+          message.error(error instanceof Error ? `${error.message}，已恢复商品` : '批量删除失败，已恢复商品');
         }
-        message.success(`已删除 ${productIds.length} 个商品`);
       },
     });
   };
