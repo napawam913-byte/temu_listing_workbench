@@ -313,53 +313,77 @@ class ProductAttributesTest(unittest.TestCase):
         self.assertEqual([item["propValue"] for item in result], ["B", "B1"])
         self.assertEqual([item["vid"] for item in result], ["2", "22"])
 
-    def test_complete_attributes_skip_red_line_battery_and_plug_child_fields(self):
+    def test_complete_attributes_fill_red_line_fields_with_safe_negative_values(self):
         fields = [
             choice_field(
-                "\u662f\u5426\u5e26\u7535\u6c60",
-                pid=1427,
-                template_pid=525339,
-                ref_pid=1563,
-                options=[option("36639", "\u662f"), option("36640", "\u5426")],
+                "\u4f9b\u7535\u65b9\u5f0f",
+                pid=1425,
+                template_pid=980319,
+                ref_pid=1561,
+                options=[
+                    option("36627", "\u65e0\u9700\u63a5\u7535\u4f7f\u7528"),
+                    option("36790", "\u7535\u6c60\u4f9b\u7535\uff08\u65e0\u63d2\u5934\uff09"),
+                ],
             ),
             choice_field(
-                "\u53ef\u5145\u7535\u7535\u6c60",
-                pid=1535,
-                template_pid=958335,
-                ref_pid=2147,
-                options=[option("52045", "\u9502\u7cfb\u7535\u6c60")],
+                "\u7535\u6c60\u5c5e\u6027",
+                pid=1539,
+                template_pid=990001,
+                ref_pid=2153,
+                options=[
+                    option("52029", "\u53ef\u5145\u7535\u7535\u6c60"),
+                    option("52032", "\u4e0d\u5e26\u7535\u6c60", "Without Battery"),
+                ],
             ),
             choice_field(
                 "\u5de5\u4f5c\u7535\u538b",
                 pid=1155,
                 template_pid=1378401,
                 ref_pid=1132,
-                options=[option("28317", "36V\u53ca\u4ee5\u4e0b")],
-            ),
-            choice_field(
-                "\u63d2\u5934\u89c4\u683c",
-                pid=1404,
-                template_pid=1378402,
-                ref_pid=1485,
-                options=[option("36261", "\u7f8e\u89c4")],
+                options=[option("na", "\u4e0d\u9002\u7528", "Not Applicable"), option("28317", "36V\u53ca\u4ee5\u4e0b")],
             ),
         ]
 
         result = generate_complete_product_attributes(
-            {"productTitle": "\u5ba0\u7269\u7845\u80f6\u9910\u57ab \u4e0d\u5e26\u7535"},
+            {"productTitle": "\u79cd\u5b50\u53d1\u82bd\u76d8 \u65e0\u9700\u63a5\u7535\u4f7f\u7528"},
             fields,
             {
                 "attributes": [
-                    {"field_label": "\u662f\u5426\u5e26\u7535\u6c60", "prop_value": "\u5426"},
-                    {"field_label": "\u53ef\u5145\u7535\u7535\u6c60", "prop_value": "\u9502\u7cfb\u7535\u6c60"},
+                    {"field_label": "\u4f9b\u7535\u65b9\u5f0f", "prop_value": "\u7535\u6c60\u4f9b\u7535\uff08\u65e0\u63d2\u5934\uff09"},
+                    {"field_label": "\u7535\u6c60\u5c5e\u6027", "prop_value": "\u53ef\u5145\u7535\u7535\u6c60"},
                     {"field_label": "\u5de5\u4f5c\u7535\u538b", "prop_value": "36V\u53ca\u4ee5\u4e0b"},
-                    {"field_label": "\u63d2\u5934\u89c4\u683c", "prop_value": "\u7f8e\u89c4"},
                 ]
             },
         )
 
-        self.assertEqual([item["propName"] for item in result], ["\u662f\u5426\u5e26\u7535\u6c60"])
-        self.assertEqual(result[0]["propValue"], "\u5426")
+        self.assertEqual([item["propName"] for item in result], ["\u4f9b\u7535\u65b9\u5f0f", "\u7535\u6c60\u5c5e\u6027", "\u5de5\u4f5c\u7535\u538b"])
+        self.assertEqual(result[0]["propValue"], "\u65e0\u9700\u63a5\u7535\u4f7f\u7528")
+        self.assertEqual(result[1]["propValue"], "\u4e0d\u5e26\u7535\u6c60")
+        self.assertEqual(result[1]["vid"], "52032")
+        self.assertEqual(result[2]["propValue"], "\u4e0d\u9002\u7528")
+
+    def test_complete_attributes_accept_related_no_power_negative_option(self):
+        fields = [
+            choice_field(
+                "\u4f9b\u7535\u65b9\u5f0f",
+                pid=1425,
+                template_pid=980319,
+                ref_pid=1561,
+                options=[
+                    option("no_power", "\u65e0\u7535"),
+                    option("battery_powered", "\u7535\u6c60\u4f9b\u7535"),
+                ],
+            )
+        ]
+
+        result = generate_complete_product_attributes(
+            {"productTitle": "\u624b\u52a8\u79cd\u5b50\u53d1\u82bd\u76d8"},
+            fields,
+            {"attributes": [{"field_label": "\u4f9b\u7535\u65b9\u5f0f", "prop_value": "\u7535\u6c60\u4f9b\u7535"}]},
+        )
+
+        self.assertEqual(result[0]["propValue"], "\u65e0\u7535")
+        self.assertEqual(result[0]["vid"], "no_power")
 
     def test_attribute_hash_ignores_scraped_category_fields(self):
         base = {"productId": "p1", "productTitle": "Test", "skuEntries": [{"name": "Default"}]}

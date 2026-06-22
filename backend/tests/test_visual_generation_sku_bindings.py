@@ -366,7 +366,7 @@ class VisualGenerationSkuBindingTest(unittest.TestCase):
             finally:
                 database.DATABASE_PATH = original_path
 
-    def test_retry_waiting_clears_previous_error_message(self):
+    def test_retry_waiting_keeps_latest_error_message(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             original_path = database.DATABASE_PATH
             database.DATABASE_PATH = Path(tmpdir) / "app.db"
@@ -386,7 +386,8 @@ class VisualGenerationSkuBindingTest(unittest.TestCase):
                         ("old failed request", task_id),
                     )
 
-                mark_task_retry_waiting(task_id, user_id, "current transient failure")
+                with patch("app.modules.visual_generation.service.get_connection", database.get_connection):
+                    mark_task_retry_waiting(task_id, user_id, "current transient failure")
 
                 with database.get_connection() as conn:
                     row = conn.execute(
@@ -394,7 +395,7 @@ class VisualGenerationSkuBindingTest(unittest.TestCase):
                         (task_id,),
                     ).fetchone()
                 self.assertEqual(row["status"], TASK_STATUS_RETRY_WAITING)
-                self.assertIsNone(row["error_message"])
+                self.assertEqual(row["error_message"], "current transient failure")
             finally:
                 database.DATABASE_PATH = original_path
 

@@ -6,7 +6,7 @@ from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from app.core.config import TMAPI_API_TOKEN, TMAPI_BASE_URL
-from app.core.database import get_app_setting_value
+from app.modules.admin_config.postgres_store import get_app_setting_value
 
 
 class ImageSearchConfigError(Exception):

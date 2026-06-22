@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from app.modules.creative_generation.listing_title_optimizer import load_listing_prompt
+from app.modules.prompt_templates import render_prompt_template
 from app.modules.visual_generation.clients import (
     VisualGenerationError,
     extract_response_text,
@@ -25,7 +26,8 @@ REFERENCE_FIDELITY_RULE = (
     "For appearance, material, surface feel, gloss/matte finish, wrinkles, folds, rigidity/flexibility, body shape, color, quantity, "
     "visible geometry, facet/side count, construction, and printed pattern, reference image evidence has 100% authority and title/SKU text has 0% authority. "
     "Titles and SKU names may describe function, usage, occasion, quantity, or selling-point copy, but must never decide visual appearance or material texture. "
-    "The image is the visual source of truth; titles and SKU names are secondary text hints and must never override visible geometry, "
+    "Visual appearance weight rule: for product appearance and visual identity, reference image evidence has 100% weight and title/SKU/source text has 0% weight. "
+    "Titles and SKU names are secondary text hints and must never override visible geometry, "
     "color, material, surface finish, rigidity/flexibility, wrinkles/folds, quantity, or printed pattern. For dice, cubes, polyhedrons, or multi-sided items, preserve the exact form: "
     "do not convert a six-sided cube-style die into a twelve-sided die, and do not convert a twelve-sided die into a cube-style die. "
     "Never transform the selected product into a different object type, body form, material, surface finish, structure, function, package, container, or generic category substitute. "
@@ -34,6 +36,17 @@ REFERENCE_FIDELITY_RULE = (
     "On-image copy must not name a shape, material, component, or feature that is not visibly supported by the reference image. "
     "For combo SKUs, show all selected components together and keep each component visually identifiable. "
     "Never replace the selected item with a generic category item."
+)
+
+MATERIAL_TEXTURE_DRIFT_RULE = (
+    "Universal visual attribute fidelity rule: for every product category, the product's material, exterior finish, color, "
+    "surface texture, tactile texture, shape, silhouette, construction, rigidity/flexibility, transparency/opacity, wrinkles/folds, "
+    "edge details, printed pattern, quantity, and component relationship must follow the reference image. Do not normalize, beautify, "
+    "upgrade, simplify, or replace the observed product appearance based on category assumptions, title text, SKU text, or ecommerce style. "
+    "If the reference image shows a rough, wrinkled, soft, thin, matte, glossy, transparent, translucent, metallic, wooden, fabric, rubber, "
+    "paper, plastic, ceramic, glass, molded, handmade, uneven, dented, folded, or imperfect surface, preserve that exact visual and tactile "
+    "quality. Do not convert it into a different material, different finish, cleaner manufactured shell, smoother surface, harder/softer body, "
+    "different color, different shape, different object type, package, container, or generic category substitute unless that change is visibly present in the reference image."
 )
 
 COMPARISON_TEXT_POLICY = (
@@ -55,6 +68,16 @@ def ensure_reference_fidelity_text(prompt: str) -> str:
 def build_product_analysis_instruction(context: dict[str, Any] | None = None) -> str:
     context_json = json.dumps(context or {}, ensure_ascii=False, indent=2)
     listing_title_rules = load_listing_prompt()
+    try:
+        return render_prompt_template(
+            "visual_analysis",
+            {
+                "contextJson": context_json,
+                "listingTitleRules": listing_title_rules,
+            },
+        )
+    except Exception:
+        pass
     return f"""
 Analyze the attached ecommerce product reference images.
 
@@ -67,13 +90,14 @@ Listing title generation rules migrated into this product analysis stage:
 {listing_title_rules}
 
 Rules:
-1. Extract only visible or strongly supported product facts. The attached image itself is the visual source of truth. If uncertain, use "unknown" or an empty array instead of guessing.
+1. Extract only visible or strongly supported product facts. Visual appearance weight rule: for product appearance and visual identity, the attached reference images have 100% weight and title/SKU/source text has 0% weight. If uncertain, use "unknown" or an empty array instead of guessing.
 2. Evidence priority: for overall category/use, reference images have 70% authority and productTitle/skuNames/sourceTitle text has 30% authority. For visual identity, reference images have 100% authority and title/SKU/source text has 0% authority. Visual identity includes appearance, material, tactile texture, surface finish, gloss/matte quality, wrinkles/folds, rigidity/flexibility, shape, color, quantity, visible geometry, facet/side count, construction, proportions, and printed pattern.
-3. Text may only guide category, function/use, occasion, SKU option naming, source binding, and safe selling copy. If text conflicts with image evidence, the image wins. Do not infer shape, material, side count, color, texture, or quantity from title/SKU/source text unless visibly supported.
+3. Text may only guide category, function/use, occasion, SKU option naming, source binding, and safe selling copy. If text conflicts with image evidence for appearance or visual identity, the reference image keeps 100% weight and the text has 0% weight. Do not infer shape, material, side count, color, texture, or quantity from title/SKU/source text unless visibly supported.
 4. Treat every attached image as an equal product reference. Analyze each reference image independently using only its own label/sourceTitle/SKU binding. Never borrow another source product title, another image's title, SKU, or global productTitle to decide that image's appearance, material, texture, color, side count, or quantity.
 5. For each reference image, identify the exact visible subject: category, silhouette, shape/geometry, facet or side count when clear, colors, material, tactile texture, surface finish, rigidity/flexibility, quantity, edge/rim details, printed pattern, visible components, and component relationship. For dice or fixed-geometry items, distinguish forms such as six-sided rounded cube-style die or twelve-sided dodecahedron-style die only when clearly visible. For low-resolution or ambiguous geometry, return a neutral description such as "multi-faced / exact side count unknown".
 6. Preserve SKU and component binding. If names are ambiguous or quantity-like, such as "1 Pack" or "2pcs", keep the sourceTitle and referenceImageIndex from skuBindings. For combo/bundle SKUs, keep every component separate in productIdentity.skus[].components and join component standard names with "+" for combo_sku_name.
 7. Record facts that later generation must preserve and must not change: body form, silhouette, proportions, physical construction, material attributes, surface finish, tactile texture, wrinkles/folds, color placement, quantity/component count, and component relationship. Add doNotChange items for likely drift risks: do not change material, do not lose texture, do not change soft flexible material into smooth rigid material, do not change shape/construction/color/quantity, do not add unsupported components, do not replace the product with another object type, and do not use generic category substitution.
+7a. {MATERIAL_TEXTURE_DRIFT_RULE}
 8. Do not invent accessories, SKU options, materials, functions, brand names, platform names, claims, price, stock, weight, MOQ, SKU ID, source spec tables, or unsupported on-image copy. Mark visible risks such as logo, watermark, QR code, price, discount, rating, platform UI, or unsafe/unsupported claims.
 9. Also return productIdentity as the single source of truth for later image planning, Excel titles, SKU names, and export titles. productIdentity.title_cn and productIdentity.title_en are the final listing titles generated in this same product analysis stage. There is no later separate title-generation step.
 10. title_cn must be Chinese. title_en and sku standard_name values must be clean marketplace English with no Chinese characters. Titles must follow the migrated listing title rules, keep supported quantity/pack count, stay faithful to selected images and SKU/bundle structure, and remove promotion, holiday-only wording, rating, sold count, store text, import charge text, platform text, price/discount text, brand names, medical/certification claims, and exaggerated language. For visual identity words in titles, the reference image remains 100% authority; title text may only support function/use/occasion and buyer-facing benefit wording.
@@ -335,6 +359,32 @@ def build_prompt_plan_instruction(
     sku_combo_json = json.dumps(context_sku_combination_bindings(context), ensure_ascii=False, indent=2)
     sku_reference_json = json.dumps(context_sku_reference_bindings(context), ensure_ascii=False, indent=2)
     module_json = json.dumps(modules, ensure_ascii=False, indent=2)
+    input_json = json.dumps(
+        {
+            "productUnderstanding": product_analysis,
+            "productIdentity": product_analysis.get("productIdentity") if isinstance(product_analysis.get("productIdentity"), dict) else {},
+            "requestedCount": expected,
+            "layout": key,
+            "skuNames": context_sku_names(context, product_analysis),
+            "skuBindings": context_sku_bindings(context),
+            "skuCombinationBindings": context_sku_combination_bindings(context),
+            "skuReferenceBindings": context_sku_reference_bindings(context),
+            "candidateModules": modules,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    try:
+        return render_prompt_template(
+            "visual_prompt",
+            {
+                "inputJson": input_json,
+                "labelPolicyText": label_policy_text(allow_short_labels),
+                "materialTextureDriftRule": MATERIAL_TEXTURE_DRIFT_RULE,
+            },
+        )
+    except Exception:
+        pass
     return f"""
 You are an ecommerce listing image task planner.
 
@@ -372,6 +422,7 @@ Rules:
 12. Each module must preserve the exact visual identity from productUnderstanding.referenceAnalyses for every used reference index: silhouette, shape, geometry, facet/side count, visible color, material attributes, physical construction, proportions, quantity, surface texture, surface finish, tactile texture, wrinkles/folds, rigidity/flexibility, component count, component relationship, and printed pattern. Text titles cannot override these visible facts.
 13. For dice or polyhedron products, explicitly protect geometry in mustPreserve/doNotChange. Example: a six-sided rounded cube-style die must stay six-sided/cube-style; a twelve-sided dodecahedron-style wooden die must stay twelve-sided/dodecahedron-style.
 14. Every module must carry a product identity lock in mustPreserve/doNotChange: do not change the product material, surface finish, tactile texture, wrinkles/folds, rigidity/flexibility, body shape, silhouette, proportions, construction, color arrangement, component count, or component relationship; do not turn the selected product into another object type, package, container, or generic category substitute.
+14a. Every module must carry a material texture drift lock when applicable: {MATERIAL_TEXTURE_DRIFT_RULE}
 15. Each module may plan whether on-image copy is useful.
 16. On-image copy intent can include feature introduction, benefit emphasis, usage scene, component explanation, comparison, bundle value, or SKU option clarification.
 17. Do not write the final full on-image copy here. Only define copyIntent and textPolicy.
@@ -440,6 +491,32 @@ def build_panel_prompt_instruction(
     reference_json = json.dumps(context_reference_images(context), ensure_ascii=False, indent=2)
     rows, cols = parse_layout(layout)
     key = layout_key(rows, cols)
+    input_json = json.dumps(
+        {
+            "productUnderstanding": product_understanding,
+            "productIdentity": product_understanding.get("productIdentity") if isinstance(product_understanding.get("productIdentity"), dict) else {},
+            "visualTaskPlan": visual_task_plan,
+            "layout": key,
+            "skuNames": context_sku_names(context, product_understanding),
+            "skuBindings": context_sku_bindings(context),
+            "skuCombinationBindings": context_sku_combination_bindings(context),
+            "skuReferenceBindings": context_sku_reference_bindings(context),
+            "referenceImages": context_reference_images(context),
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    try:
+        return render_prompt_template(
+            "visual_panel_prompt",
+            {
+                "inputJson": input_json,
+                "labelPolicyText": label_policy_text(allow_short_labels),
+                "materialTextureDriftRule": MATERIAL_TEXTURE_DRIFT_RULE,
+            },
+        )
+    except Exception:
+        pass
     return f"""
 You are an ecommerce image prompt writer.
 
@@ -474,6 +551,7 @@ Rules:
 10. For every referenceImageIndex used by a panel, explicitly describe its visual identity from productUnderstanding.referenceAnalyses: exact silhouette, geometry/facet or side count, body form, proportions, color, material attributes, surface finish, tactile texture, wrinkles/folds, rigidity/flexibility, physical construction, quantity, component relationship, and printed pattern. If title text conflicts with visible image facts, follow the image.
 11. For dice or polyhedron products, write hard negative constraints against geometry drift. Example: if one SKU is a six-sided rounded cube-style die and another is a twelve-sided wooden dodecahedron-style die, the prompt must say the six-sided die must not become twelve-sided and the twelve-sided die must not become cube-style.
 12. For every product, write hard negative constraints against identity drift: do not change material attributes, surface finish, tactile texture, wrinkles/folds, rigidity/flexibility, body shape, silhouette, proportions, construction, color arrangement, component count, or component relationship; do not transform the selected product into another object type, package, container, or generic category substitute.
+12a. When applicable, write this material texture drift lock directly into each panel prompt and negativePrompt: {MATERIAL_TEXTURE_DRIFT_RULE}
 13. Add composition, camera angle, lighting, background, scene, props, text placement, and ecommerce style only when they support the module purpose.
 14. On-image copy is allowed when useful for purchase motivation, feature introduction, usage explanation, component explanation, comparison, bundle value, or SKU clarification.
 15. On-image copy does not have to be extremely short. It may be a concise phrase or a short sentence when the module needs clearer selling-point explanation.
@@ -736,6 +814,24 @@ def build_mother_prompt_from_plan(plan: dict[str, Any], layout: str, allow_short
             f"{task['panelPrompt']}"
         )
 
+    try:
+        return render_prompt_template(
+            "visual_image",
+            {
+                "layoutKey": key,
+                "expectedCount": expected,
+                "gridRules": grid_rules,
+                "productJson": product_json,
+                "skuBindingJson": sku_binding_json,
+                "skuComboJson": sku_combo_json,
+                "skuReferenceJson": sku_reference_json,
+                "panelInstructions": chr(10).join(panel_lines),
+                "materialTextureDriftRule": MATERIAL_TEXTURE_DRIFT_RULE,
+            },
+        )
+    except Exception:
+        pass
+
     return f"""
 Create one single {key} ecommerce mother image.
 
@@ -756,12 +852,13 @@ Global product consistency:
 4. For combo SKUs, include every component listed in the combo binding when a panel is about combo/package/option contents.
 5. For different-product bundles where SKU names are only quantities or units, use the reference image to SKU/source product title binding table as the product identity authority.
 6. Do not swap products between reference images, do not merge different products into one generic item, and do not replace the selected product/SKU with a generic category item.
-7. The attached reference image is the visual source of truth. Titles, SKU names, and generated copy must not override visible shape, geometry, side count, color, material, surface finish, tactile texture, wrinkles/folds, rigidity/flexibility, quantity, or printed pattern.
+7. Visual appearance weight rule: for product appearance and visual identity, attached reference images have 100% weight and titles, SKU names, source text, and generated copy have 0% weight. Text must not override visible shape, geometry, side count, color, material, surface finish, tactile texture, wrinkles/folds, rigidity/flexibility, quantity, or printed pattern.
 8. Geometry lock: for dice, cubes, polyhedrons, or multi-sided items, never change the visible form. A six-sided rounded cube-style die must not become a twelve-sided/dodecahedron die; a twelve-sided/dodecahedron wooden die must not become a six-sided cube-style die.
 9. Product identity lock: never change the selected product's material attributes, surface finish, tactile texture, wrinkles/folds, rigidity/flexibility, body shape, silhouette, proportions, physical construction, color arrangement, component count, or component relationship.
 10. Object-type lock: never transform the selected product into another object type, package, container, functional form, or generic category substitute unless that form is visibly present in the reference image.
 11. Copy truth lock: on-image copy must not name any shape, material, texture, surface finish, construction, component, or function that is not visibly supported by the reference image. Titles may support function/use/occasion copy only.
-12. Keep all panels visually coherent as one commercial listing batch.
+12. {MATERIAL_TEXTURE_DRIFT_RULE}
+13. Keep all panels visually coherent as one commercial listing batch.
 
 Product facts to preserve:
 {product_json}
@@ -883,11 +980,12 @@ and printed pattern for every SKU/component with supplied visual facts.
 For combo/package/option panels, include every component listed in the combo binding. For different-product bundles where SKU names are only quantities or units,
 use the reference image to SKU/source product title binding table as the product identity authority. Do not swap products between reference images,
 do not merge different products into one generic item, and do not replace the selected product/SKU with a generic category item.
-Image-first rule: titles and SKU names are text hints only for function/use/occasion; visible image facts have 100% authority for appearance, material, surface finish, tactile texture, wrinkles/folds, rigidity/flexibility, color, shape, quantity, and construction. Geometry lock: never convert a six-sided rounded cube-style die
+Visual appearance weight rule: for product appearance and visual identity, visible reference image facts have 100% weight and titles, SKU names, source text, and generated copy have 0% weight. Text hints may only guide function/use/occasion; they must not determine appearance, material, surface finish, tactile texture, wrinkles/folds, rigidity/flexibility, color, shape, quantity, or construction. Geometry lock: never convert a six-sided rounded cube-style die
 into a twelve-sided/dodecahedron die, and never convert a twelve-sided/dodecahedron die into a six-sided cube-style die.
 Product identity lock: never change the selected product's material attributes, surface finish, tactile texture, wrinkles/folds, rigidity/flexibility, body shape, silhouette, proportions, physical construction,
 color arrangement, component count, or component relationship. Never transform the selected product into another object type,
 package, container, functional form, or generic category substitute unless that form is visibly present in the reference image.
+{MATERIAL_TEXTURE_DRIFT_RULE}
 Copy truth lock: on-image copy must not describe a shape, material, texture, surface finish, construction, component, or function that is not visibly supported by the reference image. Titles may support function/use/occasion copy only.
 
 Global safety:
@@ -996,6 +1094,7 @@ def request_prompt_plan(
                 candidate_modules=candidate_modules,
             ),
             temperature=0.6,
+            gateway_stage="visual_prompt",
         )
         visual_task_plan = normalized_visual_task_plan(
             parsed_task_plan,
@@ -1038,6 +1137,7 @@ def request_prompt_plan(
                 context=context,
             ),
             temperature=0.6,
+            gateway_stage="visual_prompt",
         )
         panel_prompt_plan = normalized_panel_prompt_plan(
             parsed_panel_prompt_plan,

@@ -5,7 +5,7 @@ from typing import Any
 from fastapi import Cookie, Depends, Header, HTTPException
 
 from app.core.config import WORKBENCH_SESSION_COOKIE_NAME
-from app.core.database import get_user_by_session_token
+from app.modules.identity.postgres_store import get_user_by_session_token
 
 try:
     from psycopg import OperationalError as PostgresOperationalError
@@ -25,6 +25,8 @@ def require_current_user(
     session_cookie: str | None = Cookie(None, alias=WORKBENCH_SESSION_COOKIE_NAME),
 ) -> dict[str, Any]:
     token = str(session_cookie or "").strip() or clean_bearer_token(authorization)
+    if not token:
+        raise HTTPException(status_code=401, detail="请先登录")
     try:
         user = get_user_by_session_token(token)
     except Exception as exc:

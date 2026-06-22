@@ -15,6 +15,7 @@ from app.modules.visual_generation.service import (
     assert_visual_concurrency_available,
     create_visual_task,
     delete_visual_task,
+    delete_visual_tasks,
     generate_visual_task,
     get_visual_task,
     get_visual_task_status_summary,
@@ -81,6 +82,10 @@ class VisualTaskGenerateRequest(BaseModel):
 class VisualTaskRunRequest(VisualTaskPlanRequest, VisualTaskGenerateRequest):
     applyToLinkRecord: bool | None = True
     reuseExistingOutputs: bool | None = None
+
+
+class VisualTaskBatchDeleteRequest(BaseModel):
+    taskIds: list[str] = Field(default_factory=list)
 
 
 class VisualTaskSplitRequest(BaseModel):
@@ -155,6 +160,12 @@ def delete_task(task_id: str, current_user: dict[str, Any] = Depends(require_cur
     except VisualTaskError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"ok": True}
+
+
+@router.post("/tasks/batch-delete")
+def batch_delete_tasks(payload: VisualTaskBatchDeleteRequest, current_user: dict[str, Any] = Depends(require_current_user)):
+    return delete_visual_tasks(task_ids=payload.taskIds, user_id=current_user["id"])
+
 
 @router.post("/tasks/{task_id}/plan")
 def plan_task(

@@ -6,19 +6,14 @@ import json
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
 
 from app.core.image_plugins import register_optional_image_plugins
-from app.core import config as app_config
-from app.core.database import (
-    get_app_setting_value,
-    get_enabled_admin_api_channel_credential,
-    get_enabled_user_api_credential,
-    get_user_role,
-)
+from app.modules.admin_config.postgres_store import get_app_setting_value
 
 register_optional_image_plugins()
 
@@ -30,7 +25,11 @@ except Exception:  # pragma: no cover - optional runtime dependency guard
 
 
 DEFAULT_OPENAI_BASE_URL = "https://api.aicoming.top/v1"
-DEFAULT_IMAGE_GENERATION_TIMEOUT_SECONDS = 900
+DEFAULT_IMAGE_GENERATION_TIMEOUT_SECONDS = 90
+DEFAULT_IMAGE_GATEWAY_MAX_ATTEMPT_TIMEOUT_SECONDS = 150
+IMAGE_TASK_POLL_INTERVAL_SECONDS = 2
+IMAGE_TASK_TERMINAL_FAILURE_STATUSES = {"failed", "cancelled", "canceled", "error", "expired"}
+IMAGE_TASK_PENDING_STATUSES = {"pending", "queued", "running", "processing", "in_progress", "created"}
 REQUEST_TOO_LARGE_MARKERS = (
     "HTTP 413",
     "message_length_exceeds_limit",
@@ -68,7 +67,20 @@ TRANSIENT_UPSTREAM_MARKERS = (
     "temporarily failed",
     "network is unreachable",
 )
+from app.modules.ai_gateway import scheduler as ai_gateway_scheduler
 AI_UPSTREAM_RETRY_DELAYS_SECONDS = (0, 3, 8, 15)
+NON_RETRYABLE_REQUEST_MARKERS = (
+    "http 400",
+    "bad request",
+    "invalid_request",
+    "invalid request",
+    "prompt",
+    "content policy",
+    "safety",
+    "request too large",
+    "payload too large",
+    "message_length_exceeds_limit",
+)
 
 
 class VisualGenerationError(RuntimeError):
@@ -90,6 +102,51 @@ def is_transient_ai_error(error: BaseException | str) -> bool:
     return any(marker.lower() in text for marker in TRANSIENT_UPSTREAM_MARKERS)
 
 
+def classify_ai_error(error: BaseException | str) -> str:
+    text = str(error or "").lower()
+    if "invalid_api_key" in text or "api key is invalid" in text or "http 401" in text or "permission denied" in text:
+        return "auth"
+    if is_rate_limit_error(text):
+        return "rate_limit"
+    if is_transient_ai_error(text):
+        return "transient"
+    if any(marker in text for marker in NON_RETRYABLE_REQUEST_MARKERS):
+        return "bad_request"
+    if "http 403" in text or "model is unavailable" in text or "misspelled" in text:
+        return "bad_request"
+    return "error"
+
+
+def should_switch_ai_candidate(error: BaseException | str) -> bool:
+    return classify_ai_error(error) in {"auth", "rate_limit", "transient"}
+
+
+def should_retry_visual_task_error(error: BaseException | str) -> bool:
+    return classify_ai_error(error) in {"rate_limit", "transient", "error"}
+
+
+def image_gateway_max_attempt_timeout_seconds() -> int:
+    raw_value = get_runtime_setting(
+        "VISUAL_IMAGE_GATEWAY_MAX_ATTEMPT_TIMEOUT_SECONDS",
+        str(DEFAULT_IMAGE_GATEWAY_MAX_ATTEMPT_TIMEOUT_SECONDS),
+    )
+    try:
+        value = int(str(raw_value or "").strip())
+    except ValueError:
+        return DEFAULT_IMAGE_GATEWAY_MAX_ATTEMPT_TIMEOUT_SECONDS
+    return min(max(value, 30), 300)
+
+
+def bounded_image_request_timeout(value: Any | None = None) -> int:
+    if value is None or str(value).strip() == "":
+        return image_generation_timeout_seconds()
+    try:
+        timeout = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return image_generation_timeout_seconds()
+    return min(max(timeout, 30), 300)
+
+
 def format_response_error(response_json: object) -> str:
     if not isinstance(response_json, dict):
         return ""
@@ -109,107 +166,33 @@ def format_response_error(response_json: object) -> str:
 
 
 def get_runtime_setting(key: str, default: str = "") -> str:
-    saved_value = get_app_setting_value(key, "")
+    try:
+        saved_value = get_app_setting_value(key, "")
+    except Exception:
+        saved_value = ""
     if saved_value != "":
         return saved_value
     return os.getenv(key, default).strip()
 
 
-def get_ai_settings(user_id: str | None = None) -> dict[str, str]:
-    user_credential = get_enabled_user_api_credential(user_id)
-    has_user_credential = bool(user_credential and user_credential.get("apiKey"))
-    user_role = get_user_role(user_id)
-    requires_member_credential = bool(str(user_id or "").strip()) and user_role != "admin"
-    if requires_member_credential and not has_user_credential:
-        raise VisualGenerationError("当前成员未配置可用 API Key，请管理员在后台为该成员配置 API Key 后再执行。")
-
-    admin_credential = None if has_user_credential or requires_member_credential else get_enabled_admin_api_channel_credential()
-    has_admin_credential = bool(admin_credential and admin_credential.get("apiKey"))
-    base_url = (
-        str(user_credential.get("baseUrl") or "").strip().rstrip("/")
-        if has_user_credential
-        else str(admin_credential.get("baseUrl") or "").strip().rstrip("/")
-        if has_admin_credential
-        else get_runtime_setting("OPENAI_BASE_URL", app_config.OPENAI_BASE_URL).strip().rstrip("/")
-    )
-    credential_text_model = (
-        str(user_credential.get("textModel") or "").strip()
-        if has_user_credential
-        else str(admin_credential.get("textModel") or "").strip()
-        if has_admin_credential
-        else ""
-    )
-    credential_image_model = (
-        str(user_credential.get("imageModel") or "").strip()
-        if has_user_credential
-        else str(admin_credential.get("imageModel") or "").strip()
-        if has_admin_credential
-        else ""
-    )
-    return {
-        "api_key": (
-            str(user_credential.get("apiKey") or "").strip()
-            if has_user_credential
-            else str(admin_credential.get("apiKey") or "").strip()
-            if has_admin_credential
-            else get_runtime_setting("OPENAI_API_KEY", app_config.OPENAI_API_KEY).strip()
-        ),
-        "base_url": base_url or DEFAULT_OPENAI_BASE_URL,
-        "text_model": credential_text_model
-        or get_runtime_setting("OPENAI_TEXT_MODEL", app_config.OPENAI_TEXT_MODEL).strip()
-        or "gpt-5.5",
-        "image_model": credential_image_model
-        or get_runtime_setting("OPENAI_IMAGE_MODEL", app_config.OPENAI_IMAGE_MODEL).strip()
-        or "gpt-image-2-1k",
-        "image_quality": get_runtime_setting("OPENAI_IMAGE_QUALITY", app_config.OPENAI_IMAGE_QUALITY).strip() or "medium",
-        "channel_id": (
-            str(user_credential.get("channelId") or "")
-            if has_user_credential
-            else str(admin_credential.get("channelId") or "")
-            if has_admin_credential
-            else ""
-        ),
-        "has_user_credential": "1" if has_user_credential else "",
-        "has_channel_credential": "1" if has_user_credential or has_admin_credential else "",
-    }
-
-
-AI_STAGE_SETTING_PREFIXES = {
-    "recommendation": "OPENAI_RECOMMENDATION",
-    "product_attribute": "OPENAI_PRODUCT_ATTRIBUTE",
-    "visual_analysis": "OPENAI_VISUAL_ANALYSIS",
-    "visual_prompt": "OPENAI_VISUAL_PROMPT",
-    "image": "OPENAI_IMAGE",
-}
-
-
 def get_ai_stage_settings(stage: str, user_id: str | None = None) -> dict[str, str]:
-    common = get_ai_settings(user_id=user_id)
+    _ = user_id
     stage_key = str(stage or "").strip().lower().replace("-", "_")
-    prefix = AI_STAGE_SETTING_PREFIXES.get(stage_key)
-    if not prefix:
-        return {
-            "api_key": common["api_key"],
-            "base_url": common["base_url"],
-            "model": common["text_model"],
-            "image_quality": common["image_quality"],
-            "channel_id": common.get("channel_id", ""),
-        }
-
-    fallback_model = common["image_model"] if stage_key == "image" else common["text_model"]
-    model = get_runtime_setting(f"{prefix}_MODEL", "").strip() or fallback_model
-    if common.get("has_channel_credential"):
-        api_key = common["api_key"]
-        base_url = common["base_url"]
-    else:
-        api_key = get_runtime_setting(f"{prefix}_API_KEY", "").strip() or common["api_key"]
-        base_url = get_runtime_setting(f"{prefix}_BASE_URL", "").strip().rstrip("/") or common["base_url"]
+    gateway_candidates = ai_gateway_scheduler.resolve_candidates(stage_key)
+    if not gateway_candidates:
+        raise VisualGenerationError(f"API 中枢没有可用渠道：{stage_key}")
+    candidate = gateway_candidates[0]
+    gateway_model = str(candidate.get("model") or "").strip()
+    model_type = str(candidate.get("modelType") or "").strip()
     return {
-        "api_key": api_key,
-        "base_url": base_url or DEFAULT_OPENAI_BASE_URL,
-        "model": model,
-        "image_quality": common["image_quality"],
-        "channel_id": common.get("channel_id", ""),
+        "api_key": str(candidate.get("apiKey") or "").strip(),
+        "base_url": str(candidate.get("baseUrl") or DEFAULT_OPENAI_BASE_URL).strip().rstrip("/") or DEFAULT_OPENAI_BASE_URL,
+        "model": gateway_model or ("gpt-image-2-1k" if model_type == "image" else "gpt-5.5"),
+        "image_quality": get_runtime_setting("OPENAI_IMAGE_QUALITY", "medium").strip() or "medium",
+        "channel_id": str(candidate.get("channelId") or ""),
+        "credential_id": str(candidate.get("credentialId") or ""),
+        "credential_name": str(candidate.get("credentialName") or candidate.get("credentialId") or ""),
+        "gateway_stage": stage_key,
     }
 
 
@@ -228,10 +211,17 @@ def image_generation_timeout_seconds() -> int:
         value = int(str(raw_value or "").strip())
     except ValueError:
         return DEFAULT_IMAGE_GENERATION_TIMEOUT_SECONDS
-    return min(max(value, 60), 1800)
+    return min(max(value, 30), 300)
 
 
-def request_json(api_url: str, api_key: str, payload: dict[str, Any], *, timeout: int = 300) -> dict[str, Any]:
+def request_json(
+    api_url: str,
+    api_key: str,
+    payload: dict[str, Any],
+    *,
+    timeout: int = 300,
+    fail_fast_transient: bool = False,
+) -> dict[str, Any]:
     if not api_key:
         raise VisualGenerationError("AI API Key is not configured")
 
@@ -256,19 +246,19 @@ def request_json(api_url: str, api_key: str, payload: dict[str, Any], *, timeout
         except urllib.error.HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="replace")
             error = VisualGenerationError(format_http_error(exc.code, error_body))
-            if should_retry_transient_error(error, attempt):
+            if not fail_fast_transient and should_retry_transient_error(error, attempt):
                 last_error = error
                 continue
             raise error from exc
         except urllib.error.URLError as exc:
             error = VisualGenerationError(f"AI request failed: {exc}")
-            if should_retry_transient_error(error, attempt):
+            if not fail_fast_transient and should_retry_transient_error(error, attempt):
                 last_error = error
                 continue
             raise error from exc
         except TimeoutError as exc:
             error = VisualGenerationError(f"AI request timed out: {exc}")
-            if should_retry_transient_error(error, attempt):
+            if not fail_fast_transient and should_retry_transient_error(error, attempt):
                 last_error = error
                 continue
             raise error from exc
@@ -280,13 +270,62 @@ def request_json(api_url: str, api_key: str, payload: dict[str, Any], *, timeout
         response_error = format_response_error(parsed)
         if response_error:
             error = VisualGenerationError(response_error)
-            if should_retry_transient_error(error, attempt):
+            if not fail_fast_transient and should_retry_transient_error(error, attempt):
                 last_error = error
                 continue
             raise error
         return parsed
 
     raise last_error or VisualGenerationError("AI request failed")
+
+
+def request_gateway_json(
+    *,
+    stage: str,
+    path: str,
+    payload: dict[str, Any],
+    timeout: int = 300,
+) -> dict[str, Any]:
+    attempt_limit = ai_gateway_scheduler.resolve_attempt_limit(stage)
+    excluded_credential_ids: set[str] = set()
+    last_error: BaseException | None = None
+    for _attempt in range(attempt_limit):
+        candidate = ai_gateway_scheduler.acquire_candidate(
+            stage,
+            task_type="api",
+            excluded_credential_ids=excluded_credential_ids,
+        )
+        if not candidate:
+            break
+        excluded_credential_ids.add(str(candidate.get("credentialId") or ""))
+        started = time.monotonic()
+        model = str(candidate.get("model") or payload.get("model") or "")
+        candidate_payload = {**payload, "model": model} if model else payload
+        try:
+            result = request_json(
+                build_api_url(str(candidate.get("baseUrl") or DEFAULT_OPENAI_BASE_URL), path),
+                str(candidate.get("apiKey") or ""),
+                candidate_payload,
+                timeout=timeout,
+            )
+            ai_gateway_scheduler.finish_attempt(
+                candidate,
+                success=True,
+                latency_ms=int((time.monotonic() - started) * 1000),
+            )
+            return result
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            ai_gateway_scheduler.finish_attempt(
+                candidate,
+                success=False,
+                error_message=str(exc),
+                latency_ms=int((time.monotonic() - started) * 1000),
+            )
+            continue
+    if last_error is None:
+        raise VisualGenerationError(f"API gateway has no available candidate for stage: {stage}")
+    raise VisualGenerationError(f"All API gateway candidates failed for {stage}: {last_error}") from last_error
 
 
 def request_multipart(
@@ -296,6 +335,7 @@ def request_multipart(
     fields: list[tuple[str, str]],
     files: list[tuple[str, str, str, bytes]],
     timeout: int = 300,
+    fail_fast_transient: bool = False,
 ) -> dict[str, Any]:
     if not api_key:
         raise VisualGenerationError("AI API Key is not configured")
@@ -340,19 +380,19 @@ def request_multipart(
         except urllib.error.HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="replace")
             error = VisualGenerationError(format_http_error(exc.code, error_body))
-            if should_retry_transient_error(error, attempt):
+            if not fail_fast_transient and should_retry_transient_error(error, attempt):
                 last_error = error
                 continue
             raise error from exc
         except urllib.error.URLError as exc:
             error = VisualGenerationError(f"AI request failed: {exc}")
-            if should_retry_transient_error(error, attempt):
+            if not fail_fast_transient and should_retry_transient_error(error, attempt):
                 last_error = error
                 continue
             raise error from exc
         except TimeoutError as exc:
             error = VisualGenerationError(f"AI request timed out: {exc}")
-            if should_retry_transient_error(error, attempt):
+            if not fail_fast_transient and should_retry_transient_error(error, attempt):
                 last_error = error
                 continue
             raise error from exc
@@ -364,7 +404,7 @@ def request_multipart(
         response_error = format_response_error(parsed)
         if response_error:
             error = VisualGenerationError(response_error)
-            if should_retry_transient_error(error, attempt):
+            if not fail_fast_transient and should_retry_transient_error(error, attempt):
                 last_error = error
                 continue
             raise error
@@ -451,6 +491,88 @@ def download_image(url: str) -> bytes:
     if "image" not in content_type.lower() and not data.startswith((b"\xff\xd8", b"\x89PNG", b"RIFF")):
         raise VisualGenerationError(f"URL did not return image content: {content_type}")
     return data
+
+
+def parse_image_bytes_from_response(response_json: dict[str, Any]) -> bytes | None:
+    b64_value = find_first_key(response_json, {"b64_json", "base64", "image_base64", "result"})
+    image_bytes = decode_base64_image(b64_value)
+    if image_bytes:
+        return image_bytes
+
+    url_value = find_first_key(response_json, {"url", "image_url", "uri"})
+    if isinstance(url_value, dict):
+        url_value = find_first_key(url_value, {"url"})
+    if isinstance(url_value, str) and url_value:
+        return download_image(url_value)
+    return None
+
+
+def resolve_poll_url(api_url: str, poll_url: str) -> str:
+    return urllib.parse.urljoin(api_url, poll_url)
+
+
+def request_image_task_status(poll_url: str, api_key: str, *, timeout: int = 300) -> dict[str, Any]:
+    request = urllib.request.Request(
+        poll_url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response_body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise VisualGenerationError(format_http_error(exc.code, error_body)) from exc
+    except urllib.error.URLError as exc:
+        raise VisualGenerationError(f"image task poll failed: {exc}") from exc
+    except TimeoutError as exc:
+        raise VisualGenerationError(f"image task poll timed out: {exc}") from exc
+
+    try:
+        parsed = json.loads(response_body)
+    except json.JSONDecodeError as exc:
+        raise VisualGenerationError(f"image task poll did not return JSON: {response_body[:500]}") from exc
+    response_error = format_response_error(parsed)
+    if response_error:
+        raise VisualGenerationError(response_error)
+    return parsed
+
+
+def poll_image_task_result(api_url: str, api_key: str, response_json: dict[str, Any], *, timeout: int) -> bytes | None:
+    poll_url_value = find_first_key(response_json, {"poll_url", "pollUrl", "status_url", "statusUrl"})
+    if not isinstance(poll_url_value, str) or not poll_url_value.strip():
+        return None
+
+    poll_url = resolve_poll_url(api_url, poll_url_value.strip())
+    deadline = time.monotonic() + max(1, timeout)
+    last_response = response_json
+    while time.monotonic() < deadline:
+        image_bytes = parse_image_bytes_from_response(last_response)
+        if image_bytes:
+            return image_bytes
+
+        status_value = str(find_first_key(last_response, {"status", "state"}) or "").strip().lower()
+        if status_value in IMAGE_TASK_TERMINAL_FAILURE_STATUSES:
+            raise VisualGenerationError(
+                "image generation task failed: "
+                f"{json.dumps(last_response, ensure_ascii=False)[:1000]}"
+            )
+        if status_value and status_value not in IMAGE_TASK_PENDING_STATUSES:
+            raise VisualGenerationError(
+                "image generation task returned unsupported status: "
+                f"{json.dumps(last_response, ensure_ascii=False)[:1000]}"
+            )
+
+        time.sleep(IMAGE_TASK_POLL_INTERVAL_SECONDS)
+        last_response = request_image_task_status(poll_url, api_key, timeout=min(60, max(1, int(deadline - time.monotonic()))))
+
+    raise VisualGenerationError(
+        "image generation task timed out while polling: "
+        f"{json.dumps(last_response, ensure_ascii=False)[:1000]}"
+    )
 
 
 def image_file_to_data_url(path: Path, *, max_side: int | None = None, quality: int = 86) -> str:
@@ -562,15 +684,44 @@ def parse_json_from_text(text: str) -> dict[str, Any]:
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start < 0 or end < start:
+        json_object_text = extract_first_json_object(cleaned)
+        if not json_object_text:
             raise
-        data = json.loads(cleaned[start : end + 1])
+        data = json.loads(json_object_text)
 
     if not isinstance(data, dict):
         raise VisualGenerationError("AI JSON result must be an object")
     return data
+
+
+def extract_first_json_object(text: str) -> str:
+    start = text.find("{")
+    if start < 0:
+        return ""
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            depth += 1
+            continue
+        if char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return ""
 
 
 def request_text_json(
@@ -580,6 +731,7 @@ def request_text_json(
     model: str,
     instruction: str,
     temperature: float = 0.2,
+    gateway_stage: str = "",
 ) -> dict[str, Any]:
     if api_url.rstrip("/").endswith("/chat/completions"):
         payload = {
@@ -593,7 +745,14 @@ def request_text_json(
             "input": [{"role": "user", "content": [{"type": "input_text", "text": instruction}]}],
             "temperature": temperature,
         }
-    response_json = request_json(api_url, api_key, payload)
+    if gateway_stage:
+        response_json = request_gateway_json(
+            stage=gateway_stage,
+            path="/chat/completions" if api_url.rstrip("/").endswith("/chat/completions") else "/responses",
+            payload=payload,
+        )
+    else:
+        response_json = request_json(api_url, api_key, payload)
     return parse_json_from_text(extract_response_text(response_json))
 
 
@@ -608,9 +767,11 @@ def request_generated_image(
     reference_image_paths: list[Path] | None = None,
     reference_image_max_side: int | None = None,
     reference_image_quality: int = 86,
+    timeout: int | None = None,
+    fail_fast_transient: bool = False,
 ) -> bytes:
     normalized_api_url = api_url.rstrip("/")
-    request_timeout = image_generation_timeout_seconds()
+    request_timeout = bounded_image_request_timeout(timeout)
     if normalized_api_url.endswith("/chat/completions"):
         raise VisualGenerationError("image generation API cannot use /chat/completions")
 
@@ -635,7 +796,7 @@ def request_generated_image(
             "input": [{"role": "user", "content": content}],
             "tools": [{"type": "image_generation"}],
         }
-        response_json = request_json(api_url, api_key, payload, timeout=request_timeout)
+        response_json = request_json(api_url, api_key, payload, timeout=request_timeout, fail_fast_transient=fail_fast_transient)
     elif normalized_api_url.endswith("/images/edits"):
         resolved_reference_paths = [path for path in (reference_image_paths or []) if path and path.exists()]
         if not resolved_reference_paths and reference_image_path and reference_image_path.exists():
@@ -654,23 +815,27 @@ def request_generated_image(
                 quality=reference_image_quality,
             )
             files.append((image_field_name, f"reference_{index}_{filename}", content_type, data))
-        response_json = request_multipart(api_url, api_key, fields=fields, files=files, timeout=request_timeout)
+        response_json = request_multipart(
+            api_url,
+            api_key,
+            fields=fields,
+            files=files,
+            timeout=request_timeout,
+            fail_fast_transient=fail_fast_transient,
+        )
     else:
         payload = {"model": model, "prompt": prompt, "n": 1}
         if size:
             payload["size"] = size
-        response_json = request_json(api_url, api_key, payload, timeout=request_timeout)
+        response_json = request_json(api_url, api_key, payload, timeout=request_timeout, fail_fast_transient=fail_fast_transient)
 
-    b64_value = find_first_key(response_json, {"b64_json", "base64", "image_base64", "result"})
-    image_bytes = decode_base64_image(b64_value)
+    image_bytes = parse_image_bytes_from_response(response_json)
     if image_bytes:
         return image_bytes
 
-    url_value = find_first_key(response_json, {"url", "image_url", "uri"})
-    if isinstance(url_value, dict):
-        url_value = find_first_key(url_value, {"url"})
-    if isinstance(url_value, str) and url_value:
-        return download_image(url_value)
+    image_bytes = poll_image_task_result(api_url, api_key, response_json, timeout=request_timeout)
+    if image_bytes:
+        return image_bytes
 
     raise VisualGenerationError(
         "image generation result did not contain base64 or URL: "

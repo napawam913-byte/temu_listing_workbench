@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.api.auth import require_current_user
-from app.core.database import (
+from app.modules.link_records.postgres_store import (
     list_link_list_records,
     soft_delete_link_list_record,
     upsert_link_list_record,

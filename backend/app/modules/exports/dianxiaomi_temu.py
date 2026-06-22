@@ -20,6 +20,7 @@ from app.modules.creative_generation.listing_title_optimizer import (
 )
 from app.modules.exports.product_attributes import get_product_attribute_for_export_record
 from app.modules.image_storage.aliyun_oss import ImageStorageError, mirror_export_image, read_image_ref, upload_image_bytes
+from app.modules.shared_concurrency import user_concurrency_slot
 from app.modules.visual_generation.clients import get_runtime_setting
 
 register_optional_image_plugins()
@@ -371,12 +372,34 @@ def build_template_rows_for_export_record(
     user_id: str | None = None,
 ) -> list[dict[str, Any]]:
     try:
-        return build_template_rows(record, export_mode=export_mode, user_id=user_id, translate_variants=False)
+        with user_concurrency_slot(
+            user_id or "default-user",
+            task_type="excel_attribute",
+            task_id=clean_text(record.get("id")) or clean_text(record.get("productId")) or uuid.uuid4().hex[:10],
+            persistent_running_count=lambda: running_visual_task_count_for_export_user(user_id),
+            poll_seconds=0.5,
+        ):
+            return build_template_rows(record, export_mode=export_mode, user_id=user_id, translate_variants=False)
     except DianxiaomiExportError:
         raise
     except Exception as exc:
         title = clean_text(record.get("productTitle")) or clean_text(record.get("id")) or clean_text(record.get("productId")) or "record"
         raise DianxiaomiExportError(f"Export failed for {title}: {exc}") from exc
+
+
+def running_visual_task_count_for_export_user(user_id: str | None) -> int:
+    if not user_id:
+        return 0
+    try:
+        from app.modules.visual_generation.service import count_running_visual_tasks_for_user, ensure_visual_generation_schema
+
+        from app.modules.exports.postgres_store import get_export_connection as get_connection
+
+        with get_connection() as conn:
+            ensure_visual_generation_schema(conn)
+            return count_running_visual_tasks_for_user(conn, user_id)
+    except Exception:
+        return 0
 
 
 def visual_product_identity_from_record(record: dict[str, Any] | None) -> dict[str, Any]:

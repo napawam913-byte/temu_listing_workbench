@@ -85,7 +85,6 @@ POSTGRES_DATABASE_URL=postgresql://temu_app:<password>@pgm-bp10sp109p8t006r.pg.r
 DATABASE_URL=postgresql://temu_app:<password>@pgm-bp10sp109p8t006r.pg.rds.aliyuncs.com:5432/temu_workbench
 VISUAL_QUEUE_REDIS_ENABLED=0
 VISUAL_USER_CONCURRENCY_LIMIT=1
-VISUAL_TEAM_CONCURRENCY_LIMIT=2
 ```
 
 Add your OSS and AI channel environment variables here if the backend still depends on them from `.env`.

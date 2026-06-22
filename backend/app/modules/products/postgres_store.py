@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from contextlib import contextmanager
+from threading import Lock
 from typing import Any, Iterator
 
 try:
@@ -23,6 +25,13 @@ from app.core.database import (
     parse_category_path_parts,
     utc_now_text,
 )
+from app.core.postgres_pool import get_postgres_connection
+
+PRODUCT_COUNT_CACHE_TTL_SECONDS = 30
+_product_query_schema_ready = False
+_product_query_schema_lock = Lock()
+_product_count_cache: dict[tuple[Any, ...], tuple[float, int]] = {}
+_product_count_cache_lock = Lock()
 
 
 def is_enabled() -> bool:
@@ -44,8 +53,56 @@ def get_pg_connection() -> Iterator[Any]:
     url = configured_url()
     if not url:
         raise RuntimeError("Product PostgreSQL backend requires PRODUCTS_DATABASE_URL, POSTGRES_DATABASE_URL, or DATABASE_URL")
-    with psycopg.connect(url, row_factory=dict_row) as conn:
+    with get_postgres_connection(url) as conn:
         yield conn
+
+
+def ensure_product_query_schema() -> None:
+    global _product_query_schema_ready
+    if _product_query_schema_ready:
+        return
+    with _product_query_schema_lock:
+        if _product_query_schema_ready:
+            return
+        with get_pg_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_products_catalog_status ON products(catalog_scope, status)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_products_price ON products(price_usd)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_products_gmv ON products(gmv_usd)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_products_weekly_sales ON products(weekly_sales)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_products_monthly_sales ON products(monthly_sales)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_products_category_level1 ON products(category_level1)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_products_category_level2 ON products(category_level2)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_product_pool_memberships_user_status_created ON product_pool_memberships(user_id, status, created_at)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_product_pool_memberships_user_product ON product_pool_memberships(user_id, product_id)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_product_category_matches_product_status ON product_category_matches(product_id, status)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_canonical_categories_provider_path ON canonical_categories(provider, path_text)")
+            conn.commit()
+        _product_query_schema_ready = True
+
+
+def clear_product_count_cache() -> None:
+    with _product_count_cache_lock:
+        _product_count_cache.clear()
+
+
+def product_count_cache_key(*, from_sql: str, where_sql: str, params: list[Any]) -> tuple[Any, ...]:
+    return (from_sql.strip(), where_sql.strip(), tuple(str(param) for param in params))
+
+
+def cached_product_count(cur: Any, *, from_sql: str, where_sql: str, params: list[Any]) -> int:
+    key = product_count_cache_key(from_sql=from_sql, where_sql=where_sql, params=params)
+    now = time.monotonic()
+    with _product_count_cache_lock:
+        cached = _product_count_cache.get(key)
+        if cached and now - cached[0] <= PRODUCT_COUNT_CACHE_TTL_SECONDS:
+            return cached[1]
+
+    cur.execute(f"SELECT COUNT(*) AS count FROM {from_sql} {where_sql}", params)
+    total = int(cur.fetchone()["count"] or 0)
+    with _product_count_cache_lock:
+        _product_count_cache[key] = (now, total)
+    return total
 
 
 def list_products(
@@ -67,8 +124,10 @@ def list_products(
     sort_by: str | None = None,
     sort_order: str | None = None,
     include_deleted: bool = False,
+    include_total: bool = True,
     user_id: str = DEFAULT_USER_ID,
 ) -> dict[str, Any]:
+    ensure_product_query_schema()
     where, params = build_product_where(
         keyword=keyword,
         period=period,
@@ -109,8 +168,7 @@ def list_products(
 
     with get_pg_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(f"SELECT COUNT(*) AS count FROM {from_sql} {where_sql}", params)
-            total = int(cur.fetchone()["count"] or 0)
+            total = cached_product_count(cur, from_sql=from_sql, where_sql=where_sql, params=params) if include_total else None
             pool_added_select = "membership.created_at AS pool_added_at" if scope == "pool" else "NULL AS pool_added_at"
             cur.execute(
                 f"""
@@ -127,6 +185,7 @@ def list_products(
     return {
         "items": [product_row_to_api(row) for row in rows],
         "total": total,
+        "total_included": include_total,
         "page": safe_page,
         "page_size": safe_page_size,
     }
@@ -379,6 +438,7 @@ def add_products_to_pool(product_ids: list[str], *, user_id: str = DEFAULT_USER_
                 """,
                 rows,
             )
+            clear_product_count_cache()
             return len(rows)
 
 
@@ -400,7 +460,10 @@ def soft_delete_product(product_id: str, scope: str = "pool", *, user_id: str = 
                     "UPDATE products SET status = 'deleted', updated_at = %s WHERE id = %s",
                     (now, product_id),
                 )
-            return cur.rowcount > 0
+            deleted = cur.rowcount > 0
+            if deleted:
+                clear_product_count_cache()
+            return deleted
 
 
 def build_product_where(

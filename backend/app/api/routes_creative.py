@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from app.api.auth import require_current_user
-from app.core.database import list_sensitive_terms
+from app.modules.admin_config.postgres_store import list_sensitive_terms
 from app.modules.creative_generation.chatgpt_listing import CreativeGenerationError, generate_listing_package
 from app.modules.creative_generation.plugin_jobs import (
     CreativePluginJobError,

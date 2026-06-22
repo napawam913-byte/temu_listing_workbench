@@ -4,6 +4,8 @@ import os
 import secrets
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from threading import Lock
 from typing import Any, Iterator
 
 try:
@@ -25,6 +27,11 @@ from app.core.database import (
     utc_now_text,
     verify_password,
 )
+from app.core.postgres_pool import get_postgres_connection
+
+_identity_schema_ready = False
+_identity_schema_lock = Lock()
+SESSION_TOUCH_INTERVAL_SECONDS = 300
 
 
 def is_enabled() -> bool:
@@ -46,7 +53,7 @@ def get_pg_connection() -> Iterator[Any]:
     url = configured_url()
     if not url:
         raise RuntimeError("Identity PostgreSQL backend requires IDENTITY_DATABASE_URL, POSTGRES_DATABASE_URL, or DATABASE_URL")
-    with psycopg.connect(url, row_factory=dict_row) as conn:
+    with get_postgres_connection(url) as conn:
         yield conn
 
 
@@ -110,6 +117,18 @@ def ensure_identity_schema(conn: Any) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_team_members_user ON team_members(user_id)")
 
 
+def ensure_identity_schema_ready() -> None:
+    global _identity_schema_ready
+    if _identity_schema_ready:
+        return
+    with _identity_schema_lock:
+        if _identity_schema_ready:
+            return
+        with get_pg_connection() as conn:
+            ensure_identity_schema(conn)
+        _identity_schema_ready = True
+
+
 def pg_table_exists(conn: Any, table_name: str) -> bool:
     row = conn.execute("SELECT to_regclass(%s) AS table_name", (f"public.{table_name}",)).fetchone()
     return bool(row and row["table_name"])
@@ -168,6 +187,7 @@ def sync_user_teams(conn: Any) -> None:
 
 
 def create_user(username: str, password: str, display_name: str | None = None) -> dict[str, Any]:
+    ensure_identity_schema_ready()
     clean_username = " ".join(str(username or "").split()).strip()
     if len(clean_username) < 2:
         raise ValueError("用户名至少需要 2 个字符")
@@ -205,6 +225,7 @@ def create_user(username: str, password: str, display_name: str | None = None) -
 
 
 def list_users() -> list[dict[str, Any]]:
+    ensure_identity_schema_ready()
     with get_pg_connection() as conn:
         sync_user_teams(conn)
         expire_stale_user_sessions(conn)
@@ -242,6 +263,7 @@ def create_managed_user(
     status: str = "active",
     manager_user_id: str | None = None,
 ) -> dict[str, Any]:
+    ensure_identity_schema_ready()
     clean_username = " ".join(str(username or "").split()).strip()
     if len(clean_username) < 2:
         raise ValueError("用户名至少需要 2 个字符")
@@ -293,6 +315,7 @@ def update_managed_user(
     status: str | None = None,
     manager_user_id: str | None = None,
 ) -> dict[str, Any]:
+    ensure_identity_schema_ready()
     clean_user_id = str(user_id or "").strip()
     if not clean_user_id:
         raise ValueError("缺少用户 ID")
@@ -352,6 +375,7 @@ def update_managed_user(
 
 
 def delete_managed_users(user_ids: list[str], *, requested_by_user_id: str) -> dict[str, Any]:
+    ensure_identity_schema_ready()
     clean_ids = []
     seen: set[str] = set()
     for user_id in user_ids:
@@ -451,6 +475,7 @@ def delete_managed_users(user_ids: list[str], *, requested_by_user_id: str) -> d
 
 
 def reset_managed_user_password(user_id: str, password: str) -> dict[str, Any]:
+    ensure_identity_schema_ready()
     clean_user_id = str(user_id or "").strip()
     if len(str(password or "")) < 6:
         raise ValueError("密码至少需要 6 个字符")
@@ -529,6 +554,7 @@ def resolve_manager_user_id(
 
 
 def authenticate_user(username: str, password: str) -> dict[str, Any] | None:
+    ensure_identity_schema_ready()
     clean_username = " ".join(str(username or "").split()).strip()
     with get_pg_connection() as conn:
         row = conn.execute(
@@ -543,6 +569,8 @@ def authenticate_user(username: str, password: str) -> dict[str, Any] | None:
 
 
 def expire_stale_user_sessions(conn: Any | None = None) -> int:
+    if conn is None:
+        ensure_identity_schema_ready()
     cutoff = session_expiry_cutoff_text()
     now = utc_now_text()
 
@@ -572,7 +600,16 @@ def expire_stale_user_sessions(conn: Any | None = None) -> int:
         return update(owned_conn)
 
 
+def session_touch_cutoff_text() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .replace(tzinfo=None, microsecond=0)
+        - timedelta(seconds=SESSION_TOUCH_INTERVAL_SECONDS)
+    ).isoformat(sep=" ")
+
+
 def create_user_session(user_id: str) -> dict[str, Any]:
+    ensure_identity_schema_ready()
     token = secrets.token_urlsafe(32)
     now = utc_now_text()
     with get_pg_connection() as conn:
@@ -594,6 +631,7 @@ def create_user_session(user_id: str) -> dict[str, Any]:
 
 
 def get_user_by_session_token(token: str) -> dict[str, Any] | None:
+    ensure_identity_schema_ready()
     clean_token = str(token or "").strip()
     if not clean_token:
         return None
@@ -619,8 +657,12 @@ def get_user_by_session_token(token: str) -> dict[str, Any] | None:
                 UPDATE user_sessions
                 SET last_seen_at = %s, updated_at = %s
                 WHERE token = %s
+                  AND (
+                      last_seen_at IS NULL
+                      OR last_seen_at < %s
+                  )
                 """,
-                (now, now, clean_token),
+                (now, now, clean_token, session_touch_cutoff_text()),
             )
         else:
             conn.execute(
@@ -637,6 +679,7 @@ def get_user_by_session_token(token: str) -> dict[str, Any] | None:
 
 
 def revoke_user_session(token: str) -> bool:
+    ensure_identity_schema_ready()
     clean_token = str(token or "").strip()
     if not clean_token:
         return False

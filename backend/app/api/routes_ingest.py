@@ -7,7 +7,7 @@ from fastapi import APIRouter, Cookie, Header, HTTPException
 
 from app.api.auth import clean_bearer_token
 from app.core.config import WORKBENCH_INGEST_TOKEN, WORKBENCH_SESSION_COOKIE_NAME
-from app.core.database import get_user_by_session_token
+from app.modules.identity.postgres_store import get_user_by_session_token
 from app.modules.ingestion.schemas import IngestRequest
 from app.modules.ingestion.service import IngestError, ingest_records
 

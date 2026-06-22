@@ -1,29 +1,34 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 from dataclasses import dataclass
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.api.auth import require_admin_user
 from app.core import config as app_config
-from app.core.database import (
-    create_managed_user,
-    delete_managed_users,
+from app.core.postgres_pool import apply_postgres_pool_runtime_config
+from app.modules.admin_config.postgres_store import (
     get_api_usage_summary,
     get_app_settings_map,
     get_user_api_credentials_map,
     get_user_usage_limit,
+    upsert_app_setting,
+    upsert_user_api_credential,
+    upsert_user_usage_limit,
+)
+from app.modules.identity.postgres_store import (
+    create_managed_user,
+    delete_managed_users,
     list_users,
     reset_managed_user_password,
     update_managed_user,
-    upsert_user_usage_limit,
-    upsert_user_api_credential,
-    upsert_app_setting,
 )
-from app.modules.admin_prompt_configs import list_admin_prompt_configs
+from app.modules.admin_prompt_configs import list_admin_prompt_configs, restore_admin_prompt_config, update_admin_prompt_config
+from app.modules.ai_gateway import store as ai_gateway_store
+from app.modules.ai_gateway import scheduler as ai_gateway_scheduler
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -60,7 +65,15 @@ class ApiRouteStageDefinition:
     model_type: str = "text"
 
 
+class AdminPromptConfigUpdateRequest(BaseModel):
+    content: str = Field(default="")
+
+
 SETTING_DEFINITIONS: tuple[SettingDefinition, ...] = (
+    SettingDefinition("DB_POOL_MODE", "database", "数据库连接池模式", "small_team 表示小队模式，high_concurrency 表示高并发模式", "small_team"),
+    SettingDefinition("DB_POOL_MIN_SIZE", "database", "连接池最小连接数", "后端进程保持的最小 PostgreSQL 连接数", "2"),
+    SettingDefinition("DB_POOL_MAX_SIZE", "database", "连接池最大连接数", "后端进程允许同时借出的最大 PostgreSQL 连接数", "10"),
+    SettingDefinition("POSTGRES_CONNECT_TIMEOUT_SECONDS", "database", "数据库连接超时秒数", "连接 PostgreSQL 的超时时间，建议保持 3 秒", "3"),
     SettingDefinition("OPENAI_API_KEY", "ai", "通用 API 密钥", "初凡 AI / OpenAI 兼容 API 密钥", is_secret=True),
     SettingDefinition("OPENAI_BASE_URL", "ai", "通用接口地址", "初凡 AI 地址，例如 https://api.aicoming.top/v1"),
     SettingDefinition("OPENAI_TEXT_MODEL", "ai", "文本模型", "用于标题、关键词、提示词分析", "gpt-5.5"),
@@ -106,8 +119,7 @@ SETTING_DEFINITIONS: tuple[SettingDefinition, ...] = (
     SettingDefinition("VISUAL_QUEUE_DEAD_NAME", "visual", "生图失败队列名称", "重试耗尽后保存失败生图任务的 Redis 列表键名", "visual:tasks:dead"),
     SettingDefinition("VISUAL_QUEUE_MAX_RETRIES", "visual", "生图最大重试次数", "单个生图任务失败后最多自动重试的次数", "2"),
     SettingDefinition("VISUAL_QUEUE_RETRY_DELAY_SECONDS", "visual", "生图重试等待秒数", "生图任务失败后等待多久再重试", "30"),
-    SettingDefinition("VISUAL_USER_CONCURRENCY_LIMIT", "visual", "成员任务并发限制", "单个成员同时运行的生图任务数量，也控制清单导出时商品链接并行处理数；超过后生图进入等待队列；0 表示不限制", "5"),
-    SettingDefinition("VISUAL_TEAM_CONCURRENCY_LIMIT", "visual", "团队并发生图限制", "同一管理员团队同时运行的视觉任务数量；超过后新任务进入等待队列；0 表示不限制", "5"),
+    SettingDefinition("VISUAL_USER_CONCURRENCY_LIMIT", "visual", "成员模型并发限制", "单个成员同时运行的模型任务总数，生图任务和 Excel 商品属性分析共用此额度；0 表示不限制", "5"),
     SettingDefinition("TMAPI_API_TOKEN", "1688", "1688 搜图 API Token", "TMAPI 或同类 1688 搜图服务 Token", is_secret=True),
     SettingDefinition("TMAPI_BASE_URL", "1688", "1688 API 接口地址", "默认 http://api.tmapi.top", "http://api.tmapi.top"),
     SettingDefinition("ALIYUN_OSS_ENABLED", "oss", "启用 OSS", "1 表示启用，0 表示关闭", "0"),
@@ -190,10 +202,34 @@ LEGACY_TITLE_SETTING_KEYS = {
     "OPENAI_TITLE_MODEL",
 }
 LEGACY_TITLE_STAGE_IDS = {"title"}
+DB_POOL_SETTING_KEYS = {
+    "DB_POOL_MODE",
+    "DB_POOL_MIN_SIZE",
+    "DB_POOL_MAX_SIZE",
+    "POSTGRES_CONNECT_TIMEOUT_SECONDS",
+}
+DB_POOL_PRESETS = {
+    "small_team": {
+        "DB_POOL_MODE": "small_team",
+        "DB_POOL_MIN_SIZE": "2",
+        "DB_POOL_MAX_SIZE": "10",
+        "POSTGRES_CONNECT_TIMEOUT_SECONDS": "3",
+    },
+    "high_concurrency": {
+        "DB_POOL_MODE": "high_concurrency",
+        "DB_POOL_MIN_SIZE": "5",
+        "DB_POOL_MAX_SIZE": "20",
+        "POSTGRES_CONNECT_TIMEOUT_SECONDS": "3",
+    },
+}
 
 
 def visible_setting_definitions() -> tuple[SettingDefinition, ...]:
-    return tuple(definition for definition in SETTING_DEFINITIONS if definition.key not in LEGACY_TITLE_SETTING_KEYS)
+    return tuple(
+        definition
+        for definition in SETTING_DEFINITIONS
+        if definition.category != "ai" and definition.key not in LEGACY_TITLE_SETTING_KEYS
+    )
 
 
 def active_api_route_stage_definitions() -> tuple[ApiRouteStageDefinition, ...]:
@@ -232,6 +268,28 @@ class AdminSettingUpdateItem(BaseModel):
 
 class AdminSettingsUpdateRequest(BaseModel):
     items: list[AdminSettingUpdateItem]
+
+
+def normalize_database_pool_mode(value: str | None) -> str:
+    clean_value = str(value or "").strip().lower().replace("-", "_")
+    if clean_value in {"team", "small", "small_team"}:
+        return "small_team"
+    if clean_value in {"high", "concurrency", "high_concurrency"}:
+        return "high_concurrency"
+    return clean_value
+
+
+def expand_database_pool_setting_items(items: list[AdminSettingUpdateItem]) -> list[AdminSettingUpdateItem]:
+    expanded = {item.key: item for item in items}
+    mode_item = expanded.get("DB_POOL_MODE")
+    preset = DB_POOL_PRESETS.get(normalize_database_pool_mode(mode_item.value if mode_item else ""))
+    if preset:
+        for key, value in preset.items():
+            if key not in expanded:
+                expanded[key] = AdminSettingUpdateItem(key=key, value=value)
+            elif key == "DB_POOL_MODE":
+                expanded[key] = AdminSettingUpdateItem(key=key, value=preset["DB_POOL_MODE"])
+    return list(expanded.values())
 
 
 class AdminApiChannelUpdateItem(BaseModel):
@@ -277,6 +335,62 @@ class AdminApiRoutesApplyRequest(BaseModel):
     channelId: str
     textModel: str | None = None
     imageModel: str | None = None
+
+
+class AiGatewayChannelRequest(BaseModel):
+    id: str | None = None
+    name: str
+    providerType: str = "openai_compatible"
+    baseUrl: str = ""
+    textModel: str = "gpt-5.5"
+    imageModel: str = "gpt-image-2-1k"
+    modelTemplates: dict[str, str] = Field(default_factory=dict)
+    capabilities: list[str] = Field(default_factory=lambda: ["chat"])
+    enabled: bool = True
+    priority: int = 100
+    connectTimeoutSeconds: int = 10
+    readTimeoutSeconds: int = 60
+    notes: str = ""
+
+
+class AiGatewayCredentialRequest(BaseModel):
+    id: str | None = None
+    channelId: str
+    name: str
+    apiKey: str | None = None
+    clearApiKey: bool = False
+    enabled: bool = True
+    priority: int = 100
+    weight: int = 1
+    maxConcurrency: int = 2
+    rpmLimit: int = 0
+    dailyLimit: int = 0
+    monthlyLimit: int = 0
+    notes: str = ""
+
+
+class AiGatewayRouteRequest(BaseModel):
+    title: str | None = None
+    modelType: str = "text"
+    channelOrder: list[str] = Field(default_factory=list)
+    keySelectionPolicy: str = "least_in_flight_weighted"
+    maxChannelAttempts: int = 3
+    allowCrossChannelFallback: bool = True
+    enabled: bool = True
+
+
+class AiGatewayCircuitSetRequest(BaseModel):
+    scopeType: str
+    scopeId: str
+    state: str = "open"
+    stage: str = ""
+    model: str = ""
+    errorMessage: str = ""
+
+
+def ai_gateway_http_error(exc: Exception) -> HTTPException:
+    status_code = 400 if isinstance(exc, (RuntimeError, ValueError)) else 500
+    return HTTPException(status_code=status_code, detail=str(exc))
 
 
 @router.get("/users")
@@ -410,13 +524,28 @@ def admin_list_settings(_admin: dict[str, Any] = Depends(require_admin_user)):
 
 
 @router.get("/api-usage")
-def admin_api_usage_summary(_admin: dict[str, Any] = Depends(require_admin_user)):
-    return get_api_usage_summary()
+def admin_api_usage_summary(
+    scope: str = Query("all", pattern="^(all|models|groups)$"),
+    time_range: str = Query("all", alias="timeRange", pattern="^(1h|24h|7d|all)$"),
+    channel_id: str = Query("", alias="channelId"),
+    credential_id: str = Query("", alias="credentialId"),
+    stage: str = Query(""),
+    status: str = Query("", pattern="^(success|failed|)$"),
+    _admin: dict[str, Any] = Depends(require_admin_user),
+):
+    return get_api_usage_summary(
+        scope=scope,
+        time_range=time_range,
+        channel_id=channel_id,
+        credential_id=credential_id,
+        stage=stage,
+        status=status,
+    )
 
 
 @router.get("/api-channels")
 def admin_api_channels(_admin: dict[str, Any] = Depends(require_admin_user)):
-    return serialize_api_channel_bundle()
+    raise HTTPException(status_code=410, detail="旧单 Key API 配置已停用，请使用 API 中枢。")
 
 
 @router.get("/prompt-configs")
@@ -424,20 +553,171 @@ def admin_prompt_configs(_admin: dict[str, Any] = Depends(require_admin_user)):
     return {"items": list_admin_prompt_configs()}
 
 
+@router.put("/prompt-configs/{template_id}")
+def admin_update_prompt_config(
+    template_id: str,
+    payload: AdminPromptConfigUpdateRequest,
+    admin: dict[str, Any] = Depends(require_admin_user),
+):
+    try:
+        return {"item": update_admin_prompt_config(template_id, payload.content, updated_by=str(admin["id"]))}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/prompt-configs/{template_id}/restore")
+def admin_restore_prompt_config(template_id: str, admin: dict[str, Any] = Depends(require_admin_user)):
+    try:
+        return {"item": restore_admin_prompt_config(template_id, updated_by=str(admin["id"]))}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/ai-gateway")
+def admin_ai_gateway_bundle(_admin: dict[str, Any] = Depends(require_admin_user)):
+    try:
+        return {
+            "channels": ai_gateway_store.list_channels(),
+            "routes": ai_gateway_store.list_routes(),
+            "circuits": ai_gateway_store.list_circuits(),
+            "scheduler": ai_gateway_scheduler.runtime_snapshot(),
+        }
+    except Exception as exc:
+        raise ai_gateway_http_error(exc) from exc
+
+
+@router.post("/ai-gateway/channels")
+def admin_create_ai_gateway_channel(
+    payload: AiGatewayChannelRequest,
+    admin: dict[str, Any] = Depends(require_admin_user),
+):
+    try:
+        return {"channel": ai_gateway_store.upsert_channel(payload.model_dump(), admin_id=admin["id"])}
+    except Exception as exc:
+        raise ai_gateway_http_error(exc) from exc
+
+
+@router.patch("/ai-gateway/channels/{channel_id}")
+def admin_update_ai_gateway_channel(
+    channel_id: str,
+    payload: AiGatewayChannelRequest,
+    admin: dict[str, Any] = Depends(require_admin_user),
+):
+    try:
+        data = payload.model_dump()
+        data["id"] = channel_id
+        return {"channel": ai_gateway_store.upsert_channel(data, admin_id=admin["id"])}
+    except Exception as exc:
+        raise ai_gateway_http_error(exc) from exc
+
+
+@router.delete("/ai-gateway/channels/{channel_id}")
+def admin_delete_ai_gateway_channel(channel_id: str, _admin: dict[str, Any] = Depends(require_admin_user)):
+    try:
+        if not ai_gateway_store.delete_channel(channel_id):
+            raise HTTPException(status_code=404, detail="渠道不存在")
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise ai_gateway_http_error(exc) from exc
+
+
+@router.post("/ai-gateway/credentials")
+def admin_create_ai_gateway_credential(
+    payload: AiGatewayCredentialRequest,
+    admin: dict[str, Any] = Depends(require_admin_user),
+):
+    try:
+        return {"credential": ai_gateway_store.upsert_credential(payload.model_dump(), admin_id=admin["id"])}
+    except Exception as exc:
+        raise ai_gateway_http_error(exc) from exc
+
+
+@router.patch("/ai-gateway/credentials/{credential_id}")
+def admin_update_ai_gateway_credential(
+    credential_id: str,
+    payload: AiGatewayCredentialRequest,
+    admin: dict[str, Any] = Depends(require_admin_user),
+):
+    try:
+        data = payload.model_dump()
+        data["id"] = credential_id
+        return {"credential": ai_gateway_store.upsert_credential(data, admin_id=admin["id"])}
+    except Exception as exc:
+        raise ai_gateway_http_error(exc) from exc
+
+
+@router.delete("/ai-gateway/credentials/{credential_id}")
+def admin_delete_ai_gateway_credential(credential_id: str, _admin: dict[str, Any] = Depends(require_admin_user)):
+    try:
+        if not ai_gateway_store.delete_credential(credential_id):
+            raise HTTPException(status_code=404, detail="Key 不存在")
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise ai_gateway_http_error(exc) from exc
+
+
+@router.put("/ai-gateway/routes/{stage}")
+def admin_update_ai_gateway_route(
+    stage: str,
+    payload: AiGatewayRouteRequest,
+    admin: dict[str, Any] = Depends(require_admin_user),
+):
+    try:
+        return {"route": ai_gateway_store.upsert_route(stage, payload.model_dump(), admin_id=admin["id"])}
+    except Exception as exc:
+        raise ai_gateway_http_error(exc) from exc
+
+
+@router.post("/ai-gateway/routes/{stage}/dry-run")
+def admin_dry_run_ai_gateway_route(stage: str, _admin: dict[str, Any] = Depends(require_admin_user)):
+    try:
+        return ai_gateway_store.dry_run(stage)
+    except Exception as exc:
+        raise ai_gateway_http_error(exc) from exc
+
+
+@router.post("/ai-gateway/circuits")
+def admin_set_ai_gateway_circuit(
+    payload: AiGatewayCircuitSetRequest,
+    admin: dict[str, Any] = Depends(require_admin_user),
+):
+    try:
+        return {
+            "circuit": ai_gateway_store.set_circuit_state(
+                scope_type=payload.scopeType,
+                scope_id=payload.scopeId,
+                state=payload.state,
+                stage=payload.stage,
+                model=payload.model,
+                error_message=payload.errorMessage,
+                updated_by=admin["id"],
+            )
+        }
+    except Exception as exc:
+        raise ai_gateway_http_error(exc) from exc
+
+
+@router.post("/ai-gateway/circuits/{circuit_id}/reset")
+def admin_reset_ai_gateway_circuit(circuit_id: str, admin: dict[str, Any] = Depends(require_admin_user)):
+    try:
+        return {"circuit": ai_gateway_store.reset_circuit(circuit_id, updated_by=admin["id"])}
+    except Exception as exc:
+        raise ai_gateway_http_error(exc) from exc
+
+
 @router.put("/api-channels")
 def admin_update_api_channels(
     payload: AdminApiChannelsUpdateRequest,
     admin: dict[str, Any] = Depends(require_admin_user),
 ):
-    definitions = {definition.id: definition for definition in API_CHANNEL_DEFINITIONS}
-    for item in payload.items:
-        definition = definitions.get(normalize_api_identifier(item.id))
-        if not definition:
-            raise HTTPException(status_code=400, detail=f"未知 API 渠道：{item.id}")
-        update_api_channel(definition, item, admin["id"])
-        if item.enabled is True:
-            disable_other_api_channels(definition.id, admin["id"])
-    return serialize_api_channel_bundle()
+    _ = payload, admin
+    raise HTTPException(status_code=410, detail="旧单 Key API 配置已停用，请在 API 中枢的渠道池中管理 Key。")
 
 
 @router.post("/api-channels/apply")
@@ -445,22 +725,8 @@ def admin_apply_api_channel(
     payload: AdminApiRouteApplyRequest,
     admin: dict[str, Any] = Depends(require_admin_user),
 ):
-    stage = {definition.id: definition for definition in active_api_route_stage_definitions()}.get(
-        normalize_api_identifier(payload.stage)
-    )
-    if not stage:
-        raise HTTPException(status_code=400, detail=f"未知能力：{payload.stage}")
-
-    channel = {definition.id: definition for definition in API_CHANNEL_DEFINITIONS}.get(
-        normalize_api_identifier(payload.channelId)
-    )
-    if not channel:
-        raise HTTPException(status_code=400, detail=f"未知 API 渠道：{payload.channelId}")
-
-    saved_settings = get_app_settings_map()
-    channel_values = api_channel_runtime_values(channel, saved_settings)
-    apply_api_channel_to_stage(stage, channel, channel_values, admin["id"])
-    return serialize_api_channel_bundle()
+    _ = payload, admin
+    raise HTTPException(status_code=410, detail="旧单 Key 路由绑定已停用，请在 API 中枢配置业务路由。")
 
 
 @router.post("/api-channels/apply-all")
@@ -468,17 +734,8 @@ def admin_apply_api_channel_to_all(
     payload: AdminApiRoutesApplyRequest,
     admin: dict[str, Any] = Depends(require_admin_user),
 ):
-    channel = {definition.id: definition for definition in API_CHANNEL_DEFINITIONS}.get(
-        normalize_api_identifier(payload.channelId)
-    )
-    if not channel:
-        raise HTTPException(status_code=400, detail=f"未知 API 渠道：{payload.channelId}")
-
-    saved_settings = get_app_settings_map()
-    channel_values = api_channel_runtime_values(channel, saved_settings)
-    for stage in active_api_route_stage_definitions():
-        apply_api_channel_to_stage(stage, channel, channel_values, admin["id"])
-    return serialize_api_channel_bundle()
+    _ = payload, admin
+    raise HTTPException(status_code=410, detail="旧单 Key 批量绑定已停用，请在 API 中枢配置业务路由。")
 
 
 @router.put("/settings")
@@ -489,7 +746,9 @@ def admin_update_settings(
     definitions = {definition.key: definition for definition in visible_setting_definitions()}
     saved_settings = get_app_settings_map()
     updated = []
-    for item in payload.items:
+    items = expand_database_pool_setting_items(payload.items)
+    pool_config_touched = False
+    for item in items:
         definition = definitions.get(item.key)
         if not definition:
             raise HTTPException(status_code=400, detail=f"未知配置项：{item.key}")
@@ -510,6 +769,11 @@ def admin_update_settings(
         )
         saved_settings[definition.key] = updated_setting
         updated.append(serialize_setting(definition, updated_setting, previous_value=existing_value))
+        if definition.key in DB_POOL_SETTING_KEYS:
+            pool_config_touched = True
+
+    if pool_config_touched:
+        apply_saved_database_pool_settings(saved_settings)
 
     return {
         "items": [serialize_setting(definition, saved_settings.get(definition.key)) for definition in visible_setting_definitions()],
@@ -872,6 +1136,22 @@ def setting_runtime_value(saved_settings: dict[str, dict[str, Any]], key: str, d
     return str(default or "")
 
 
+def apply_saved_database_pool_settings(saved_settings: dict[str, dict[str, Any]]) -> dict[str, int]:
+    return apply_postgres_pool_runtime_config(
+        min_size=setting_runtime_value(saved_settings, "DB_POOL_MIN_SIZE", "2"),
+        max_size=setting_runtime_value(saved_settings, "DB_POOL_MAX_SIZE", "10"),
+        connect_timeout_seconds=setting_runtime_value(saved_settings, "POSTGRES_CONNECT_TIMEOUT_SECONDS", "3"),
+    )
+
+
+def load_database_pool_settings_from_store() -> dict[str, int] | None:
+    try:
+        saved_settings = get_app_settings_map()
+    except Exception:
+        return None
+    return apply_saved_database_pool_settings(saved_settings)
+
+
 def api_channel_setting_key(definition: ApiChannelDefinition, field: str) -> str:
     return f"AI_CHANNEL_{definition.id.upper()}_{field}"
 
@@ -912,5 +1192,6 @@ def mask_secret(value: str) -> str:
     if not clean_value:
         return ""
     if len(clean_value) <= 8:
-        return "••••"
-    return f"{clean_value[:4]}••••{clean_value[-4:]}"
+        return "****"
+    return f"{clean_value[:4]}****{clean_value[-4:]}"
+

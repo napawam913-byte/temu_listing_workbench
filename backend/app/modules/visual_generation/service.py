@@ -6,29 +6,34 @@ import shutil
 import time
 import uuid
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from app.core.config import STORAGE_DIR
 from app.core.database import (
-    assert_user_api_usage_allowed,
     clean_text,
-    get_connection,
-    list_link_list_records,
-    record_api_usage_safe,
-    upsert_link_list_record,
     utc_now_text,
 )
+from app.modules.admin_config.postgres_store import assert_user_api_usage_allowed, record_api_usage_safe
+from app.modules.exports.postgres_store import get_export_connection as get_connection
 from app.modules.image_storage.aliyun_oss import ImageStorageError, read_image_ref, upload_image_bytes
+from app.modules.link_records.postgres_store import list_link_list_records, upsert_link_list_record
+from app.modules.shared_concurrency import running_runtime_slot_count
 from app.modules.visual_generation.clients import (
     VisualGenerationError,
     build_api_url,
-    get_ai_settings,
+    bounded_image_request_timeout,
+    classify_ai_error,
     get_ai_stage_settings,
+    image_gateway_max_attempt_timeout_seconds,
     get_runtime_setting,
     is_rate_limit_error,
     is_request_too_large_error,
     request_generated_image,
+    should_switch_ai_candidate,
 )
+from app.modules.ai_gateway import scheduler as ai_gateway_scheduler
+from app.modules.visual_generation.queue import get_visual_progress, set_visual_progress
 from app.modules.visual_generation.planner import (
     build_compact_mother_prompt_from_plan,
     build_mother_prompt_from_plan,
@@ -45,9 +50,12 @@ TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_PLANNED = "planned"
 TASK_STATUS_RUNNING = "running"
 TASK_STATUS_RETRY_WAITING = "retry_waiting"
+_visual_generation_schema_ready = False
+_visual_generation_schema_lock = Lock()
 TASK_STATUS_SPLIT = "split"
 TASK_STATUS_COMPLETED = "completed"
 TASK_STATUS_FAILED = "failed"
+TASK_STATUS_CANCELLED = "cancelled"
 ACTIVE_VISUAL_TASK_STATUSES = (TASK_STATUS_QUEUED, TASK_STATUS_RUNNING, TASK_STATUS_RETRY_WAITING)
 RUNNING_VISUAL_TASK_STATUSES = (TASK_STATUS_RUNNING,)
 
@@ -65,6 +73,14 @@ VISUAL_PROMPT_LOGIC_VERSION = "analysis-generates-final-title-image-material-100
 
 
 class VisualTaskError(ValueError):
+    pass
+
+
+class VisualTaskNonRetryableError(VisualTaskError):
+    pass
+
+
+class VisualTaskCancelled(VisualTaskError):
     pass
 
 
@@ -119,6 +135,7 @@ def record_visual_api_usage(
     model: str,
     status: str,
     error_message: str | None = None,
+    task_id: str | None = None,
 ) -> None:
     record_api_usage_safe(
         provider="openai-compatible",
@@ -127,7 +144,10 @@ def record_visual_api_usage(
         model=model,
         user_id=user_id,
         channel_id=settings.get("channel_id"),
+        credential_id=settings.get("credential_id"),
+        credential_name=settings.get("credential_name"),
         status=status,
+        related_id=task_id,
         error_message=error_message,
     )
 
@@ -160,53 +180,16 @@ def visual_float_setting(key: str, default: float, *, minimum: float, maximum: f
 
 def assert_visual_concurrency_available(user_id: str, *, exclude_task_id: str | None = None) -> None:
     user_limit = visual_int_setting("VISUAL_USER_CONCURRENCY_LIMIT", 5, minimum=0, maximum=100)
-    team_limit = visual_int_setting("VISUAL_TEAM_CONCURRENCY_LIMIT", 5, minimum=0, maximum=500)
-    if user_limit <= 0 and team_limit <= 0:
+    if user_limit <= 0:
         return
 
     with get_connection() as conn:
         ensure_visual_generation_schema(conn)
         user_count = count_running_visual_tasks_for_user(conn, user_id, exclude_task_id=exclude_task_id)
-        team_scope = resolve_visual_team_scope(conn, user_id)
-        team_count = (
-            count_running_visual_tasks_for_team(conn, team_scope["adminUserId"], exclude_task_id=exclude_task_id)
-            if team_scope["adminUserId"]
-            else user_count
-        )
+    user_count += running_runtime_slot_count(user_id)
 
     if user_limit > 0 and user_count >= user_limit:
         raise VisualTaskError(f"当前成员已有 {user_count} 个生图任务正在运行，成员并发上限为 {user_limit}")
-    if team_limit > 0 and team_count >= team_limit:
-        team_name = team_scope.get("teamName") or "当前团队"
-        raise VisualTaskError(f"{team_name} 已有 {team_count} 个生图任务正在运行，团队并发上限为 {team_limit}")
-
-
-def resolve_visual_team_scope(conn, user_id: str) -> dict[str, str]:
-    row = conn.execute(
-        """
-        SELECT
-            users.id,
-            users.role,
-            users.manager_user_id,
-            teams.id AS team_id,
-            teams.name AS team_name
-        FROM users
-        LEFT JOIN teams ON teams.admin_user_id = CASE
-            WHEN users.role = 'admin' THEN users.id
-            ELSE users.manager_user_id
-        END
-        WHERE users.id = ?
-        """,
-        (user_id,),
-    ).fetchone()
-    if not row:
-        return {"adminUserId": "", "teamId": "", "teamName": ""}
-    admin_user_id = row["id"] if row["role"] == "admin" else row["manager_user_id"]
-    return {
-        "adminUserId": clean_text(admin_user_id),
-        "teamId": clean_text(row["team_id"]),
-        "teamName": clean_text(row["team_name"]),
-    }
 
 
 def count_visual_tasks_for_user(
@@ -258,55 +241,6 @@ def count_running_visual_tasks_global() -> int:
         )
 
 
-def count_visual_tasks_for_team(
-    conn,
-    admin_user_id: str,
-    statuses: tuple[str, ...],
-    *,
-    exclude_task_id: str | None = None,
-) -> int:
-    if not statuses:
-        return 0
-    params: list[Any] = [admin_user_id, admin_user_id, *statuses]
-    placeholders = ", ".join("?" for _ in statuses)
-    task_filter = ""
-    if exclude_task_id:
-        task_filter = "AND visual_generation_tasks.id != ?"
-        params.append(exclude_task_id)
-    return int(
-        conn.execute(
-            f"""
-            SELECT COUNT(*)
-            FROM visual_generation_tasks
-            JOIN users ON users.id = visual_generation_tasks.user_id
-            WHERE (users.id = ? OR users.manager_user_id = ?)
-              AND visual_generation_tasks.status IN ({placeholders})
-              {task_filter}
-            """,
-            params,
-        ).fetchone()[0]
-        or 0
-    )
-
-
-def count_active_visual_tasks_for_team(conn, admin_user_id: str, *, exclude_task_id: str | None = None) -> int:
-    return count_visual_tasks_for_team(
-        conn,
-        admin_user_id,
-        ACTIVE_VISUAL_TASK_STATUSES,
-        exclude_task_id=exclude_task_id,
-    )
-
-
-def count_running_visual_tasks_for_team(conn, admin_user_id: str, *, exclude_task_id: str | None = None) -> int:
-    return count_visual_tasks_for_team(
-        conn,
-        admin_user_id,
-        RUNNING_VISUAL_TASK_STATUSES,
-        exclude_task_id=exclude_task_id,
-    )
-
-
 def get_visual_task_status_summary(*, user_id: str) -> dict[str, Any]:
     with get_connection() as conn:
         ensure_visual_generation_schema(conn)
@@ -323,33 +257,28 @@ def get_visual_task_status_summary(*, user_id: str) -> dict[str, Any]:
         active_count = sum(counts.get(status, 0) for status in ACTIVE_VISUAL_TASK_STATUSES)
         running_count = counts.get(TASK_STATUS_RUNNING, 0)
         queued_count = counts.get(TASK_STATUS_QUEUED, 0)
-        team_scope = resolve_visual_team_scope(conn, user_id)
-        team_active_count = (
-            count_active_visual_tasks_for_team(conn, team_scope["adminUserId"])
-            if team_scope.get("adminUserId")
-            else active_count
-        )
-        team_running_count = (
-            count_running_visual_tasks_for_team(conn, team_scope["adminUserId"])
-            if team_scope.get("adminUserId")
-            else running_count
-        )
     user_limit = visual_int_setting("VISUAL_USER_CONCURRENCY_LIMIT", 5, minimum=0, maximum=100)
-    team_limit = visual_int_setting("VISUAL_TEAM_CONCURRENCY_LIMIT", 5, minimum=0, maximum=500)
     return {
         "counts": counts,
         "activeCount": active_count,
         "runningCount": running_count,
         "queuedCount": queued_count,
-        "teamActiveCount": team_active_count,
-        "teamRunningCount": team_running_count,
         "userConcurrencyLimit": user_limit,
-        "teamConcurrencyLimit": team_limit,
-        "team": team_scope,
     }
 
 
 def ensure_visual_generation_schema(conn) -> None:
+    global _visual_generation_schema_ready
+    if _visual_generation_schema_ready:
+        return
+    with _visual_generation_schema_lock:
+        if _visual_generation_schema_ready:
+            return
+        ensure_visual_generation_schema_on_connection(conn)
+        _visual_generation_schema_ready = True
+
+
+def ensure_visual_generation_schema_on_connection(conn) -> None:
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS visual_generation_tasks (
@@ -399,6 +328,22 @@ def ensure_visual_generation_schema(conn) -> None:
         );
 
         CREATE INDEX IF NOT EXISTS idx_visual_modules_task
+            ON visual_generation_modules(task_id, panel_index);
+        DELETE FROM visual_generation_modules
+        WHERE id IN (
+            SELECT id
+            FROM (
+                SELECT
+                    id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY task_id, panel_index
+                        ORDER BY updated_at DESC, created_at DESC, id DESC
+                    ) AS duplicate_rank
+                FROM visual_generation_modules
+            ) ranked_modules
+            WHERE duplicate_rank > 1
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_visual_modules_task_panel_unique
             ON visual_generation_modules(task_id, panel_index);
         """
     )
@@ -494,17 +439,69 @@ def get_visual_task(*, task_id: str, user_id: str) -> dict[str, Any]:
     return task_row_to_api(row, modules=modules)
 
 
-def delete_visual_task(*, task_id: str, user_id: str) -> None:
+def assert_visual_task_not_cancelled(task_id: str, user_id: str) -> None:
     with get_connection() as conn:
         ensure_visual_generation_schema(conn)
         row = conn.execute(
-            "SELECT id FROM visual_generation_tasks WHERE id = ? AND user_id = ?",
+            "SELECT status FROM visual_generation_tasks WHERE id = ? AND user_id = ?",
             (task_id, user_id),
         ).fetchone()
-        if row is None:
+    if row is None:
+        raise VisualTaskCancelled("visual task was removed")
+    if clean_text(row["status"]) == TASK_STATUS_CANCELLED:
+        raise VisualTaskCancelled("visual task was cancelled")
+
+
+def delete_visual_task(*, task_id: str, user_id: str) -> None:
+    with get_connection() as conn:
+        ensure_visual_generation_schema(conn)
+        conn.execute(
+            """
+            DELETE FROM visual_generation_modules
+            WHERE task_id = ?
+              AND EXISTS (
+                  SELECT 1
+                  FROM visual_generation_tasks
+                  WHERE id = ? AND user_id = ?
+              )
+            """,
+            (task_id, task_id, user_id),
+        )
+        result = conn.execute("DELETE FROM visual_generation_tasks WHERE id = ? AND user_id = ?", (task_id, user_id))
+        if result.rowcount <= 0:
             raise VisualTaskError("visual task not found")
-        conn.execute("DELETE FROM visual_generation_modules WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM visual_generation_tasks WHERE id = ? AND user_id = ?", (task_id, user_id))
+
+
+def delete_visual_tasks(*, task_ids: list[str], user_id: str) -> dict[str, Any]:
+    clean_ids = []
+    seen_ids = set()
+    for task_id in task_ids:
+        clean_id = clean_text(task_id)
+        if clean_id and clean_id not in seen_ids:
+            clean_ids.append(clean_id)
+            seen_ids.add(clean_id)
+    if not clean_ids:
+        return {"deletedCount": 0, "missingIds": []}
+    with get_connection() as conn:
+        ensure_visual_generation_schema(conn)
+        placeholders = ", ".join("?" for _ in clean_ids)
+        rows = conn.execute(
+            f"SELECT id FROM visual_generation_tasks WHERE user_id = ? AND id IN ({placeholders})",
+            (user_id, *clean_ids),
+        ).fetchall()
+        found_ids = {row["id"] for row in rows}
+        deleting_ids = [task_id for task_id in clean_ids if task_id in found_ids]
+        if deleting_ids:
+            delete_placeholders = ", ".join("?" for _ in deleting_ids)
+            conn.execute(f"DELETE FROM visual_generation_modules WHERE task_id IN ({delete_placeholders})", deleting_ids)
+            conn.execute(
+                f"DELETE FROM visual_generation_tasks WHERE user_id = ? AND id IN ({delete_placeholders})",
+                (user_id, *deleting_ids),
+            )
+    return {
+        "deletedCount": len(deleting_ids),
+        "missingIds": [task_id for task_id in clean_ids if task_id not in found_ids],
+    }
 
 
 def reset_stale_visual_task_outputs(*, task_id: str, user_id: str) -> None:
@@ -573,7 +570,122 @@ def request_generated_image_with_payload_retry(
     compact_prompt: str,
     reference_image_path: Path | None,
     reference_image_paths: list[Path],
+    gateway_stage: str = "",
+    used_settings: dict[str, str] | None = None,
+    task_id: str = "",
 ) -> bytes:
+    if gateway_stage:
+        attempt_limit = ai_gateway_scheduler.resolve_attempt_limit(gateway_stage)
+        excluded_credential_ids: set[str] = set()
+        last_error: Exception | None = None
+        last_error_type = ""
+        last_switch_progress: dict[str, str] = {}
+        for _attempt in range(attempt_limit):
+            candidate = ai_gateway_scheduler.acquire_candidate(
+                gateway_stage,
+                task_type="image",
+                excluded_credential_ids=excluded_credential_ids,
+            )
+            if not candidate:
+                break
+            excluded_credential_ids.add(clean_text(candidate.get("credentialId")))
+            started = time.monotonic()
+            candidate_settings = {
+                "api_key": clean_text(candidate.get("apiKey")),
+                "base_url": clean_text(candidate.get("baseUrl")),
+                "model": clean_text(candidate.get("model")) or model,
+                "channel_id": clean_text(candidate.get("channelId")),
+                "credential_id": clean_text(candidate.get("credentialId")),
+                "credential_name": clean_text(candidate.get("credentialName")) or clean_text(candidate.get("credentialId")),
+                "gateway_stage": gateway_stage,
+            }
+            candidate_model = normalize_image_model_for_channel(candidate_settings, candidate_settings["model"])
+            candidate_settings["model"] = candidate_model
+            candidate_size = "" if is_chufan_ai_image_target(candidate_settings, candidate_model) else size
+            candidate_timeout = min(
+                bounded_image_request_timeout(candidate.get("readTimeoutSeconds")),
+                image_gateway_max_attempt_timeout_seconds(),
+            )
+            candidate_api_url = build_api_url(
+                candidate_settings["base_url"],
+                "/images/edits" if reference_image_paths or reference_image_path else "/images/generations",
+            )
+            if used_settings is not None:
+                used_settings.clear()
+                used_settings.update(candidate_settings)
+            if task_id:
+                set_visual_progress(
+                    task_id,
+                    {
+                        "state": "waiting_upstream",
+                        "stage": gateway_stage,
+                        "channelId": candidate_settings["channel_id"],
+                        "credentialId": candidate_settings["credential_id"],
+                        "credentialName": candidate_settings["credential_name"],
+                        "model": candidate_model,
+                        "timeoutSeconds": candidate_timeout,
+                        **last_switch_progress,
+                    },
+                )
+            try:
+                result = request_generated_image_for_candidate(
+                    api_url=candidate_api_url,
+                    api_key=candidate_settings["api_key"],
+                    model=candidate_model,
+                    size=candidate_size,
+                    prompt=prompt,
+                    compact_prompt=compact_prompt,
+                    reference_image_path=reference_image_path,
+                    reference_image_paths=reference_image_paths,
+                    timeout=candidate_timeout,
+                )
+                ai_gateway_scheduler.finish_attempt(
+                    candidate,
+                    success=True,
+                    latency_ms=int((time.monotonic() - started) * 1000),
+                )
+                return result
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                last_error_type = classify_ai_error(exc)
+                ai_gateway_scheduler.finish_attempt(
+                    candidate,
+                    success=False,
+                    error_message=str(exc),
+                    latency_ms=int((time.monotonic() - started) * 1000),
+                )
+                if not should_switch_ai_candidate(exc):
+                    break
+                if task_id:
+                    last_switch_progress = {
+                        "lastSwitchChannelId": candidate_settings["channel_id"],
+                        "lastSwitchCredentialId": candidate_settings["credential_id"],
+                        "lastSwitchCredentialName": candidate_settings["credential_name"],
+                        "lastSwitchModel": candidate_model,
+                        "lastSwitchErrorType": last_error_type,
+                        "lastSwitchError": str(exc)[:2000],
+                    }
+                    set_visual_progress(
+                        task_id,
+                        {
+                            "state": "switching_key",
+                            "stage": gateway_stage,
+                            "channelId": candidate_settings["channel_id"],
+                            "credentialId": candidate_settings["credential_id"],
+                            "credentialName": candidate_settings["credential_name"],
+                            "model": candidate_model,
+                            "errorType": last_error_type,
+                            "lastError": str(exc)[:2000],
+                            **last_switch_progress,
+                        },
+                    )
+                continue
+        if last_error_type == "bad_request" and last_error is not None:
+            raise VisualTaskNonRetryableError(str(last_error)) from last_error
+        if last_error is None:
+            raise VisualTaskError(f"API 中枢没有可用生图渠道：{gateway_stage}")
+        raise last_error or VisualTaskError(f"API 中枢没有可用生图渠道：{gateway_stage}")
+
     last_error: Exception | None = None
     for rate_attempt, delay_seconds in enumerate(IMAGE_RATE_LIMIT_RETRY_DELAYS_SECONDS):
         if delay_seconds > 0:
@@ -610,6 +722,45 @@ def request_generated_image_with_payload_retry(
     raise last_error or VisualTaskError("image generation failed")
 
 
+def request_generated_image_for_candidate(
+    *,
+    api_url: str,
+    api_key: str,
+    model: str,
+    size: str,
+    prompt: str,
+    compact_prompt: str,
+    reference_image_path: Path | None,
+    reference_image_paths: list[Path],
+    timeout: int,
+) -> bytes:
+    last_error: Exception | None = None
+    for active_prompt in (prompt, compact_prompt):
+        for index, image_profile in enumerate(IMAGE_PAYLOAD_RETRY_PROFILES):
+            try:
+                return request_generated_image(
+                    api_url=api_url,
+                    api_key=api_key,
+                    model=model,
+                    size=size,
+                    prompt=active_prompt,
+                    reference_image_path=reference_image_path,
+                    reference_image_paths=reference_image_paths,
+                    reference_image_max_side=image_profile["max_side"],
+                    reference_image_quality=image_profile["quality"],
+                    timeout=timeout,
+                    fail_fast_transient=True,
+                )
+            except Exception as exc:
+                if not is_request_too_large_error(exc):
+                    raise
+                last_error = exc
+                if index < len(IMAGE_PAYLOAD_RETRY_PROFILES) - 1:
+                    continue
+                break
+    raise last_error or VisualTaskError("image generation failed")
+
+
 def plan_visual_task(
     *,
     task_id: str,
@@ -620,6 +771,7 @@ def plan_visual_task(
     analysis_model: str | None = None,
     prompt_model: str | None = None,
 ) -> dict[str, Any]:
+    assert_visual_task_not_cancelled(task_id, user_id)
     task = get_visual_task(task_id=task_id, user_id=user_id)
     record = task.get("record") or {}
     reference_refs = normalize_reference_image_refs(reference_image_refs or record.get("visualReferenceImages"))
@@ -654,6 +806,7 @@ def plan_visual_task(
     )
     update_task_status(task_id, user_id, TASK_STATUS_RUNNING, clear_error=True)
     try:
+        assert_visual_task_not_cancelled(task_id, user_id)
         if cached_product_analysis:
             product_analysis = dict(cached_product_analysis)
             product_analysis = normalize_visual_product_identity(
@@ -672,6 +825,7 @@ def plan_visual_task(
                     product_image_paths=reference_paths,
                     context=context,
                 )
+                assert_visual_task_not_cancelled(task_id, user_id)
                 product_analysis = normalize_visual_product_identity(
                     record=record,
                     product_analysis=product_analysis,
@@ -695,6 +849,7 @@ def plan_visual_task(
                     api_type="chat",
                     model=text_model,
                     status="success",
+                    task_id=task_id,
                 )
             except Exception as exc:
                 record_visual_api_usage(
@@ -705,6 +860,7 @@ def plan_visual_task(
                     model=text_model,
                     status="failed",
                     error_message=str(exc),
+                    task_id=task_id,
                 )
                 raise
         assert_user_api_usage_allowed(user_id)
@@ -727,6 +883,7 @@ def plan_visual_task(
                         plan=partial_plan,
                     ),
                 )
+                assert_visual_task_not_cancelled(task_id, user_id)
             except Exception as exc:
                 if not is_request_too_large_error(exc):
                     raise
@@ -748,6 +905,7 @@ def plan_visual_task(
                         plan=partial_plan,
                     ),
                 )
+                assert_visual_task_not_cancelled(task_id, user_id)
             record_visual_api_usage(
                 prompt_settings,
                 user_id=user_id,
@@ -755,6 +913,7 @@ def plan_visual_task(
                 api_type="chat",
                 model=plan_model,
                 status="success",
+                task_id=task_id,
             )
         except Exception as exc:
             record_visual_api_usage(
@@ -765,14 +924,19 @@ def plan_visual_task(
                 model=plan_model,
                 status="failed",
                 error_message=str(exc),
+                task_id=task_id,
             )
             raise
         mother_prompt = build_mother_prompt_from_plan(plan, task["layout"], resolved_allow_short_labels)
+        assert_visual_task_not_cancelled(task_id, user_id)
         persist_plan(task_id, user_id, source_ref, plan, mother_prompt)
+    except VisualTaskCancelled:
+        raise
     except Exception as exc:
         mark_task_failed(task_id, user_id, str(exc))
         raise
 
+    assert_visual_task_not_cancelled(task_id, user_id)
     return get_visual_task(task_id=task_id, user_id=user_id)
 
 
@@ -786,6 +950,7 @@ def generate_visual_task(
     image_size: str | None = None,
     use_reference_image: bool | None = None,
 ) -> dict[str, Any]:
+    assert_visual_task_not_cancelled(task_id, user_id)
     task = get_visual_task(task_id=task_id, user_id=user_id)
     if visual_task_prompt_is_stale(task):
         raise VisualTaskError("task prompt is stale; run plan first")
@@ -817,11 +982,15 @@ def generate_visual_task(
         clean_text(task.get("layout")) or "3x3",
         visual_bool_setting("VISUAL_ALLOW_SHORT_LABELS", True),
     )
-    request_image_size = "" if use_chufan_image_target else resolved_image_size
+    request_image_size = resolved_image_size
+    if not settings.get("gateway_stage") and use_chufan_image_target:
+        request_image_size = ""
 
     update_task_status(task_id, user_id, TASK_STATUS_RUNNING, clear_error=True)
     try:
+        assert_visual_task_not_cancelled(task_id, user_id)
         assert_user_api_usage_allowed(user_id)
+        actual_image_settings = dict(settings)
         try:
             image_bytes = request_generated_image_with_payload_retry(
                 api_url=image_url,
@@ -832,24 +1001,21 @@ def generate_visual_task(
                 compact_prompt=compact_prompt_text,
                 reference_image_path=reference_path,
                 reference_image_paths=reference_paths,
+                gateway_stage=settings.get("gateway_stage", ""),
+                used_settings=actual_image_settings,
+                task_id=task_id,
             )
-            record_visual_api_usage(
-                settings,
-                user_id=user_id,
-                stage="visual_image",
-                api_type="image",
-                model=resolved_image_model,
-                status="success",
-            )
+            assert_visual_task_not_cancelled(task_id, user_id)
         except Exception as exc:
             record_visual_api_usage(
-                settings,
+                actual_image_settings,
                 user_id=user_id,
                 stage="visual_image",
                 api_type="image",
-                model=resolved_image_model,
+                model=clean_text(actual_image_settings.get("model")) or resolved_image_model,
                 status="failed",
                 error_message=str(exc),
+                task_id=task_id,
             )
             raise
         mother_path = task_dir / "generated_mother.png"
@@ -864,17 +1030,30 @@ def generate_visual_task(
                 """,
                 (str(mother_path), TASK_STATUS_PLANNED, utc_now_text(), task_id, user_id),
             )
+        record_visual_api_usage(
+            actual_image_settings,
+            user_id=user_id,
+            stage="visual_image",
+            api_type="image",
+            model=clean_text(actual_image_settings.get("model")) or resolved_image_model,
+            status="success",
+            task_id=task_id,
+        )
+    except VisualTaskCancelled:
+        raise
     except Exception as exc:
         mark_task_failed(task_id, user_id, str(exc))
         raise
 
     if resolved_split_after:
+        assert_visual_task_not_cancelled(task_id, user_id)
         return split_visual_task(
             task_id=task_id,
             user_id=user_id,
             mother_image_ref=str(mother_path),
             upload_to_oss=resolved_upload_to_oss,
         )
+    assert_visual_task_not_cancelled(task_id, user_id)
     return get_visual_task(task_id=task_id, user_id=user_id)
 
 
@@ -890,6 +1069,7 @@ def split_visual_task(
     quality: int | None = None,
     sharpen: float | None = None,
 ) -> dict[str, Any]:
+    assert_visual_task_not_cancelled(task_id, user_id)
     task = get_visual_task(task_id=task_id, user_id=user_id)
     if visual_task_prompt_is_stale(task):
         raise VisualTaskError("task prompt is stale; run plan first")
@@ -917,6 +1097,7 @@ def split_visual_task(
     )
     update_task_status(task_id, user_id, TASK_STATUS_RUNNING, clear_error=True)
     try:
+        assert_visual_task_not_cancelled(task_id, user_id)
         manifest = split_grid_file(
             input_path=mother_path,
             output_dir=split_dir,
@@ -927,6 +1108,7 @@ def split_visual_task(
             quality=resolved_quality,
             sharpen=resolved_sharpen,
         )
+        assert_visual_task_not_cancelled(task_id, user_id)
         modules = persist_split_result(
             task_id=task_id,
             user_id=user_id,
@@ -935,10 +1117,13 @@ def split_visual_task(
             manifest=manifest,
             upload_to_oss=resolved_upload_to_oss,
         )
+    except VisualTaskCancelled:
+        raise
     except Exception as exc:
         mark_task_failed(task_id, user_id, str(exc))
         raise
 
+    assert_visual_task_not_cancelled(task_id, user_id)
     result = get_visual_task(task_id=task_id, user_id=user_id)
     result["modules"] = modules
     return result
@@ -966,23 +1151,29 @@ def run_visual_task_pipeline(
     Persisted prompt/mother outputs are only reusable for explicit failure retries.
     A normal run against the same task/link should regenerate from fresh planning.
     """
+    assert_visual_task_not_cancelled(task_id, user_id)
     task = get_visual_task(task_id=task_id, user_id=user_id)
     if visual_task_prompt_is_stale(task) or (
         not reuse_existing_outputs and visual_task_has_persisted_generation(task)
     ):
         reset_stale_visual_task_outputs(task_id=task_id, user_id=user_id)
+        assert_visual_task_not_cancelled(task_id, user_id)
         task = get_visual_task(task_id=task_id, user_id=user_id)
 
     completed_status = completed_status_from_task(task)
     if completed_status:
+        assert_visual_task_not_cancelled(task_id, user_id)
         update_task_status(task_id, user_id, completed_status, clear_error=True)
         if apply_to_link_record:
+            assert_visual_task_not_cancelled(task_id, user_id)
             apply_visual_task_results_to_link_record(task_id=task_id, user_id=user_id)
+            assert_visual_task_not_cancelled(task_id, user_id)
             update_task_status(task_id, user_id, TASK_STATUS_COMPLETED, clear_error=True)
         return get_visual_task(task_id=task_id, user_id=user_id)
 
     planned: dict[str, Any] | None = None
     if not clean_text(task.get("promptText")):
+        assert_visual_task_not_cancelled(task_id, user_id)
         planned = plan_visual_task(
             task_id=task_id,
             user_id=user_id,
@@ -992,10 +1183,12 @@ def run_visual_task_pipeline(
             analysis_model=analysis_model,
             prompt_model=prompt_model,
         )
+        assert_visual_task_not_cancelled(task_id, user_id)
         task = planned
 
     generated: dict[str, Any] | None = None
     if split_after is not False and task_has_usable_mother_image(task):
+        assert_visual_task_not_cancelled(task_id, user_id)
         generated = split_visual_task(
             task_id=task_id,
             user_id=user_id,
@@ -1003,6 +1196,7 @@ def run_visual_task_pipeline(
             upload_to_oss=upload_to_oss,
         )
     elif not task_has_usable_mother_image(task):
+        assert_visual_task_not_cancelled(task_id, user_id)
         generated = generate_visual_task(
             task_id=task_id,
             user_id=user_id,
@@ -1017,13 +1211,18 @@ def run_visual_task_pipeline(
 
     if apply_to_link_record:
         try:
+            assert_visual_task_not_cancelled(task_id, user_id)
             update_task_status(task_id, user_id, TASK_STATUS_RUNNING, clear_error=True)
             apply_visual_task_results_to_link_record(task_id=task_id, user_id=user_id)
+            assert_visual_task_not_cancelled(task_id, user_id)
             update_task_status(task_id, user_id, TASK_STATUS_COMPLETED, clear_error=True)
+        except VisualTaskCancelled:
+            raise
         except Exception as exc:
             # The generated assets should remain usable even if link-list persistence fails.
             mark_task_failed(task_id, user_id, f"generated, but link record update failed: {exc}")
             raise
+    assert_visual_task_not_cancelled(task_id, user_id)
     return get_visual_task(task_id=task_id, user_id=user_id) if apply_to_link_record else generated or planned
 
 
@@ -2179,10 +2378,10 @@ def mark_task_retry_waiting(task_id: str, user_id: str, error_message: str) -> N
         conn.execute(
             """
             UPDATE visual_generation_tasks
-            SET status = ?, error_message = NULL, updated_at = ?
+            SET status = ?, error_message = ?, updated_at = ?
             WHERE id = ? AND user_id = ?
             """,
-            (TASK_STATUS_RETRY_WAITING, utc_now_text(), task_id, user_id),
+            (TASK_STATUS_RETRY_WAITING, error_message[:2000], utc_now_text(), task_id, user_id),
         )
 
 
@@ -2222,7 +2421,7 @@ def task_row_to_api(row, *, modules: list[dict[str, Any]]) -> dict[str, Any]:
     analysis = parse_json(row["analysis_json"], {})
     manifest = parse_json(row["manifest_json"], {})
     record = parse_json(row["record_json"], {})
-    return {
+    api_task = {
         "id": row["id"],
         "userId": row["user_id"],
         "linkRecordId": row["link_record_id"],
@@ -2244,6 +2443,36 @@ def task_row_to_api(row, *, modules: list[dict[str, Any]]) -> dict[str, Any]:
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
     }
+    progress = get_visual_progress(row["id"])
+    if progress:
+        api_task.update(
+            {
+                "progressState": progress.get("state"),
+                "progressMessage": progress.get("message") or progress.get("waitReason"),
+                "activeChannelId": progress.get("channelId"),
+                "activeCredentialId": progress.get("credentialId"),
+                "activeCredentialName": progress.get("credentialName"),
+                "activeModel": progress.get("model"),
+                "timeoutSeconds": progress.get("timeoutSeconds"),
+                "switchingErrorType": progress.get("errorType"),
+                "lastSwitchChannelId": progress.get("lastSwitchChannelId"),
+                "lastSwitchCredentialId": progress.get("lastSwitchCredentialId"),
+                "lastSwitchCredentialName": progress.get("lastSwitchCredentialName"),
+                "lastSwitchModel": progress.get("lastSwitchModel"),
+                "lastSwitchErrorType": progress.get("lastSwitchErrorType"),
+                "lastSwitchError": progress.get("lastSwitchError"),
+            }
+        )
+    if row["status"] == TASK_STATUS_RETRY_WAITING:
+        retry_error = clean_text(progress.get("lastError") or progress.get("error") or row["error_message"])
+        api_task.update(
+            {
+                "retryCount": safe_int(progress.get("retryCount")),
+                "nextRetryAt": progress.get("nextRetryAt"),
+                "retryErrorMessage": retry_error or row["error_message"],
+            }
+        )
+    return api_task
 
 
 def module_row_to_api(row) -> dict[str, Any]:

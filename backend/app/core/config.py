@@ -16,12 +16,12 @@ def load_local_env() -> None:
     if not env_path.exists():
         return
 
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+    for raw_line in env_path.read_text(encoding="utf-8-sig").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        key = key.strip()
+        key = key.strip().lstrip("\ufeff")
         value = value.strip().strip('"').strip("'")
         if key and key not in os.environ:
             os.environ[key] = value
@@ -63,6 +63,31 @@ OPENAI_IMAGE_QUALITY = os.getenv("OPENAI_IMAGE_QUALITY", "medium").strip()
 
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 
+
+def cloud_database_url() -> str:
+    return (
+        os.getenv("POSTGRES_DATABASE_URL", "").strip()
+        or os.getenv("DATABASE_URL", "").strip()
+        or os.getenv("ADMIN_CONFIG_DATABASE_URL", "").strip()
+        or os.getenv("IDENTITY_DATABASE_URL", "").strip()
+        or os.getenv("EXPORTS_DATABASE_URL", "").strip()
+        or os.getenv("PRODUCTS_DATABASE_URL", "").strip()
+        or os.getenv("LINK_RECORDS_DATABASE_URL", "").strip()
+        or os.getenv("SOURCING_1688_DATABASE_URL", "").strip()
+    )
+
+
+def cloud_database_enabled() -> bool:
+    return bool(cloud_database_url())
+
+
+ALLOW_LOCAL_SQLITE = os.getenv("TEMU_WORKBENCH_ALLOW_LOCAL_SQLITE", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
 VISUAL_DEFAULT_MODE = os.getenv("VISUAL_DEFAULT_MODE", "main-gallery").strip()
 VISUAL_DEFAULT_LAYOUT = os.getenv("VISUAL_DEFAULT_LAYOUT", "3x3").strip()
 VISUAL_DEFAULT_REQUESTED_COUNT = os.getenv("VISUAL_DEFAULT_REQUESTED_COUNT", "9").strip()
@@ -85,7 +110,6 @@ VISUAL_QUEUE_DEAD_NAME = os.getenv("VISUAL_QUEUE_DEAD_NAME", "visual:tasks:dead"
 VISUAL_QUEUE_MAX_RETRIES = os.getenv("VISUAL_QUEUE_MAX_RETRIES", "2").strip()
 VISUAL_QUEUE_RETRY_DELAY_SECONDS = os.getenv("VISUAL_QUEUE_RETRY_DELAY_SECONDS", "30").strip()
 VISUAL_USER_CONCURRENCY_LIMIT = os.getenv("VISUAL_USER_CONCURRENCY_LIMIT", "5").strip()
-VISUAL_TEAM_CONCURRENCY_LIMIT = os.getenv("VISUAL_TEAM_CONCURRENCY_LIMIT", "5").strip()
 
 TMAPI_API_TOKEN = os.getenv("TMAPI_API_TOKEN", "").strip()
 TMAPI_BASE_URL = os.getenv("TMAPI_BASE_URL", "http://api.tmapi.top").strip().rstrip("/")

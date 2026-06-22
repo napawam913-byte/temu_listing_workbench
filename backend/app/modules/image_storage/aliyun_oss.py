@@ -10,7 +10,7 @@ from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 from app.core import config as app_config
-from app.core.database import get_app_setting_value
+from app.modules.admin_config.postgres_store import get_app_setting_value
 
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 HTTP_TIMEOUT_SECONDS = 20

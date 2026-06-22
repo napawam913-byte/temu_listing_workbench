@@ -3,23 +3,24 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 import uuid
 from typing import Any
 
 from app.core.database import (
-    assert_user_api_usage_allowed,
     build_text_vector,
     cosine_similarity,
-    record_api_usage_safe,
 )
+from app.modules.admin_config.postgres_store import assert_user_api_usage_allowed, record_api_usage_safe
+from app.modules.ai_gateway import scheduler as ai_gateway_scheduler
 from app.modules.exports.postgres_store import get_export_connection as get_connection
+from app.modules.prompt_templates import render_prompt_template
 from app.modules.visual_generation.clients import (
     build_api_url,
     extract_response_text,
     get_ai_stage_settings,
     parse_json_from_text,
     request_json,
-    request_text_json,
 )
 
 QUEUE_STATUSES = ("queued", "running", "done", "failed")
@@ -603,15 +604,14 @@ def request_category_intent_ai(
     }
     assert_user_api_usage_allowed(user_id)
     try:
-        result = request_category_json(
+        result, used_settings = request_category_json(
             api_url=build_api_url(settings["base_url"], "/chat/completions"),
-            api_key=settings["api_key"],
             model=settings["model"],
             instruction=json.dumps(instruction, ensure_ascii=False),
             image_refs=category_reference_image_urls(record),
             temperature=0.05,
         )
-        record_product_attribute_usage(settings, user_id=user_id, status="success")
+        record_product_attribute_usage(used_settings, user_id=user_id, status="success")
         return result
     except Exception as exc:
         record_product_attribute_usage(settings, user_id=user_id, status="failed", error_message=str(exc))
@@ -621,23 +621,30 @@ def request_category_intent_ai(
 def request_category_json(
     *,
     api_url: str,
-    api_key: str,
     model: str,
     instruction: str,
     image_refs: list[str],
     temperature: float,
-) -> dict[str, Any]:
-    clean_images = unique_strings([url for url in image_refs if is_image_reference_url(url)])[:MAX_CATEGORY_REFERENCE_IMAGES]
-    if not clean_images:
-        return request_text_json(
-            api_url=api_url,
-            api_key=api_key,
-            model=model,
-            instruction=instruction,
-            temperature=temperature,
-        )
+) -> tuple[dict[str, Any], dict[str, str]]:
+    return request_category_json_with_gateway(
+        api_url=api_url,
+        model=model,
+        instruction=instruction,
+        image_refs=image_refs,
+        temperature=temperature,
+    )
 
-    payload = build_category_multimodal_payload(
+
+def request_category_json_with_gateway(
+    *,
+    api_url: str,
+    model: str,
+    instruction: str,
+    image_refs: list[str],
+    temperature: float,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    clean_images = unique_strings([url for url in image_refs if is_image_reference_url(url)])[:MAX_CATEGORY_REFERENCE_IMAGES]
+    payload = build_category_request_payload(
         api_url=api_url,
         model=model,
         instruction=instruction,
@@ -645,16 +652,124 @@ def request_category_json(
         temperature=temperature,
     )
     try:
-        response_json = request_json(api_url, api_key, payload)
-        return parse_json_from_text(extract_response_text(response_json))
-    except Exception:
-        return request_text_json(
-            api_url=api_url,
-            api_key=api_key,
-            model=model,
-            instruction=instruction,
-            temperature=temperature,
+        result, used_settings = request_product_attribute_gateway_payload(
+            path="/chat/completions" if api_url.rstrip("/").endswith("/chat/completions") else "/responses",
+            payload=payload,
         )
+        return parse_json_from_text(extract_response_text(result)), used_settings
+    except Exception:
+        if clean_images:
+            text_payload = build_category_request_payload(
+                api_url=api_url,
+                model=model,
+                instruction=instruction,
+                image_refs=[],
+                temperature=temperature,
+            )
+            result, used_settings = request_product_attribute_gateway_payload(
+                path="/chat/completions" if api_url.rstrip("/").endswith("/chat/completions") else "/responses",
+                payload=text_payload,
+            )
+            return parse_json_from_text(extract_response_text(result)), used_settings
+        raise
+
+
+def request_product_attribute_gateway_payload(
+    *,
+    path: str,
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, str]]:
+    attempt_limit = ai_gateway_scheduler.resolve_attempt_limit("product_attribute")
+    excluded_credential_ids: set[str] = set()
+    last_error: BaseException | None = None
+    for _attempt in range(attempt_limit):
+        candidate = ai_gateway_scheduler.acquire_candidate(
+            "product_attribute",
+            task_type="api",
+            excluded_credential_ids=excluded_credential_ids,
+        )
+        if not candidate:
+            break
+        excluded_credential_ids.add(clean_text(candidate.get("credentialId")))
+        started = time.monotonic()
+        candidate_model = clean_text(candidate.get("model")) or clean_text(payload.get("model")) or "gpt-5.5"
+        candidate_payload = {**payload, "model": candidate_model}
+        used_settings = {
+            "api_key": clean_text(candidate.get("apiKey")),
+            "base_url": clean_text(candidate.get("baseUrl")),
+            "model": candidate_model,
+            "channel_id": clean_text(candidate.get("channelId")),
+            "credential_id": clean_text(candidate.get("credentialId")),
+            "credential_name": clean_text(candidate.get("credentialName")) or clean_text(candidate.get("credentialId")),
+            "gateway_stage": "product_attribute",
+        }
+        try:
+            result = request_json(
+                build_api_url(used_settings["base_url"], path),
+                used_settings["api_key"],
+                candidate_payload,
+                timeout=bounded_product_attribute_timeout(candidate.get("readTimeoutSeconds")),
+                fail_fast_transient=True,
+            )
+            ai_gateway_scheduler.finish_attempt(
+                candidate,
+                success=True,
+                latency_ms=int((time.monotonic() - started) * 1000),
+            )
+            return result, used_settings
+        except Exception as exc:
+            last_error = exc
+            ai_gateway_scheduler.finish_attempt(
+                candidate,
+                success=False,
+                error_message=str(exc),
+                latency_ms=int((time.monotonic() - started) * 1000),
+            )
+            continue
+    if last_error is None:
+        raise RuntimeError("API gateway has no available candidate for product_attribute")
+    raise RuntimeError(f"All API gateway candidates failed for product_attribute: {last_error}") from last_error
+
+
+def bounded_product_attribute_timeout(value: Any = None) -> int:
+    try:
+        timeout = int(float(value or 0))
+    except (TypeError, ValueError):
+        timeout = 0
+    if timeout <= 0:
+        timeout = 300
+    return max(30, min(timeout, 300))
+
+
+def build_category_request_payload(
+    *,
+    api_url: str,
+    model: str,
+    instruction: str,
+    image_refs: list[str],
+    temperature: float,
+) -> dict[str, Any]:
+    clean_images = unique_strings([url for url in image_refs if is_image_reference_url(url)])[:MAX_CATEGORY_REFERENCE_IMAGES]
+    if not clean_images:
+        if api_url.rstrip("/").endswith("/chat/completions"):
+            return {
+                "model": model,
+                "messages": [{"role": "user", "content": instruction}],
+                "temperature": temperature,
+            }
+        return {
+            "model": model,
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": instruction}]}],
+            "temperature": temperature,
+        }
+
+    return build_category_multimodal_payload(
+        api_url=api_url,
+        model=model,
+        instruction=instruction,
+        image_refs=clean_images,
+        temperature=temperature,
+    )
 
 
 def build_category_multimodal_payload(
@@ -1031,17 +1146,25 @@ def request_category_branch_ai(
         "current_category_path": current_path,
         "candidates": payload_candidates,
     }
+    instruction_text = render_prompt_template(
+        "category_branch",
+        {
+            "task": task,
+            "product": json.dumps(instruction["product"], ensure_ascii=False, indent=2),
+            "currentCategoryPath": json.dumps(current_path, ensure_ascii=False),
+            "candidates": json.dumps(payload_candidates, ensure_ascii=False, indent=2),
+        },
+    )
     assert_user_api_usage_allowed(user_id)
     try:
-        result = request_category_json(
+        result, used_settings = request_category_json(
             api_url=build_api_url(settings["base_url"], "/chat/completions"),
-            api_key=settings["api_key"],
             model=settings["model"],
-            instruction=json.dumps(instruction, ensure_ascii=False),
+            instruction=instruction_text,
             image_refs=category_reference_image_urls(record),
             temperature=0.05,
         )
-        record_product_attribute_usage(settings, user_id=user_id, status="success")
+        record_product_attribute_usage(used_settings, user_id=user_id, status="success")
         return result
     except Exception as exc:
         record_product_attribute_usage(settings, user_id=user_id, status="failed", error_message=str(exc))
@@ -1243,12 +1366,13 @@ def request_product_attribute_ai(
 
     instruction = {
         "role": "You are a Dianxiaomi TEMU semi-managed product attribute assistant. Return JSON only, no explanations.",
-        "task": "Use the product title, SKU names, category path, and candidate attribute fields to fill visible product attribute fields. For select fields, use exactly one provided option label and return its vid. For checkbox-group fields, choose provided options only when clearly applicable. If a safe parent yes/no field is present for batteries, electricity, fuel, or liquid, prefer no/none/not applicable unless the product is explicitly such an item. Do not invent certifications, brands, medical claims, safety claims, waterproof claims, or unverifiable sensitive attributes.",
+        "task": "Highest priority: fill every visible required/red-star product attribute field; do not leave required fields blank. Use the product title, SKU names, category path, and candidate attribute fields to fill visible product attribute fields. For select fields, use exactly one provided option label and return its vid. For checkbox-group fields, choose provided options only when clearly applicable. If a field is related to batteries, electricity, voltage, plugs, fuel, or liquid, prefer semantically negative options such as no electricity, no power, without battery, not electric, none, without, or not applicable unless the product source explicitly proves the positive hazardous attribute. Do not invent certifications, brands, medical claims, safety claims, waterproof claims, or unverifiable sensitive attributes.",
         "red_line_rules": [
-            "Do not output child attributes for electricity or plug products unless the product is explicitly electric: working voltage, plug specification, plug type, power voltage.",
-            "Do not output child attributes for batteries unless the product explicitly includes a battery: rechargeable battery, solar battery, battery type, lithium battery.",
-            "Do not output child attributes for fuel, lighter, or liquid unless the product itself is explicitly fuel/liquid. If the product merely says liquid food, wet food, or liquid feeding bowl, it is not a liquid product.",
-            "When a parent field says no battery, no power, no fuel, no liquid, not applicable, or without, do not output the related child fields.",
+            "Required/red-star fields are the highest priority: always fill them with the safest available value instead of omitting them.",
+            "Red-line rules control the selected value, not whether a visible/required field is filled. Do not leave required red-line fields blank.",
+            "For electricity or plug child fields, use a semantically negative or not applicable option when available unless the product is explicitly electric: working voltage, plug specification, plug type, power voltage.",
+            "For battery child fields, use a semantically negative option such as no electricity, no power, without battery, no battery, or not applicable when available unless the product explicitly includes a battery: rechargeable battery, solar battery, battery type, lithium battery.",
+            "For fuel, lighter, or liquid child fields, use a safe negative/not applicable option when available unless the product itself is explicitly fuel/liquid. If the product merely says liquid food, wet food, or liquid feeding bowl, it is not a liquid product.",
             "For red-line parent fields, use objective negative options such as no, none, without, not applicable when the title/SKU/images do not prove the red-line property.",
         ],
         "output_schema": {
@@ -1280,17 +1404,28 @@ def request_product_attribute_ai(
         },
         "fields": compact_fields,
     }
+    instruction_text = render_prompt_template(
+        "product_attribute",
+        {
+            "productTitle": instruction["product"]["title"],
+            "productTitleEn": instruction["product"]["title_en"],
+            "sourceTitles": json.dumps(instruction["product"]["source_titles"], ensure_ascii=False),
+            "categoryId": instruction["category"]["category_id"],
+            "categoryPath": instruction["category"]["category_path"],
+            "skuNames": json.dumps(instruction["product"]["sku_names"], ensure_ascii=False),
+            "fields": json.dumps(compact_fields, ensure_ascii=False, indent=2),
+        },
+    )
     assert_user_api_usage_allowed(user_id)
     try:
-        result = request_category_json(
+        result, used_settings = request_category_json(
             api_url=api_url,
-            api_key=settings["api_key"],
             model=settings["model"],
-            instruction=json.dumps(instruction, ensure_ascii=False),
+            instruction=instruction_text,
             image_refs=category_reference_image_urls(record),
             temperature=0.15,
         )
-        record_product_attribute_usage(settings, user_id=user_id, status="success")
+        record_product_attribute_usage(used_settings, user_id=user_id, status="success")
         return result
     except Exception as exc:
         record_product_attribute_usage(settings, user_id=user_id, status="failed", error_message=str(exc))
@@ -1311,6 +1446,8 @@ def record_product_attribute_usage(
         model=settings.get("model") or "unknown",
         user_id=user_id,
         channel_id=settings.get("channel_id"),
+        credential_id=settings.get("credential_id"),
+        credential_name=settings.get("credential_name"),
         status=status,
         error_message=error_message,
     )
@@ -1324,8 +1461,6 @@ def normalize_product_attributes(ai_result: dict[str, Any], fields: list[dict[st
     normalized: list[dict[str, Any]] = []
     selected: list[dict[str, Any]] = []
     for field in fields:
-        if should_skip_red_line_field(field, selected):
-            continue
         label = clean_text(field.get("field_label"))
         item = decisions.get(label) or decisions.get(clean_text(field.get("field_key")))
         if not item:
@@ -1353,8 +1488,6 @@ def generate_complete_product_attributes(
     for field in fields:
         if not field_conditions_match(field, selected):
             continue
-        if should_skip_red_line_field(field, selected):
-            continue
         label = clean_text(field.get("field_label"))
         item = decisions.get(label) or decisions.get(clean_text(field.get("field_key")))
         field_items: list[dict[str, Any]] = []
@@ -1378,8 +1511,6 @@ def generate_rule_based_product_attributes(record: dict[str, Any], fields: list[
             continue
         if not field_conditions_match(field, selected):
             continue
-        if should_skip_red_line_field(field, selected):
-            continue
         component = clean_text(field.get("component"))
         if component not in CHOICE_COMPONENTS:
             continue
@@ -1390,14 +1521,6 @@ def generate_rule_based_product_attributes(record: dict[str, Any], fields: list[
         normalized.extend(normalize_decision_for_field(item, field, selected))
         selected = normalized[:]
     return normalized
-
-
-def should_skip_red_line_field(field: dict[str, Any], selected: list[dict[str, Any]]) -> bool:
-    if not is_red_line_child_field(field):
-        return False
-    if selected_has_negative_red_line_parent(selected):
-        return True
-    return True
 
 
 def is_red_line_child_field(field: dict[str, Any]) -> bool:
@@ -1433,13 +1556,29 @@ def selected_has_negative_red_line_parent(selected: list[dict[str, Any]]) -> boo
 
 def red_line_negative_option_candidates() -> list[str]:
     return [
+        "\u65e0\u7535\u6c60",
+        "\u65e0\u7535",
+        "\u4e0d\u5e26\u7535\u6c60",
+        "\u4e0d\u542b\u7535\u6c60",
+        "\u4e0d\u542b\u7535",
+        "\u4e0d\u5e26\u7535",
+        "\u4e0d\u5e26\u7535\u6e90",
+        "\u65e0\u9700\u7535\u6e90",
+        "\u65e0\u9700\u7528\u7535",
+        "\u4e0d\u542b",
+        "\u65e0\u9700\u63a5\u7535",
+        "\u65e0\u9700\u63a5\u7535\u4f7f\u7528",
+        "\u4e0d\u901a\u7535",
+        "\u975e\u7535\u52a8",
+        "\u4e0d\u9002\u7528",
         "\u5426",
         "\u65e0",
-        "\u65e0\u7535\u6c60",
-        "\u4e0d\u5e26\u7535",
-        "\u4e0d\u542b",
-        "\u65e0\u9700\u63a5\u7535\u4f7f\u7528",
-        "\u4e0d\u9002\u7528",
+        "No Electricity",
+        "No Electric",
+        "Non Electric",
+        "Non-Electric",
+        "Battery Free",
+        "Without Battery",
         "No",
         "None",
         "Without",
@@ -1452,8 +1591,6 @@ def generate_default_attribute_for_field(
     selected: list[dict[str, Any]],
     product_text: str,
 ) -> list[dict[str, Any]]:
-    if should_skip_red_line_field(field, selected):
-        return []
     component = clean_text(field.get("component"))
     if component in CHOICE_COMPONENTS or field.get("options"):
         allowed_vids = allowed_option_vids_for_field(field, selected)
@@ -1504,7 +1641,7 @@ def normalize_decision_for_field(item: dict[str, Any], field: dict[str, Any], se
             option = find_option(value, field.get("options") or [], allowed_vids=allowed_vids)
             if not option:
                 continue
-            option = safe_choice_option(field, option, number_input_value, allowed_vids=allowed_vids)
+            option = safe_choice_option(field, option, number_input_value, allowed_vids=allowed_vids, selected=selected)
             if not option:
                 continue
             vid = clean_text(option.get("vid"))
@@ -1525,7 +1662,7 @@ def normalize_decision_for_field(item: dict[str, Any], field: dict[str, Any], se
         if allowed_vids:
             fallback = first_allowed_option(field.get("options") or [], allowed_vids)
             if fallback:
-                fallback = safe_choice_option(field, fallback, number_input_value, allowed_vids=allowed_vids)
+                fallback = safe_choice_option(field, fallback, number_input_value, allowed_vids=allowed_vids, selected=selected)
             if fallback:
                 return [
                     make_product_attribute_item(
@@ -1630,10 +1767,82 @@ def safe_choice_option(
     number_input_value: str,
     *,
     allowed_vids: set[str] | None,
+    selected: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
+    red_line_option = safe_red_line_choice_option(field, option, selected or [], allowed_vids=allowed_vids)
+    if red_line_option is None:
+        return None
+    option = red_line_option
     if not should_replace_other_fiber_option(field, option, number_input_value):
         return option
     return concrete_fiber_fallback_option(field, allowed_vids=allowed_vids)
+
+
+def safe_red_line_choice_option(
+    field: dict[str, Any],
+    option: dict[str, Any],
+    selected: list[dict[str, Any]],
+    *,
+    allowed_vids: set[str] | None,
+) -> dict[str, Any] | None:
+    if is_red_line_parent_field(field) and is_red_line_positive_option(option):
+        fallback = red_line_negative_option_for_field(field, allowed_vids=allowed_vids)
+        return fallback or option
+    if not is_red_line_child_field(field):
+        if is_red_line_parent_field(field) and not is_red_line_negative_option(option):
+            fallback = red_line_negative_option_for_field(field, allowed_vids=allowed_vids)
+            return fallback or option
+        return option
+    if is_red_line_negative_option(option):
+        return option
+    if not selected_has_negative_red_line_parent(selected):
+        return option
+    return red_line_negative_option_for_field(field, allowed_vids=allowed_vids)
+
+
+def is_red_line_negative_option(option: dict[str, Any]) -> bool:
+    values = [option.get("label"), option.get("value"), option.get("en")]
+    negative_tokens = [normalize_choice_text(token) for token in red_line_negative_option_candidates()]
+    for value in values:
+        value_key = normalize_choice_text(value)
+        if not value_key:
+            continue
+        for token in negative_tokens:
+            if not token:
+                continue
+            if token == value_key or value_key in token:
+                return True
+            if len(token) > 1 and token in value_key:
+                return True
+    return False
+
+
+def is_red_line_positive_option(option: dict[str, Any]) -> bool:
+    positive_tokens = [
+        "\u7535\u6c60",
+        "\u7535\u6e90",
+        "\u4f9b\u7535",
+        "\u5145\u7535",
+        "\u7535\u538b",
+        "\u63d2\u5934",
+        "battery",
+        "power",
+        "electric",
+        "voltage",
+        "plug",
+    ]
+    for value in (option.get("label"), option.get("value"), option.get("en")):
+        value_key = normalize_choice_text(value)
+        if not value_key:
+            continue
+        if any(normalize_choice_text(token) in value_key for token in positive_tokens):
+            return not is_red_line_negative_option(option)
+    return False
+
+
+def red_line_negative_option_for_field(field: dict[str, Any], *, allowed_vids: set[str] | None) -> dict[str, Any] | None:
+    options = [option for option in field.get("options") or [] if isinstance(option, dict)]
+    return find_first_option_by_candidates(options, red_line_negative_option_candidates(), allowed_vids=allowed_vids)
 
 
 def should_replace_other_fiber_option(field: dict[str, Any], option: dict[str, Any], number_input_value: str) -> bool:
@@ -1836,7 +2045,7 @@ def pick_rule_based_option(
                     return option
 
     candidate_groups: list[list[str]] = []
-    if is_red_line_parent_field(field):
+    if is_red_line_parent_field(field) or is_red_line_child_field(field):
         candidate_groups.append(red_line_negative_option_candidates())
     if any(token in label_key for token in ("品牌", "brand")):
         candidate_groups.append(["无品牌", "没有品牌", "No Brand", "Unbranded", "Generic", "通用", "其他", "其它"])
@@ -1898,7 +2107,7 @@ def default_choice_option(
 
     label_key = normalize_choice_text(field.get("field_label"))
     candidate_groups: list[list[str]] = []
-    if is_red_line_parent_field(field):
+    if is_red_line_parent_field(field) or is_red_line_child_field(field):
         candidate_groups.append(red_line_negative_option_candidates())
     if any(token in label_key for token in ("品牌", "brand")):
         candidate_groups.append(["无品牌", "没有品牌", "No Brand", "Unbranded", "Generic", "通用", "其他", "其它"])
@@ -1931,6 +2140,8 @@ def default_numeric_input_for_field(field: dict[str, Any], product_text: str) ->
     value_unit = default_value_unit_for_field(field)
     label_key = normalize_choice_text(field.get("field_label"))
     text = clean_text(product_text)
+    if is_red_line_child_field(field):
+        return normalize_number_input("0", field, value_unit)
     if value_unit:
         match = re.search(rf"([-+]?\d+(?:\.\d+)?)\s*{re.escape(value_unit)}", text, flags=re.IGNORECASE)
         if match:

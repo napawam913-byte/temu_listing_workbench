@@ -480,7 +480,7 @@ class AdminApiUsageTest(unittest.TestCase):
             finally:
                 database.DATABASE_PATH = original_path
 
-    def test_visual_generation_concurrency_limits_user_and_team(self):
+    def test_visual_generation_concurrency_limits_user_only(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             original_path = database.DATABASE_PATH
             database.DATABASE_PATH = Path(tmpdir) / "app.db"
@@ -491,13 +491,7 @@ class AdminApiUsageTest(unittest.TestCase):
                     password="secret123",
                     manager_user_id=database.DEFAULT_USER_ID,
                 )
-                member_b = database.create_managed_user(
-                    username="visual-b",
-                    password="secret123",
-                    manager_user_id=database.DEFAULT_USER_ID,
-                )
                 database.upsert_app_setting(key="VISUAL_USER_CONCURRENCY_LIMIT", value="1", category="visual")
-                database.upsert_app_setting(key="VISUAL_TEAM_CONCURRENCY_LIMIT", value="10", category="visual")
 
                 from app.modules.visual_generation.service import (
                     TASK_STATUS_QUEUED,
@@ -533,10 +527,6 @@ class AdminApiUsageTest(unittest.TestCase):
                     assert_visual_concurrency_available(member_a["id"])
                 assert_visual_concurrency_available(member_a["id"], exclude_task_id=task["id"])
 
-                database.upsert_app_setting(key="VISUAL_USER_CONCURRENCY_LIMIT", value="10", category="visual")
-                database.upsert_app_setting(key="VISUAL_TEAM_CONCURRENCY_LIMIT", value="1", category="visual")
-                with self.assertRaises(VisualTaskError):
-                    assert_visual_concurrency_available(member_b["id"])
             finally:
                 database.DATABASE_PATH = original_path
 
@@ -547,7 +537,6 @@ class AdminApiUsageTest(unittest.TestCase):
             try:
                 database.init_db()
                 database.upsert_app_setting(key="VISUAL_USER_CONCURRENCY_LIMIT", value="1", category="visual")
-                database.upsert_app_setting(key="VISUAL_TEAM_CONCURRENCY_LIMIT", value="10", category="visual")
 
                 from app.main import create_app
                 from app.modules.visual_generation.service import (

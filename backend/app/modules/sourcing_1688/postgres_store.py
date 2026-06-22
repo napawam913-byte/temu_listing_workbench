@@ -32,6 +32,7 @@ from app.core.database import (
     sourcing_material_row_to_api,
     utc_now_text,
 )
+from app.core.postgres_pool import get_postgres_connection
 
 
 def is_enabled() -> bool:
@@ -53,7 +54,7 @@ def get_pg_connection() -> Iterator[Any]:
     url = configured_url()
     if not url:
         raise RuntimeError("Sourcing PostgreSQL backend requires SOURCING_DATABASE_URL, POSTGRES_DATABASE_URL, or DATABASE_URL")
-    with psycopg.connect(url, row_factory=dict_row) as conn:
+    with get_postgres_connection(url) as conn:
         yield conn
 
 

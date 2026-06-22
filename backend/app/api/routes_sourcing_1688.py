@@ -7,7 +7,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from app.api.auth import require_current_user
-from app.core.database import (
+from app.modules.sourcing_1688.postgres_store import (
     assign_sourcing_material_1688,
     create_product_from_sourcing_material_1688,
     create_sourcing_material_1688,

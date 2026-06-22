@@ -8,10 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import BACKEND_DIR
-from app.core.database import (
-    assert_user_api_usage_allowed,
-    record_api_usage_safe,
-)
+from app.modules.admin_config.postgres_store import assert_user_api_usage_allowed, record_api_usage_safe
 from app.modules.creative_generation.safety import sanitize_marketplace_text
 from app.modules.visual_generation.clients import (
     build_api_url,
@@ -92,6 +89,8 @@ class TitleOptimizerSettings:
     base_url: str
     text_model: str
     channel_id: str = ""
+    credential_id: str = ""
+    credential_name: str = ""
 
 
 def optimize_listing_titles(
@@ -348,6 +347,8 @@ def get_title_optimizer_settings(*, user_id: str | None = None) -> TitleOptimize
         base_url=clean_text(settings.get("base_url")).rstrip("/"),
         text_model=clean_text(settings.get("model")) or "gpt-5.5",
         channel_id=clean_text(settings.get("channel_id")),
+        credential_id=clean_text(settings.get("credential_id")),
+        credential_name=clean_text(settings.get("credential_name")),
     )
 
 
@@ -366,6 +367,8 @@ def record_title_optimizer_usage(
         model=settings.text_model,
         user_id=user_id,
         channel_id=settings.channel_id,
+        credential_id=settings.credential_id,
+        credential_name=settings.credential_name,
         status=status,
         error_message=error_message,
     )

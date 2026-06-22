@@ -1,4 +1,4 @@
-import { ApiOutlined, LockOutlined } from '@ant-design/icons';
+﻿import { LockOutlined } from '@ant-design/icons';
 import {
   Button,
   Card,
@@ -24,33 +24,47 @@ import type { CSSProperties, Key } from 'react';
 import {
   createAdminUser,
   deleteAdminUsers,
-  fetchAdminApiChannels,
+  deleteAiGatewayChannel,
+  deleteAiGatewayCredential,
+  dryRunAiGatewayRoute,
+  fetchAiGatewayBundle,
   fetchAdminPromptConfigs,
   fetchAdminApiUsage,
   fetchAdminSettings,
-  fetchAdminUserApiCredentials,
   fetchAdminUserUsageLimit,
   fetchAdminUsers,
+  restoreAdminPromptConfig,
   resetAdminUserPassword,
-  updateAdminApiChannels,
+  resetAiGatewayCircuit,
+  saveAiGatewayChannel,
+  saveAiGatewayCredential,
+  saveAiGatewayRoute,
+  setAiGatewayCircuit,
   updateAdminSettings,
-  updateAdminUserApiCredentials,
+  updateAdminPromptConfig,
   updateAdminUserUsageLimit,
   updateAdminUser,
 } from '../api/backendApi';
 import type {
-  AdminApiChannel,
-  AdminApiChannelUpdateItem,
   AdminApiUsageGroup,
+  AdminApiUsageFilters,
   AdminApiUsageItem,
+  AdminApiUsageKeyStat,
+  AdminApiUsageLog,
   AdminApiUsageSummary,
   AdminPromptConfig,
   AdminSetting,
   AdminSettingsUpdateItem,
   AdminUser,
-  AdminUserApiCredential,
-  AdminUserApiCredentialUpdateItem,
   AdminUserUsageLimit,
+  AiGatewayBundle,
+  AiGatewayChannel,
+  AiGatewayChannelPayload,
+  AiGatewayCircuit,
+  AiGatewayCredential,
+  AiGatewayCredentialPayload,
+  AiGatewayDryRun,
+  AiGatewayRoute,
 } from '../api/backendApi';
 
 type UserCreateForm = {
@@ -73,35 +87,20 @@ type PasswordResetState = {
   password: string;
 };
 
-type ApiChannelDraft = {
-  name: string;
-  enabled: boolean;
-  baseUrl: string;
-  apiKey: string;
-  clearApiKey?: boolean;
-};
-
-type MemberCredentialDraft = {
-  enabled: boolean;
-  apiKey: string;
-  baseUrl: string;
-  clearApiKey?: boolean;
-};
-
-type MemberCredentialState = {
-  user?: AdminUser;
-  credentials: AdminUserApiCredential[];
-  drafts: Record<string, MemberCredentialDraft>;
-  loading: boolean;
-  saving: boolean;
-};
-
 type UsageLimitState = {
   user?: AdminUser;
   limit?: AdminUserUsageLimit;
   monthlyApiCallLimit: number;
   loading: boolean;
   saving: boolean;
+};
+
+type AiGatewayEditorState = {
+  channel?: Partial<AiGatewayChannelPayload>;
+  credential?: Partial<AiGatewayCredentialPayload>;
+  route?: AiGatewayRoute;
+  dryRun?: AiGatewayDryRun;
+  keyManagerChannel?: AiGatewayChannel;
 };
 
 const EMPTY_API_USAGE: AdminApiUsageSummary = {
@@ -112,6 +111,9 @@ const EMPTY_API_USAGE: AdminApiUsageSummary = {
   byUser: [],
   byTeam: [],
   byChannel: [],
+  byCredential: [],
+  keyStats: [],
+  recentLogs: [],
 };
 
 const API_USAGE_COLORS = [
@@ -128,65 +130,43 @@ const API_USAGE_DONUT_CENTER = API_USAGE_DONUT_SIZE / 2;
 const API_USAGE_DONUT_RADIUS = 74;
 const API_USAGE_DONUT_STROKE = 18;
 const API_USAGE_DONUT_CIRCUMFERENCE = 2 * Math.PI * API_USAGE_DONUT_RADIUS;
-const SETTING_CATEGORY_ORDER = ['ai', 'visual', '1688', 'oss'];
-const AI_STAGE_CONFIGS = [
-  {
-    title: '标题拆分',
-    modelKey: 'OPENAI_TITLE_SPLIT_MODEL',
-    modelFallbackKey: 'OPENAI_TEXT_MODEL',
-    description: '把商品标题拆成 1688 采购搜索关键词',
+const SETTING_CATEGORY_ORDER = ['database', 'visual', '1688', 'oss'];
+const DATABASE_POOL_PRESETS = {
+  small_team: {
+    label: '小队模式',
+    description: '适合开发测试和小团队上线：min=2，max=10，timeout=3s',
+    values: {
+      DB_POOL_MODE: 'small_team',
+      DB_POOL_MIN_SIZE: '2',
+      DB_POOL_MAX_SIZE: '10',
+      POSTGRES_CONNECT_TIMEOUT_SECONDS: '3',
+    },
   },
-  {
-    title: '智能推荐',
-    modelKey: 'OPENAI_RECOMMENDATION_MODEL',
-    modelFallbackKey: 'OPENAI_TEXT_MODEL',
-    description: '商品标题、类目、图片分析和推荐关键词',
+  high_concurrency: {
+    label: '高并发模式',
+    description: '适合多人同时使用和任务较多：min=5，max=20，timeout=3s',
+    values: {
+      DB_POOL_MODE: 'high_concurrency',
+      DB_POOL_MIN_SIZE: '5',
+      DB_POOL_MAX_SIZE: '20',
+      POSTGRES_CONNECT_TIMEOUT_SECONDS: '3',
+    },
   },
-  {
-    title: '产品属性填写',
-    modelKey: 'OPENAI_PRODUCT_ATTRIBUTE_MODEL',
-    modelFallbackKey: 'OPENAI_TEXT_MODEL',
-    description: '导出时根据类目属性库和商品信息填写产品属性',
-  },
-  {
-    title: '图片理解',
-    modelKey: 'OPENAI_VISUAL_ANALYSIS_MODEL',
-    modelFallbackKey: 'OPENAI_TEXT_MODEL',
-    description: '生图前分析主体、材质、结构、风险和画风',
-  },
-  {
-    title: '提示词规划',
-    modelKey: 'OPENAI_VISUAL_PROMPT_MODEL',
-    modelFallbackKey: 'OPENAI_TEXT_MODEL',
-    description: '把分析结果转成九宫格或四宫格母图提示词',
-  },
-  {
-    title: '图片生成',
-    modelKey: 'OPENAI_IMAGE_MODEL',
-    description: '实际生成母图、单图精修和 SKU 适配图',
-  },
-];
+} as const;
+type DatabasePoolPresetKey = keyof typeof DATABASE_POOL_PRESETS;
 
 function categoryLabel(category: string) {
-  if (category === 'ai') return 'AI 配置';
+  if (category === 'database') return '数据库连接池';
   if (category === 'visual') return '生图配置';
   if (category === '1688') return '1688 API';
-  if (category === 'oss') return '阿里云 OSS';
+  if (category === 'oss') return '?? OSS';
   return category;
-}
-
-function categoryDescription(category: string) {
-  if (category === 'ai') return '管理各个 AI 阶段实际调用的模型，API 密钥和接口地址请到初凡 API 配置。';
-  if (category === 'visual') return '管理母图任务、九宫格切图、图生图参考和 OSS 上传默认策略。';
-  if (category === '1688') return '管理 1688 搜图 API 服务，用于后续同款或相关货源检索。';
-  if (category === 'oss') return '管理阿里云 OSS 图片存储，用于导出模板中的公网图片链接。';
-  return '系统运行配置。';
 }
 
 function sourceLabel(source: string) {
   if (source === 'database') return '后台配置';
   if (source === 'env') return '环境变量';
-  if (source === 'default') return '默认值';
+  if (source === 'default') return '??';
   return source;
 }
 
@@ -250,35 +230,6 @@ function apiUsagePercent(count: number, total: number) {
   return Math.round((count / total) * 1000) / 10;
 }
 
-function apiChannelDraftsFromChannels(channels: AdminApiChannel[]) {
-  return Object.fromEntries(
-    channels.map((channel) => [
-      channel.id,
-      {
-        name: channel.name,
-        enabled: channel.id === 'chufan_ai' ? true : channel.enabled,
-        baseUrl: channel.baseUrl,
-        apiKey: '',
-        clearApiKey: false,
-      },
-    ]),
-  );
-}
-
-function memberCredentialDraftsFromItems(items: AdminUserApiCredential[]) {
-  return Object.fromEntries(
-    items.map((item) => [
-      item.channelId,
-      {
-        enabled: item.enabled,
-        apiKey: '',
-        baseUrl: item.baseUrl,
-        clearApiKey: false,
-      },
-    ]),
-  );
-}
-
 function adminUserInitial(user: AdminUser) {
   return (user.displayName || user.username || '?').trim().slice(0, 1).toUpperCase();
 }
@@ -308,49 +259,48 @@ export function AdminPage() {
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [settings, setSettings] = useState<AdminSetting[]>([]);
   const [apiUsage, setApiUsage] = useState<AdminApiUsageSummary>(EMPTY_API_USAGE);
-  const [apiChannels, setApiChannels] = useState<AdminApiChannel[]>([]);
+  const [apiUsageLoaded, setApiUsageLoaded] = useState(false);
+  const [loadingApiUsageModels, setLoadingApiUsageModels] = useState(false);
+  const [loadingApiUsageGroups, setLoadingApiUsageGroups] = useState(false);
+  const [aiGateway, setAiGateway] = useState<AiGatewayBundle>({ channels: [], routes: [], circuits: [] });
   const [promptConfigs, setPromptConfigs] = useState<AdminPromptConfig[]>([]);
-  const [apiChannelDrafts, setApiChannelDrafts] = useState<Record<string, ApiChannelDraft>>({});
-  const [activeApiConfigTab, setActiveApiConfigTab] = useState('chufan-api');
+  const [promptDrafts, setPromptDrafts] = useState<Record<string, string>>({});
+  const [savingPromptIds, setSavingPromptIds] = useState<Record<string, boolean>>({});
+  const [activeApiConfigTab, setActiveApiConfigTab] = useState('prompt-configs');
   const [settingDrafts, setSettingDrafts] = useState<Record<string, string>>({});
   const [secretEditingKeys, setSecretEditingKeys] = useState<Record<string, boolean>>({});
-  const [editingAiStageKey, setEditingAiStageKey] = useState<string | null>(null);
   const [highlightedModel, setHighlightedModel] = useState<string | null>(null);
+  const [apiUsageFilters, setApiUsageFilters] = useState<AdminApiUsageFilters>({ timeRange: 'all', status: '' });
   const [loading, setLoading] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
+  const [savingDatabasePoolPreset, setSavingDatabasePoolPreset] = useState<DatabasePoolPresetKey | null>(null);
   const [creatingUser, setCreatingUser] = useState(false);
   const [deletingUsers, setDeletingUsers] = useState(false);
   const [selectedUserRowKeys, setSelectedUserRowKeys] = useState<Key[]>([]);
   const [passwordReset, setPasswordReset] = useState<PasswordResetState>({ password: '' });
   const [expandedUserRowKeys, setExpandedUserRowKeys] = useState<Key[]>([]);
-  const [memberCredentialState, setMemberCredentialState] = useState<MemberCredentialState>({
-    credentials: [],
-    drafts: {},
-    loading: false,
-    saving: false,
-  });
   const [usageLimitState, setUsageLimitState] = useState<UsageLimitState>({
     monthlyApiCallLimit: 0,
     loading: false,
     saving: false,
   });
+  const [aiGatewayEditor, setAiGatewayEditor] = useState<AiGatewayEditorState>({});
+  const [savingAiGateway, setSavingAiGateway] = useState(false);
 
   const loadAdminData = useCallback(async () => {
     setLoading(true);
     try {
-      const [nextUsers, nextSettings, nextApiUsage, nextApiChannels, nextPromptConfigs] = await Promise.all([
+      const [nextUsers, nextSettings, nextPromptConfigs, nextAiGateway] = await Promise.all([
         fetchAdminUsers(),
         fetchAdminSettings(),
-        fetchAdminApiUsage(),
-        fetchAdminApiChannels(),
         fetchAdminPromptConfigs(),
+        fetchAiGatewayBundle().catch(() => ({ channels: [], routes: [], circuits: [] })),
       ]);
       setUsers(nextUsers);
       setSettings(nextSettings);
-      setApiUsage(nextApiUsage);
-      setApiChannels(nextApiChannels.channels);
+      setAiGateway(nextAiGateway);
       setPromptConfigs(nextPromptConfigs);
-      setApiChannelDrafts(apiChannelDraftsFromChannels(nextApiChannels.channels));
+      setPromptDrafts({});
       setSettingDrafts(
         Object.fromEntries(nextSettings.map((setting) => [setting.key, setting.isSecret ? '' : setting.value || ''])),
       );
@@ -440,53 +390,6 @@ export function AdminPage() {
     }
   };
 
-  const openMemberApiCredentials = async (user: AdminUser) => {
-    setMemberCredentialState({ user, credentials: [], drafts: {}, loading: true, saving: false });
-    try {
-      const credentials = await fetchAdminUserApiCredentials(user.id);
-      setMemberCredentialState({
-        user,
-        credentials,
-        drafts: memberCredentialDraftsFromItems(credentials),
-        loading: false,
-        saving: false,
-      });
-    } catch (error) {
-      setMemberCredentialState({ credentials: [], drafts: {}, loading: false, saving: false });
-      message.error(error instanceof Error ? error.message : '成员 API 配置读取失败');
-    }
-  };
-
-  const saveMemberApiCredentials = async () => {
-    const user = memberCredentialState.user;
-    if (!user) return;
-    setMemberCredentialState((current) => ({ ...current, saving: true }));
-    try {
-      const items: AdminUserApiCredentialUpdateItem[] = memberCredentialState.credentials.map((credential) => {
-        const draft = memberCredentialState.drafts[credential.channelId];
-        return {
-          channelId: credential.channelId,
-          enabled: draft?.enabled,
-          apiKey: draft?.apiKey?.trim() || undefined,
-          clearApiKey: Boolean(draft?.clearApiKey),
-          baseUrl: draft?.baseUrl,
-        };
-      });
-      const credentials = await updateAdminUserApiCredentials(user.id, items);
-      setMemberCredentialState({
-        user,
-        credentials,
-        drafts: memberCredentialDraftsFromItems(credentials),
-        loading: false,
-        saving: false,
-      });
-      message.success('成员 API 配置已保存');
-    } catch (error) {
-      setMemberCredentialState((current) => ({ ...current, saving: false }));
-      message.error(error instanceof Error ? error.message : '成员 API 配置保存失败');
-    }
-  };
-
   const openUsageLimit = async (user: AdminUser) => {
     setUsageLimitState({ user, monthlyApiCallLimit: 0, loading: true, saving: false });
     try {
@@ -517,7 +420,16 @@ export function AdminPage() {
         loading: false,
         saving: false,
       });
-      setApiUsage(await fetchAdminApiUsage());
+      const [models, groups] = await Promise.all([fetchAdminApiUsage('models'), fetchAdminApiUsage('groups')]);
+      setApiUsage({
+        ...EMPTY_API_USAGE,
+        ...models,
+        byUser: groups.byUser || [],
+        byTeam: groups.byTeam || [],
+        byChannel: groups.byChannel || [],
+        byCredential: groups.byCredential || [],
+      });
+      setApiUsageLoaded(true);
       message.success('用量额度已保存');
     } catch (error) {
       setUsageLimitState((current) => ({ ...current, saving: false }));
@@ -527,21 +439,11 @@ export function AdminPage() {
 
   const saveSettings = async (options?: { silent?: boolean; skipNoopMessage?: boolean }) => {
     const items: AdminSettingsUpdateItem[] = [];
-    const knownSettingKeys = new Set<string>();
-    const aiStageModelKeys = new Set(AI_STAGE_CONFIGS.map((stage) => stage.modelKey));
     settings.forEach((setting) => {
-      if (setting.category === 'ai' && !aiStageModelKeys.has(setting.key)) return;
-      knownSettingKeys.add(setting.key);
       const value = settingDrafts[setting.key] ?? '';
       if (setting.isSecret && !value) return;
       if (!setting.isSecret && value === (setting.value || '')) return;
       items.push({ key: setting.key, value });
-    });
-
-    AI_STAGE_CONFIGS.forEach((stage) => {
-      const value = settingDrafts[stage.modelKey] ?? '';
-      if (!value || knownSettingKeys.has(stage.modelKey)) return;
-      items.push({ key: stage.modelKey, value });
     });
 
     if (items.length === 0) {
@@ -573,59 +475,130 @@ export function AdminPage() {
     }
   };
 
-  const refreshApiUsage = async () => {
-    setLoading(true);
+  const replacePromptConfig = (nextPrompt: AdminPromptConfig) => {
+    setPromptConfigs((current) => current.map((prompt) => (prompt.id === nextPrompt.id ? nextPrompt : prompt)));
+    setPromptDrafts((current) => {
+      const next = { ...current };
+      delete next[nextPrompt.id];
+      return next;
+    });
+  };
+
+  const savePromptConfig = async (prompt: AdminPromptConfig) => {
+    const content = Object.prototype.hasOwnProperty.call(promptDrafts, prompt.id)
+      ? promptDrafts[prompt.id]
+      : prompt.content;
+    setSavingPromptIds((current) => ({ ...current, [prompt.id]: true }));
     try {
-      setApiUsage(await fetchAdminApiUsage());
+      const nextPrompt = await updateAdminPromptConfig(prompt.id, content);
+      replacePromptConfig(nextPrompt);
+      message.success('提示词模板已保存到云数据库');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '提示词模板保存失败');
+    } finally {
+      setSavingPromptIds((current) => ({ ...current, [prompt.id]: false }));
+    }
+  };
+
+  const restorePromptConfig = async (prompt: AdminPromptConfig) => {
+    setSavingPromptIds((current) => ({ ...current, [prompt.id]: true }));
+    try {
+      const nextPrompt = await restoreAdminPromptConfig(prompt.id);
+      replacePromptConfig(nextPrompt);
+      message.success('已恢复默认提示词文件');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '恢复默认提示词失败');
+    } finally {
+      setSavingPromptIds((current) => ({ ...current, [prompt.id]: false }));
+    }
+  };
+
+  const applyDatabasePoolPreset = async (presetKey: DatabasePoolPresetKey) => {
+    const preset = DATABASE_POOL_PRESETS[presetKey];
+    const items: AdminSettingsUpdateItem[] = Object.entries(preset.values).map(([key, value]) => ({ key, value }));
+    setSavingDatabasePoolPreset(presetKey);
+    try {
+      const nextSettings = await updateAdminSettings(items);
+      setSettings(nextSettings);
+      setSettingDrafts(
+        Object.fromEntries(nextSettings.map((setting) => [setting.key, setting.isSecret ? '' : setting.value || ''])),
+      );
+      message.success(`已应用 ${preset.label}`);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '数据库连接池模式保存失败');
+    } finally {
+      setSavingDatabasePoolPreset(null);
+    }
+  };
+
+  const refreshApiUsage = async () => {
+    setLoadingApiUsageModels(true);
+    setLoadingApiUsageGroups(true);
+    try {
+      const [models, groups, filteredGroups] = await Promise.all([
+        fetchAdminApiUsage('models'),
+        fetchAdminApiUsage('groups'),
+        fetchAdminApiUsage('groups', apiUsageFilters),
+      ]);
+      setApiUsage({
+        ...EMPTY_API_USAGE,
+        ...models,
+        byUser: groups.byUser || [],
+        byTeam: groups.byTeam || [],
+        byChannel: groups.byChannel || [],
+        byCredential: groups.byCredential || [],
+        keyStats: filteredGroups.keyStats || [],
+        recentLogs: filteredGroups.recentLogs || [],
+      });
+      setApiUsageLoaded(true);
       message.success('API 调用统计已刷新');
     } catch (error) {
       message.error(error instanceof Error ? error.message : 'API 调用统计读取失败');
     } finally {
-      setLoading(false);
+      setLoadingApiUsageModels(false);
+      setLoadingApiUsageGroups(false);
     }
   };
 
-  const syncApiChannelBundle = (bundle: { channels: AdminApiChannel[] }) => {
-    setApiChannels(bundle.channels);
-    setApiChannelDrafts(apiChannelDraftsFromChannels(bundle.channels));
-  };
-
-  const saveApiChannels = async (options?: { silent?: boolean }) => {
-    setSavingSettings(true);
+  const loadApiUsageIfNeeded = async () => {
+    if (apiUsageLoaded || loadingApiUsageModels || loadingApiUsageGroups) return;
+    setLoadingApiUsageModels(true);
     try {
-      const items: AdminApiChannelUpdateItem[] = apiChannels
-        .filter((channel) => channel.id === 'chufan_ai')
-        .map((channel) => {
-          const draft = apiChannelDrafts[channel.id];
-          return {
-            id: channel.id,
-            name: draft?.name,
-            enabled: true,
-            apiKey: draft?.apiKey?.trim() || undefined,
-            clearApiKey: Boolean(draft?.clearApiKey),
-            baseUrl: draft?.baseUrl,
-          };
-        });
-      const bundle = await updateAdminApiChannels(items);
-      syncApiChannelBundle(bundle);
-      if (!options?.silent) {
-        message.success('初凡 API 已保存');
-      }
-      return bundle;
+      const models = await fetchAdminApiUsage('models');
+      setApiUsage((current) => ({ ...current, ...models }));
+      setApiUsageLoaded(true);
     } catch (error) {
-      if (!options?.silent) {
-        message.error(error instanceof Error ? error.message : '初凡 API 保存失败');
-      }
-      throw error;
+      message.error(error instanceof Error ? error.message : 'API 调用统计读取失败');
     } finally {
-      setSavingSettings(false);
+      setLoadingApiUsageModels(false);
+    }
+
+    setLoadingApiUsageGroups(true);
+    try {
+      const [groups, filteredGroups] = await Promise.all([
+        fetchAdminApiUsage('groups'),
+        fetchAdminApiUsage('groups', apiUsageFilters),
+      ]);
+      setApiUsage((current) => ({
+        ...current,
+        byUser: groups.byUser || [],
+        byTeam: groups.byTeam || [],
+        byChannel: groups.byChannel || [],
+        byCredential: groups.byCredential || [],
+        keyStats: filteredGroups.keyStats || [],
+        recentLogs: filteredGroups.recentLogs || [],
+      }));
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'API 用量分组读取失败');
+    } finally {
+      setLoadingApiUsageGroups(false);
     }
   };
+
 
   const saveAllRuntimeConfig = async () => {
     setSavingSettings(true);
     try {
-      await saveApiChannels({ silent: true });
       await saveSettings({ silent: true, skipNoopMessage: true });
       message.success('全部运行配置已保存');
     } catch (error) {
@@ -635,9 +608,149 @@ export function AdminPage() {
     }
   };
 
+  const refreshAiGateway = async (options?: { silent?: boolean }) => {
+    try {
+      const bundle = await fetchAiGatewayBundle();
+      setAiGateway(bundle);
+      if (!options?.silent) {
+        message.success('API 中枢已刷新');
+      }
+      return bundle;
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'API 中枢读取失败');
+      throw error;
+    }
+  };
+
+  const saveAiGatewayChannelEditor = async () => {
+    const draft = aiGatewayEditor.channel;
+    if (!draft?.name) {
+      message.warning('请填写渠道名称');
+      return;
+    }
+    setSavingAiGateway(true);
+    try {
+      await saveAiGatewayChannel({
+        providerType: 'openai_compatible',
+        textModel: 'gpt-5.5',
+        imageModel: 'gpt-image-2-1k',
+        modelTemplates: {},
+        capabilities: ['chat'],
+        enabled: true,
+        priority: 100,
+        connectTimeoutSeconds: 10,
+        readTimeoutSeconds: 60,
+        ...draft,
+      } as AiGatewayChannelPayload);
+      setAiGatewayEditor({});
+      await refreshAiGateway({ silent: true });
+      message.success('渠道已保存');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '渠道保存失败');
+    } finally {
+      setSavingAiGateway(false);
+    }
+  };
+
+  const saveAiGatewayCredentialEditor = async () => {
+    const draft = aiGatewayEditor.credential;
+    if (!draft?.channelId || !draft.name) {
+      message.warning('请选择渠道并填写 Key 名称');
+      return;
+    }
+    setSavingAiGateway(true);
+    try {
+      await saveAiGatewayCredential({
+        enabled: true,
+        priority: 100,
+        weight: 1,
+        maxConcurrency: 2,
+        rpmLimit: 0,
+        dailyLimit: 0,
+        monthlyLimit: 0,
+        ...draft,
+      } as AiGatewayCredentialPayload);
+      const bundle = await refreshAiGateway({ silent: true });
+      const keyManagerChannel = aiGatewayEditor.keyManagerChannel
+        ? bundle.channels.find((channel) => channel.id === aiGatewayEditor.keyManagerChannel?.id)
+        : undefined;
+      setAiGatewayEditor(keyManagerChannel ? { keyManagerChannel } : {});
+      message.success('Key 已保存');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : 'Key 保存失败');
+    } finally {
+      setSavingAiGateway(false);
+    }
+  };
+
+  const saveAiGatewayRouteEditor = async () => {
+    const route = aiGatewayEditor.route;
+    if (!route) return;
+    setSavingAiGateway(true);
+    try {
+      await saveAiGatewayRoute(route.stage, {
+        title: route.title,
+        modelType: route.modelType,
+        channelOrder: route.channelOrder,
+        keySelectionPolicy: route.keySelectionPolicy,
+        maxChannelAttempts: route.maxChannelAttempts,
+        allowCrossChannelFallback: route.allowCrossChannelFallback,
+        enabled: route.enabled,
+      });
+      setAiGatewayEditor({});
+      await refreshAiGateway({ silent: true });
+      message.success('路由策略已保存');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '路由策略保存失败');
+    } finally {
+      setSavingAiGateway(false);
+    }
+  };
+
+  const runAiGatewayDryRun = async (stage: string) => {
+    setSavingAiGateway(true);
+    try {
+      const dryRun = await dryRunAiGatewayRoute(stage);
+      setAiGatewayEditor({ dryRun });
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '路由干跑失败');
+    } finally {
+      setSavingAiGateway(false);
+    }
+  };
+
+  const openAiGatewayCircuit = async (scopeType: string, scopeId: string, label: string) => {
+    Modal.confirm({
+      title: `手动熔断 ${label}？`,
+      content: '熔断后新的请求会跳过这个对象，直到你手动恢复或后续策略恢复。',
+      okText: '确认熔断',
+      cancelText: '取消',
+      onOk: async () => {
+        await setAiGatewayCircuit({
+          scopeType,
+          scopeId,
+          state: 'open',
+          errorMessage: '管理员手动熔断',
+        });
+        await refreshAiGateway({ silent: true });
+      },
+    });
+  };
+
+  const resetAiGatewayCircuitById = async (circuitId: string) => {
+    try {
+      await resetAiGatewayCircuit(circuitId);
+      await refreshAiGateway({ silent: true });
+      message.success('熔断状态已恢复');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '恢复失败');
+    }
+  };
+
   const settingGroups = useMemo(() => {
     const groups = new Map<string, AdminSetting[]>();
     settings.forEach((setting) => {
+      if (setting.category === 'ai') return;
       groups.set(setting.category, [...(groups.get(setting.category) || []), setting]);
     });
     return Array.from(groups.entries()).sort(
@@ -647,7 +760,6 @@ export function AdminPage() {
     );
   }, [settings]);
 
-  const settingsByKey = useMemo(() => new Map(settings.map((setting) => [setting.key, setting])), [settings]);
   const apiUsageByModel = useMemo(() => {
     const modelMap = new Map<string, AdminApiUsageItem>();
     apiUsage.items.forEach((item) => {
@@ -684,6 +796,9 @@ export function AdminPage() {
     () => (highlightedModel ? apiUsageByModel.find((item) => item.model === highlightedModel) || null : null),
     [apiUsageByModel, highlightedModel],
   );
+  const schedulerChannelState = (channelId: string) => aiGateway.scheduler?.channels?.[channelId];
+  const schedulerCredentialState = (credentialId: string) => aiGateway.scheduler?.credentials?.[credentialId];
+  const schedulerHealthPercent = (value?: number) => Math.round(Math.max(0, Math.min(1, value ?? 1)) * 100);
   const adminUserOptions = useMemo(
     () =>
       users
@@ -692,9 +807,15 @@ export function AdminPage() {
     [users],
   );
   const apiChannelNameById = useMemo(
-    () => new Map(apiChannels.map((channel) => [channel.id, channel.name])),
-    [apiChannels],
+    () => new Map(aiGateway.channels.map((channel) => [channel.id, channel.name])),
+    [aiGateway.channels],
   );
+  const aiGatewayCredentialById = useMemo(() => {
+    const entries = aiGateway.channels.flatMap((channel) =>
+      (channel.credentials || []).map((credential) => [credential.id, { ...credential, channelName: channel.name }] as const),
+    );
+    return new Map(entries);
+  }, [aiGateway.channels]);
   const userTableRows = useMemo<AdminUserRow[]>(() => {
     const admins = users.filter((user) => user.role === 'admin');
     const adminIds = new Set(admins.map((user) => user.id));
@@ -750,11 +871,6 @@ export function AdminPage() {
     });
   }, [expandableUserRowKeys]);
 
-  const editingAiStage = useMemo(
-    () => AI_STAGE_CONFIGS.find((stage) => stage.modelKey === editingAiStageKey) || null,
-    [editingAiStageKey],
-  );
-
   const userColumns: ColumnsType<AdminUserRow> = [
     {
       title: '用户',
@@ -797,7 +913,7 @@ export function AdminPage() {
       ),
     },
     {
-      title: '状态',
+      title: '??',
       dataIndex: 'status',
       width: 82,
       render: (_, user) => (
@@ -823,7 +939,7 @@ export function AdminPage() {
               管理员团队
             </Tag>
             <Tag className="admin-user-member-count" color={user.memberCount ? 'processing' : 'default'}>
-              {user.memberCount || 0} 人
+              {user.memberCount || 0} ?
             </Tag>
           </Space>
         ) : (
@@ -865,15 +981,6 @@ export function AdminPage() {
       align: 'center',
       render: (_, user) => (
         <Space className="admin-user-actions" size={6} wrap={false}>
-          <Tooltip title="API 配置">
-            <Button
-              aria-label="API 配置"
-              className="admin-user-action-btn"
-              icon={<ApiOutlined />}
-              size="small"
-              onClick={() => void openMemberApiCredentials(user)}
-            />
-          </Tooltip>
           <Tooltip title="重置密码">
             <Button
               aria-label="重置密码"
@@ -1125,16 +1232,581 @@ export function AdminPage() {
     },
   ];
 
-  const editingStageModelSetting = editingAiStage ? settingsByKey.get(editingAiStage.modelKey) : undefined;
-  const editingStageFallbackModelSetting =
-    editingAiStage && editingAiStage.modelFallbackKey ? settingsByKey.get(editingAiStage.modelFallbackKey) : undefined;
+  const apiUsageCredentialColumns: ColumnsType<AdminApiUsageGroup> = [
+    {
+      title: 'API Key',
+      dataIndex: 'credentialId',
+      render: (credentialId: string | undefined, item) => {
+        if (item.userId) {
+          return (
+            <Space direction="vertical" size={0}>
+              <Typography.Text strong>{item.displayName || item.username || item.userId}</Typography.Text>
+              <Typography.Text type="secondary">{item.username || item.userId}</Typography.Text>
+            </Space>
+          );
+        }
+        const credential = credentialId ? aiGatewayCredentialById.get(credentialId) : undefined;
+        const displayName = item.credentialName || credential?.name || credentialId || '未标记 Key';
+        return (
+          <Space direction="vertical" size={0}>
+            <Typography.Text strong>{displayName}</Typography.Text>
+            <Typography.Text type="secondary">
+              {credential?.maskedApiKey || credentialId || 'legacy/global'}
+            </Typography.Text>
+          </Space>
+        );
+      },
+    },
+    {
+      title: '渠道',
+      dataIndex: 'channelId',
+      width: 150,
+      render: (channelId: string | undefined, item) => {
+        const credential = item.credentialId ? aiGatewayCredentialById.get(item.credentialId) : undefined;
+        return <Tag color="cyan">{credential?.channelName || (channelId ? apiChannelNameById.get(channelId) || channelId : '未标记渠道')}</Tag>;
+      },
+    },
+    {
+      title: '使用成员',
+      dataIndex: 'userCount',
+      width: 100,
+      render: (count?: number) => count || 0,
+    },
+    {
+      title: '调用次数',
+      dataIndex: 'callCount',
+      width: 110,
+      sorter: (left, right) => left.callCount - right.callCount,
+      defaultSortOrder: 'descend',
+      render: (count: number) => <Typography.Text strong>{count}</Typography.Text>,
+    },
+    {
+      title: '成功率',
+      key: 'successRate',
+      width: 110,
+      render: (_, item) => {
+        const total = (item.successCount || 0) + (item.failedCount || 0);
+        return total ? `${Math.round(((item.successCount || 0) / total) * 100)}%` : '-';
+      },
+    },
+    {
+      title: '成功/失败',
+      key: 'statusCount',
+      width: 120,
+      render: (_, item) => `${item.successCount || 0}/${item.failedCount || 0}`,
+    },
+    {
+      title: '最近调用',
+      dataIndex: 'lastCalledAt',
+      width: 180,
+      render: (value?: string | null) => value || '暂无',
+    },
+  ];
+
+  const apiUsageStageOptions = useMemo(() => {
+    const stages = new Set<string>();
+    apiUsage.items.forEach((item) => stages.add(item.stage));
+    apiUsage.keyStats.forEach((item) => stages.add(item.stage));
+    apiUsage.recentLogs.forEach((item) => stages.add(item.stage));
+    ['visual_analysis', 'visual_prompt', 'visual_image'].forEach((stage) => stages.add(stage));
+    return Array.from(stages)
+      .filter(Boolean)
+      .sort()
+      .map((stage) => ({ value: stage, label: apiStageLabel(stage) }));
+  }, [apiUsage.items, apiUsage.keyStats, apiUsage.recentLogs]);
+
+  const apiUsageCredentialOptions = useMemo(() => {
+    const credentialMap = new Map<string, { value: string; label: string }>();
+    aiGateway.channels.forEach((channel) => {
+      (channel.credentials || []).forEach((credential) => {
+        credentialMap.set(credential.id, { value: credential.id, label: credential.name || credential.id });
+      });
+    });
+    [...apiUsage.byCredential, ...apiUsage.keyStats, ...apiUsage.recentLogs].forEach((item) => {
+      const credentialId = item.credentialId || '';
+      if (!credentialId || credentialMap.has(credentialId)) return;
+      credentialMap.set(credentialId, { value: credentialId, label: item.credentialName || credentialId });
+    });
+    return Array.from(credentialMap.values()).sort((left, right) => left.label.localeCompare(right.label));
+  }, [aiGateway.channels, apiUsage.byCredential, apiUsage.keyStats, apiUsage.recentLogs]);
+
+  const renderApiCredentialLabel = (credentialId?: string, credentialName?: string) => {
+    const credential = credentialId ? aiGatewayCredentialById.get(credentialId) : undefined;
+    const displayName = credentialName || credential?.name || credentialId || '未标记 Key';
+    const keyLabel = credential?.maskedApiKey || credentialId || 'legacy/global';
+    return (
+      <Space direction="vertical" size={0}>
+        <Typography.Text strong>{displayName}</Typography.Text>
+        <Typography.Text type="secondary">{keyLabel}</Typography.Text>
+      </Space>
+    );
+  };
+
+  const renderApiStatusTag = (status?: string) => (
+    <Tag color={status === 'failed' ? 'red' : status === 'success' ? 'green' : 'default'}>
+      {status === 'failed' ? '失败' : status === 'success' ? '成功' : status || '未知'}
+    </Tag>
+  );
+
+  const apiUsageKeyColumns: ColumnsType<AdminApiUsageKeyStat> = [
+    {
+      title: '渠道',
+      dataIndex: 'channelId',
+      width: 150,
+      render: (channelId?: string) => <Tag color="cyan">{channelId ? apiChannelNameById.get(channelId) || channelId : '未标记渠道'}</Tag>,
+    },
+    {
+      title: 'API Key',
+      dataIndex: 'credentialId',
+      render: (credentialId: string | undefined, item) => renderApiCredentialLabel(credentialId, item.credentialName),
+    },
+    {
+      title: '模型',
+      dataIndex: 'model',
+      width: 160,
+      render: (model: string) => <Typography.Text strong>{model}</Typography.Text>,
+    },
+    {
+      title: '阶段',
+      dataIndex: 'stage',
+      width: 130,
+      render: (stage: string) => <Tag color="blue">{apiStageLabel(stage)}</Tag>,
+    },
+    {
+      title: '类型',
+      dataIndex: 'apiType',
+      width: 120,
+      render: (apiType: string) => apiTypeLabel(apiType),
+    },
+    {
+      title: '调用次数',
+      dataIndex: 'callCount',
+      width: 110,
+      sorter: (left, right) => left.callCount - right.callCount,
+      defaultSortOrder: 'descend',
+      render: (count: number) => <Typography.Text strong>{count}</Typography.Text>,
+    },
+    {
+      title: '成功/失败',
+      key: 'statusCount',
+      width: 120,
+      render: (_, item) => `${item.successCount || 0}/${item.failedCount || 0}`,
+    },
+    {
+      title: '成功率',
+      key: 'successRate',
+      width: 100,
+      render: (_, item) => {
+        const total = (item.successCount || 0) + (item.failedCount || 0);
+        return total ? `${Math.round(((item.successCount || 0) / total) * 100)}%` : '-';
+      },
+    },
+    {
+      title: '最近调用',
+      dataIndex: 'lastCalledAt',
+      width: 170,
+      render: (value?: string | null) => value || '暂无',
+    },
+    {
+      title: '最近错误',
+      dataIndex: 'lastErrorMessage',
+      ellipsis: true,
+      render: (value?: string) => value ? <Typography.Text type="danger">{value}</Typography.Text> : <Typography.Text type="secondary">无</Typography.Text>,
+    },
+  ];
+
+  const apiUsageLogColumns: ColumnsType<AdminApiUsageLog> = [
+    {
+      title: '时间',
+      dataIndex: 'createdAt',
+      width: 170,
+      render: (value?: string | null) => value || '暂无',
+    },
+    {
+      title: '渠道',
+      dataIndex: 'channelId',
+      width: 140,
+      render: (channelId?: string) => <Tag color="cyan">{channelId ? apiChannelNameById.get(channelId) || channelId : '未标记渠道'}</Tag>,
+    },
+    {
+      title: 'API Key',
+      dataIndex: 'credentialId',
+      render: (credentialId: string | undefined, item) => renderApiCredentialLabel(credentialId, item.credentialName),
+    },
+    {
+      title: '阶段',
+      dataIndex: 'stage',
+      width: 130,
+      render: (stage: string) => <Tag color="blue">{apiStageLabel(stage)}</Tag>,
+    },
+    {
+      title: '模型',
+      dataIndex: 'model',
+      width: 150,
+    },
+    {
+      title: '状态',
+      dataIndex: 'status',
+      width: 90,
+      render: (status: string) => renderApiStatusTag(status),
+    },
+    {
+      title: '任务 ID',
+      dataIndex: 'relatedId',
+      width: 190,
+      ellipsis: true,
+      render: (value?: string | null) => value || '暂无',
+    },
+    {
+      title: '错误',
+      dataIndex: 'errorMessage',
+      ellipsis: true,
+      render: (value?: string | null) => value ? <Typography.Text type="danger">{value}</Typography.Text> : <Typography.Text type="secondary">无</Typography.Text>,
+    },
+  ];
+
+  const aiGatewayChannelOptions = useMemo(
+    () => aiGateway.channels.map((channel) => ({ value: channel.id, label: channel.name })),
+    [aiGateway.channels],
+  );
+
+  const aiGatewayCredentialColumns: ColumnsType<AiGatewayCredential> = [
+    {
+      title: 'Key',
+      dataIndex: 'name',
+      render: (value: string, record) => (
+        <Space direction="vertical" size={2}>
+          <Typography.Text strong>{value}</Typography.Text>
+          <Space size={6} wrap>
+            <Tag color={record.enabled ? 'green' : 'default'}>{record.enabled ? '启用' : '停用'}</Tag>
+            <Tag color={record.apiKeyConfigured ? 'green' : 'gold'}>
+              {record.apiKeyConfigured ? record.maskedApiKey || '已配置' : '未配置'}
+            </Tag>
+          </Space>
+        </Space>
+      ),
+    },
+    {
+      title: '调度',
+      width: 260,
+      render: (_, record) => {
+        const state = schedulerCredentialState(record.id);
+        const isRuntimeOpen = Boolean(state?.openUntil && state.openUntil * 1000 > Date.now());
+        return (
+          <Space size={6} wrap>
+            <Tag>优先级 {record.priority}</Tag>
+            <Tag>权重 {record.weight}</Tag>
+            <Tag>并发 {record.maxConcurrency || '不限'}</Tag>
+            <Tag color={state?.inFlight ? 'blue' : 'default'}>运行中 {state?.inFlight || 0}</Tag>
+            <Tag color={schedulerHealthPercent(state?.healthScore) < 60 ? 'gold' : 'green'}>
+              健康 {schedulerHealthPercent(state?.healthScore)}%
+            </Tag>
+            {state?.recentTotalCount ? (
+              <Tag color={state.recentFailureCount ? 'red' : 'green'}>
+                失败 {state.recentFailureCount}/{state.recentTotalCount}
+              </Tag>
+            ) : null}
+            {isRuntimeOpen ? <Tag color="red">运行熔断</Tag> : null}
+          </Space>
+        );
+      },
+    },
+    {
+      title: '限额',
+      width: 180,
+      render: (_, record) => (
+        <Space size={6} wrap>
+          <Tag>RPM {record.rpmLimit || '不限'}</Tag>
+          <Tag>? {record.dailyLimit || '??'}</Tag>
+          <Tag>? {record.monthlyLimit || '??'}</Tag>
+        </Space>
+      ),
+    },
+    {
+      title: '操作',
+      width: 210,
+      render: (_, record) => (
+        <Space size={6} wrap>
+          <Button size="small" onClick={() => setAiGatewayEditor({ credential: { ...record, apiKey: '' } })}>
+            编辑
+          </Button>
+          <Button size="small" onClick={() => void openAiGatewayCircuit('credential', record.id, record.name)}>
+            熔断
+          </Button>
+          <Button
+            danger
+            size="small"
+            onClick={() => {
+              Modal.confirm({
+                title: `?? Key ${record.name}?`,
+                okText: '删除',
+                okButtonProps: { danger: true },
+                cancelText: '取消',
+                onOk: async () => {
+                  await deleteAiGatewayCredential(record.id);
+                  await refreshAiGateway({ silent: true });
+                },
+              });
+            }}
+          >
+            删除
+          </Button>
+        </Space>
+      ),
+    },
+  ];
+
+  const aiGatewayCircuitColumns: ColumnsType<AiGatewayCircuit> = [
+    {
+      title: '对象',
+      render: (_, record) => (
+        <Space direction="vertical" size={2}>
+          <Typography.Text strong>{record.scopeType} / {record.scopeId}</Typography.Text>
+          <Typography.Text type="secondary">{record.stage || '全部阶段'} · {record.model || '全部模型'}</Typography.Text>
+        </Space>
+      ),
+    },
+    {
+      title: '??',
+      width: 120,
+      render: (_, record) => (
+        <Tag color={record.state === 'open' ? 'red' : record.state === 'half_open' ? 'gold' : 'green'}>
+          {record.state === 'open' ? '熔断' : record.state === 'half_open' ? '试探' : '正常'}
+        </Tag>
+      ),
+    },
+    {
+      title: '失败',
+      width: 110,
+      dataIndex: 'failureCount',
+    },
+    {
+      title: '最近错误',
+      dataIndex: 'lastErrorMessage',
+      render: (value: string) => value || '-',
+    },
+    {
+      title: '更新时间',
+      dataIndex: 'updatedAt',
+      width: 170,
+    },
+    {
+      title: '操作',
+      width: 100,
+      render: (_, record) => (
+        <Button size="small" onClick={() => void resetAiGatewayCircuitById(record.id)}>
+          恢复
+        </Button>
+      ),
+    },
+  ];
+
+  const activeKeyManagerChannel = useMemo(
+    () =>
+      aiGatewayEditor.keyManagerChannel
+        ? aiGateway.channels.find((channel) => channel.id === aiGatewayEditor.keyManagerChannel?.id) ||
+          aiGatewayEditor.keyManagerChannel
+        : undefined,
+    [aiGateway.channels, aiGatewayEditor.keyManagerChannel],
+  );
+
+  const aiGatewayTab = {
+    key: 'ai-gateway',
+    label: 'API 中枢',
+    children: (
+      <div className="admin-ai-gateway">
+        <Card
+          className="admin-table-card"
+          title="渠道池"
+          extra={
+            <Space>
+              <Button onClick={() => void refreshAiGateway()} loading={savingAiGateway}>
+                刷新
+              </Button>
+              <Button
+                type="primary"
+                onClick={() =>
+                  setAiGatewayEditor({
+                    channel: {
+                      name: '',
+                      providerType: 'openai_compatible',
+                      baseUrl: '',
+                      textModel: 'gpt-5.5',
+                      imageModel: 'gpt-image-2-1k',
+                      modelTemplates: {},
+                      capabilities: ['chat'],
+                      enabled: true,
+                      priority: 100,
+                      connectTimeoutSeconds: 10,
+                      readTimeoutSeconds: 60,
+                    },
+                  })
+                }
+              >
+                新增渠道
+              </Button>
+            </Space>
+          }
+        >
+          <div className="admin-ai-gateway-channel-list">
+            {aiGateway.channels.length ? (
+              aiGateway.channels.map((channel) => (
+                <div className="admin-ai-gateway-channel" key={channel.id}>
+                  <div className="admin-ai-gateway-channel-head">
+                    <div>
+                      <Space size={8} wrap>
+                        <Typography.Text strong>{channel.name}</Typography.Text>
+                        <Tag color={channel.enabled ? 'green' : 'default'}>{channel.enabled ? '启用' : '停用'}</Tag>
+                        <Tag>{channel.providerType}</Tag>
+                        {channel.capabilities.map((capability) => (
+                          <Tag color={capability === 'image' ? 'purple' : 'blue'} key={capability}>
+                            {capability}
+                          </Tag>
+                        ))}
+                      </Space>
+                      <Typography.Text className="admin-ai-gateway-url" type="secondary">
+                        {channel.baseUrl || '未配置接口地址'}
+                      </Typography.Text>
+                    </div>
+                    <Space size={6} wrap>
+                      <Button size="small" onClick={() => setAiGatewayEditor({ keyManagerChannel: channel })}>
+                        管理 Key
+                      </Button>
+                      <Button size="small" onClick={() => setAiGatewayEditor({ channel })}>
+                        编辑
+                      </Button>
+                      <Button size="small" onClick={() => void openAiGatewayCircuit('channel', channel.id, channel.name)}>
+                        熔断
+                      </Button>
+                      <Button
+                        danger
+                        size="small"
+                        onClick={() => {
+                          Modal.confirm({
+                            title: `删除渠道 ${channel.name}？`,
+                            content: '删除渠道会同时删除它下面的 Key 配置。',
+                            okText: '删除',
+                            okButtonProps: { danger: true },
+                            cancelText: '取消',
+                            onOk: async () => {
+                              await deleteAiGatewayChannel(channel.id);
+                              await refreshAiGateway({ silent: true });
+                            },
+                          });
+                        }}
+                      >
+                        删除
+                      </Button>
+                    </Space>
+                  </div>
+                  <Space size={6} wrap>
+                    <Tag>优先级 {channel.priority}</Tag>
+                    <Tag>连接超时 {channel.connectTimeoutSeconds}s</Tag>
+                    <Tag>读取超时 {channel.readTimeoutSeconds}s</Tag>
+                    <Tag>阶段模型 {Object.keys(channel.modelTemplates || {}).length}</Tag>
+                  </Space>
+                  <div className="admin-ai-gateway-key-summary">
+                    <span>Key {channel.credentials.length}</span>
+                    <span>可用 {channel.credentials.filter((credential) => credential.enabled && credential.apiKeyConfigured).length}</span>
+                    <span>运行中 {schedulerChannelState(channel.id)?.inFlight || 0}</span>
+                    <span>健康 {schedulerHealthPercent(schedulerChannelState(channel.id)?.healthScore)}%</span>
+                    <span>
+                      总并发{' '}
+                      {channel.credentials.reduce(
+                        (total, credential) =>
+                          credential.enabled && credential.apiKeyConfigured
+                            ? total + credential.maxConcurrency
+                            : total,
+                        0,
+                      )}
+                    </span>
+                  </div>
+                </div>
+              ))
+            ) : (
+              <Empty description="还没有渠道，先新增一个 OpenAI 兼容渠道" />
+            )}
+          </div>
+        </Card>
+
+        <Card className="admin-table-card" title="业务路由">
+          <Table<AiGatewayRoute>
+            rowKey="stage"
+            dataSource={aiGateway.routes}
+            pagination={false}
+            size="middle"
+            columns={[
+              {
+                title: '业务阶段',
+                render: (_, route) => (
+                  <Space direction="vertical" size={2}>
+                    <Typography.Text strong>{route.title}</Typography.Text>
+                    <Typography.Text type="secondary">{route.stage}</Typography.Text>
+                  </Space>
+                ),
+              },
+              {
+                title: '类型',
+                width: 90,
+                render: (_, route) => <Tag color={route.modelType === 'image' ? 'purple' : 'blue'}>{route.modelType}</Tag>,
+              },
+              {
+                title: '候选渠道',
+                render: (_, route) =>
+                  route.channelOrder.length ? (
+                    <Space size={6} wrap>
+                      {route.channelOrder.map((channelId) => (
+                        <Tag key={channelId}>{aiGatewayChannelOptions.find((item) => item.value === channelId)?.label || channelId}</Tag>
+                      ))}
+                    </Space>
+                  ) : (
+                    <Typography.Text type="secondary">按渠道优先级自动选择</Typography.Text>
+                  ),
+              },
+              {
+                title: '策略',
+                width: 190,
+                render: (_, route) => (
+                  <Space size={6} wrap>
+                    <Tag>{route.keySelectionPolicy}</Tag>
+                    <Tag>?? {route.maxChannelAttempts}</Tag>
+                  </Space>
+                ),
+              },
+              {
+                title: '操作',
+                width: 170,
+                render: (_, route) => (
+                  <Space size={6}>
+                    <Button size="small" onClick={() => setAiGatewayEditor({ route })}>
+                      编辑
+                    </Button>
+                    <Button size="small" loading={savingAiGateway} onClick={() => void runAiGatewayDryRun(route.stage)}>
+                      干跑
+                    </Button>
+                  </Space>
+                ),
+              },
+            ]}
+          />
+        </Card>
+
+        <Card className="admin-table-card" title="熔断状态">
+          <Table<AiGatewayCircuit>
+            rowKey="id"
+            columns={aiGatewayCircuitColumns}
+            dataSource={aiGateway.circuits}
+            locale={{ emptyText: '暂无熔断记录' }}
+            pagination={{ pageSize: 8, showSizeChanger: false }}
+            size="middle"
+          />
+        </Card>
+      </div>
+    ),
+  };
+
   const settingDraftValue = (key: string, setting?: AdminSetting) =>
     Object.prototype.hasOwnProperty.call(settingDrafts, key) ? settingDrafts[key] || '' : settingValue(setting);
-  const editingStageModelDraft = editingAiStage ? settingDrafts[editingAiStage.modelKey] ?? '' : '';
-  const editingStageFallbackModelValue =
-    editingAiStage && editingAiStage.modelFallbackKey
-      ? settingDraftValue(editingAiStage.modelFallbackKey, editingStageFallbackModelSetting)
-      : '';
   const promptConfigTab = {
     key: 'prompt-configs',
     label: '提示词配置',
@@ -1142,7 +1814,7 @@ export function AdminPage() {
       <div className="admin-prompt-config-tab">
         <div className="admin-setting-group-head">
           <Typography.Text strong>提示词配置</Typography.Text>
-          <Typography.Text type="secondary">查看各个 AI 阶段的输入、输出和实际提示词模板。</Typography.Text>
+          <Typography.Text type="secondary">查看各个 AI 阶段的输入、输出和实际提示词模板</Typography.Text>
         </div>
         {promptConfigs.length ? (
           <div className="admin-prompt-config-grid">
@@ -1155,7 +1827,9 @@ export function AdminPage() {
                   </div>
                   <Space size={6} wrap>
                     <Tag color="blue">{prompt.modelKey}</Tag>
-                    <Tag color="green">只读</Tag>
+                    <Tag color={prompt.overridden ? 'gold' : 'green'}>
+                      {prompt.overridden ? '云端覆盖' : '默认文件'}
+                    </Tag>
                   </Space>
                 </div>
                 <div className="admin-prompt-flow-row">
@@ -1178,10 +1852,51 @@ export function AdminPage() {
                 </Typography.Text>
                 <Input.TextArea
                   className="admin-prompt-template"
-                  readOnly
-                  value={prompt.content}
+                  value={Object.prototype.hasOwnProperty.call(promptDrafts, prompt.id) ? promptDrafts[prompt.id] : prompt.content}
+                  onChange={(event) =>
+                    setPromptDrafts((current) => ({
+                      ...current,
+                      [prompt.id]: event.target.value,
+                    }))
+                  }
                   autoSize={{ minRows: 8, maxRows: 18 }}
                 />
+                <Space size={8} wrap>
+                  <Button
+                    type="primary"
+                    size="small"
+                    loading={Boolean(savingPromptIds[prompt.id])}
+                    onClick={() => void savePromptConfig(prompt)}
+                  >
+                    保存到云数据库
+                  </Button>
+                  <Button
+                    size="small"
+                    disabled={!prompt.overridden && !Object.prototype.hasOwnProperty.call(promptDrafts, prompt.id)}
+                    onClick={() => {
+                      if (Object.prototype.hasOwnProperty.call(promptDrafts, prompt.id)) {
+                        setPromptDrafts((current) => {
+                          const next = { ...current };
+                          delete next[prompt.id];
+                          return next;
+                        });
+                        return;
+                      }
+                      void restorePromptConfig(prompt);
+                    }}
+                  >
+                    撤销编辑
+                  </Button>
+                  <Button
+                    size="small"
+                    danger
+                    loading={Boolean(savingPromptIds[prompt.id])}
+                    disabled={!prompt.overridden}
+                    onClick={() => void restorePromptConfig(prompt)}
+                  >
+                    恢复默认文件
+                  </Button>
+                </Space>
               </div>
             ))}
           </div>
@@ -1196,6 +1911,11 @@ export function AdminPage() {
     <div className="admin-page">
       <Tabs
         className="admin-tabs"
+        onChange={(key) => {
+          if (key === 'api-usage') {
+            void loadApiUsageIfNeeded();
+          }
+        }}
         items={[
           {
             key: 'users',
@@ -1209,13 +1929,13 @@ export function AdminPage() {
                     initialValues={{ role: 'user', status: 'active' }}
                     onFinish={createUser}
                   >
-                    <Form.Item label="用户名" name="username" rules={[{ required: true, message: '请输入用户名' }]}>
+                    <Form.Item label="用户名" name="username" rules={[{ required: true, message: '请输入用户名' }]}> 
                       <Input placeholder="例如 member01" />
                     </Form.Item>
                     <Form.Item label="显示名称" name="displayName">
                       <Input placeholder="例如 运营 A" />
                     </Form.Item>
-                    <Form.Item label="初始密码" name="password" rules={[{ required: true, min: 6, message: '至少 6 位' }]}>
+                    <Form.Item label="初始密码" name="password" rules={[{ required: true, min: 6, message: '至少 6 位' }]}> 
                       <Input.Password />
                     </Form.Item>
                     <Form.Item label="角色" name="role">
@@ -1233,7 +1953,7 @@ export function AdminPage() {
                         placeholder="默认归属当前管理员"
                       />
                     </Form.Item>
-                    <Form.Item label="状态" name="status">
+                    <Form.Item label="??" name="status">
                       <Select
                         options={[
                           { value: 'active', label: '启用' },
@@ -1282,7 +2002,7 @@ export function AdminPage() {
                           <span>管理员 {userTableSummary.adminCount}</span>
                           <span>成员 {userTableSummary.memberCount}</span>
                           {userTableSummary.unassignedCount ? <span>未归属 {userTableSummary.unassignedCount}</span> : null}
-                          {selectedUserRowKeys.length ? <span>已选 {selectedUserRowKeys.length}</span> : null}
+                          {selectedUserRowKeys.length ? <span>?? {selectedUserRowKeys.length}</span> : null}
                         </Space>
                         <Button
                           danger
@@ -1309,11 +2029,11 @@ export function AdminPage() {
                   className="admin-api-usage-card"
                   title="模型调用总览"
                   extra={
-                    <Button loading={loading} onClick={refreshApiUsage}>
+                    <Button loading={loadingApiUsageModels || loadingApiUsageGroups} onClick={refreshApiUsage}>
                       刷新统计
                     </Button>
                   }
-                  loading={loading}
+                  loading={loadingApiUsageModels}
                 >
                   <div className="admin-api-usage-summary">
                     <div className="admin-api-usage-chart-panel">
@@ -1421,7 +2141,80 @@ export function AdminPage() {
                   </div>
                 </Card>
 
-                <Card title="模型调用明细" className="admin-table-card" loading={loading}>
+                <Card title="渠道 Key 调用统计" className="admin-table-card admin-api-usage-key-card" loading={loadingApiUsageGroups}>
+                  <div className="admin-api-usage-filterbar">
+                    <Select
+                      aria-label="时间范围"
+                      options={[
+                        { value: 'all', label: '全部时间' },
+                        { value: '1h', label: '最近 1 小时' },
+                        { value: '24h', label: '最近 24 小时' },
+                        { value: '7d', label: '最近 7 天' },
+                      ]}
+                      value={apiUsageFilters.timeRange || 'all'}
+                      onChange={(timeRange) => setApiUsageFilters((current) => ({ ...current, timeRange }))}
+                    />
+                    <Select
+                      allowClear
+                      aria-label="渠道"
+                      options={aiGatewayChannelOptions}
+                      placeholder="全部渠道"
+                      value={apiUsageFilters.channelId || undefined}
+                      onChange={(channelId) => setApiUsageFilters((current) => ({ ...current, channelId }))}
+                    />
+                    <Select
+                      allowClear
+                      aria-label="API Key"
+                      options={apiUsageCredentialOptions}
+                      placeholder="全部 Key"
+                      value={apiUsageFilters.credentialId || undefined}
+                      onChange={(credentialId) => setApiUsageFilters((current) => ({ ...current, credentialId }))}
+                    />
+                    <Select
+                      allowClear
+                      aria-label="阶段"
+                      options={apiUsageStageOptions}
+                      placeholder="全部阶段"
+                      value={apiUsageFilters.stage || undefined}
+                      onChange={(stage) => setApiUsageFilters((current) => ({ ...current, stage }))}
+                    />
+                    <Select
+                      aria-label="状态"
+                      options={[
+                        { value: '', label: '全部状态' },
+                        { value: 'success', label: '成功' },
+                        { value: 'failed', label: '失败' },
+                      ]}
+                      value={apiUsageFilters.status || ''}
+                      onChange={(status) => setApiUsageFilters((current) => ({ ...current, status: status as AdminApiUsageFilters['status'] }))}
+                    />
+                    <Button loading={loadingApiUsageGroups} onClick={refreshApiUsage} type="primary">
+                      应用筛选
+                    </Button>
+                  </div>
+                  <Table<AdminApiUsageKeyStat>
+                    rowKey="id"
+                    columns={apiUsageKeyColumns}
+                    dataSource={apiUsage.keyStats}
+                    locale={{ emptyText: '暂无渠道 Key 调用数据' }}
+                    pagination={{ pageSize: 8, showSizeChanger: false }}
+                    scroll={{ x: 1200 }}
+                    size="middle"
+                  />
+                </Card>
+
+                <Card title="最近调用日志" className="admin-table-card" loading={loadingApiUsageGroups}>
+                  <Table<AdminApiUsageLog>
+                    rowKey="id"
+                    columns={apiUsageLogColumns}
+                    dataSource={apiUsage.recentLogs}
+                    locale={{ emptyText: '暂无最近调用日志' }}
+                    pagination={{ pageSize: 10, showSizeChanger: false }}
+                    scroll={{ x: 1180 }}
+                    size="middle"
+                  />
+                </Card>
+                <Card title="模型调用明细" className="admin-table-card" loading={loadingApiUsageModels}>
                   <Table<AdminApiUsageItem>
                     rowKey="id"
                     columns={apiUsageColumns}
@@ -1439,7 +2232,7 @@ export function AdminPage() {
                   />
                 </Card>
 
-                <Card title="团队与成员用量" className="admin-table-card admin-api-usage-group-card" loading={loading}>
+                <Card title="团队与成员用量" className="admin-table-card admin-api-usage-group-card" loading={loadingApiUsageGroups}>
                   <Tabs
                     size="small"
                     items={[
@@ -1485,12 +2278,31 @@ export function AdminPage() {
                           />
                         ),
                       },
+                      {
+                        key: 'credentials',
+                        label: 'Key 用量',
+                        children: (
+                          <Table<AdminApiUsageGroup>
+                            rowKey={(record) =>
+                              record.userId
+                                ? `${record.credentialId || 'unmarked-credential'}:${record.userId}`
+                                : record.credentialId || 'unmarked-credential'
+                            }
+                            columns={apiUsageCredentialColumns}
+                            dataSource={apiUsage.byCredential}
+                            locale={{ emptyText: '暂无 Key 用量数据' }}
+                            pagination={{ pageSize: 8, showSizeChanger: false }}
+                            size="middle"
+                          />
+                        ),
+                      },
                     ]}
                   />
                 </Card>
               </div>
             ),
           },
+          aiGatewayTab,
           {
             key: 'settings',
             label: 'API 配置',
@@ -1510,155 +2322,32 @@ export function AdminPage() {
                   tabPosition="left"
                   onChange={setActiveApiConfigTab}
                   items={[
-                    {
-                      key: 'chufan-api',
-                      label: '初凡 API',
-                      children: (
-                        <div className="admin-api-channel-tab">
-                  <section className="admin-api-channel-panel">
-                    <div className="admin-api-section-head">
-                      <div>
-                        <Typography.Text strong>初凡 API</Typography.Text>
-                        <Typography.Text type="secondary">配置初凡 AI 的 API 密钥和 OpenAI 兼容接口地址。</Typography.Text>
-                      </div>
-                      <Button loading={savingSettings} onClick={() => void saveApiChannels()}>
-                        保存初凡 API
-                      </Button>
-                    </div>
-                    <div className="admin-api-channel-grid">
-                      {apiChannels.filter((channel) => channel.id === 'chufan_ai').map((channel) => {
-                        const draft = apiChannelDrafts[channel.id] || {
-                          name: channel.name,
-                          enabled: true,
-                          baseUrl: channel.baseUrl,
-                          apiKey: '',
-                        };
-                        return (
-                          <div className="admin-api-channel-card" key={channel.id}>
-                            <div className="admin-api-channel-title">
-                              <Typography.Text strong>{channel.name}</Typography.Text>
-                            </div>
-                            <Typography.Text type="secondary">{channel.description}</Typography.Text>
-                            <Space size={6} wrap>
-                              <Tag color="green">启用</Tag>
-                              <Tag color={channel.apiKeyConfigured && !draft.clearApiKey ? 'green' : 'gold'}>
-                                {channel.apiKeyConfigured && !draft.clearApiKey ? channel.maskedApiKey || '密钥已配置' : '密钥待配置'}
-                              </Tag>
-                            </Space>
-                            <div className="admin-api-channel-fields">
-                              <label>
-                                <span>API 密钥</span>
-                                <Input.Password
-                                  placeholder={channel.apiKeyConfigured ? '输入新密钥才会替换' : '输入 API 密钥'}
-                                  value={draft.apiKey}
-                                  onChange={(event) =>
-                                    setApiChannelDrafts((current) => ({
-                                      ...current,
-                                      [channel.id]: {
-                                        ...draft,
-                                        apiKey: event.target.value,
-                                        clearApiKey: false,
-                                      },
-                                    }))
-                                  }
-                                />
-                              </label>
-                              <label>
-                                <span>接口地址</span>
-                                <Input
-                                  value={draft.baseUrl}
-                                  onChange={(event) =>
-                                    setApiChannelDrafts((current) => ({
-                                      ...current,
-                                      [channel.id]: {
-                                        ...draft,
-                                        baseUrl: event.target.value,
-                                      },
-                                    }))
-                                  }
-                                />
-                              </label>
-                            </div>
-                            <Button
-                              danger
-                              disabled={!channel.apiKeyConfigured && !draft.apiKey}
-                              size="small"
-                              onClick={() =>
-                                setApiChannelDrafts((current) => ({
-                                  ...current,
-                                  [channel.id]: {
-                                    ...draft,
-                                    apiKey: '',
-                                    clearApiKey: true,
-                                  },
-                                }))
-                              }
-                            >
-                              清除 Key
-                            </Button>
-                          </div>
-                        );
-                      })}
-                    </div>
-                          </section>
-                        </div>
-                      ),
-                    },
                     promptConfigTab,
                     ...settingGroups.map(([category, groupSettings]) => ({
                     key: category,
                     label: categoryLabel(category),
                     children: (
                       <div className="admin-settings-list">
-                        <div className="admin-setting-group-head">
-                          <Typography.Text strong>{categoryLabel(category)}</Typography.Text>
-                          <Typography.Text type="secondary">{categoryDescription(category)}</Typography.Text>
-                        </div>
-                        {category === 'ai' ? (
-                          <div className="admin-model-stage-grid">
-                            {AI_STAGE_CONFIGS.map((stage) => {
-                              const settingMap = new Map(groupSettings.map((setting) => [setting.key, setting]));
-                              const modelSetting = settingMap.get(stage.modelKey);
-                              const fallbackSetting = stage.modelFallbackKey
-                                ? settingMap.get(stage.modelFallbackKey)
-                                : undefined;
-                              const hasModelFallback = Boolean(stage.modelFallbackKey);
-                              const storedStageModelValue = settingValue(modelSetting);
-                              const modelDraft = settingDraftValue(stage.modelKey, modelSetting);
-                              const fallbackModelValue = stage.modelFallbackKey
-                                ? settingDraftValue(stage.modelFallbackKey, fallbackSetting)
-                                : '';
-                              const hasStoredStageModel =
-                                Boolean(storedStageModelValue) && modelSetting?.source !== 'default';
-                              const hasEditedStageModel =
-                                Object.prototype.hasOwnProperty.call(settingDrafts, stage.modelKey) &&
-                                modelDraft !== storedStageModelValue;
-                              const hasStageModel = hasModelFallback
-                                ? Boolean(modelDraft) && (hasStoredStageModel || hasEditedStageModel)
-                                : Boolean(modelDraft);
-                              const modelValue = (hasStageModel ? modelDraft : fallbackModelValue) || '未配置';
-                              const modelTagColor = hasStageModel ? 'blue' : fallbackModelValue ? 'gold' : 'default';
+                        {category === 'database' ? (
+                          <div className="admin-db-pool-presets">
+                            {Object.entries(DATABASE_POOL_PRESETS).map(([presetKey, preset]) => {
+                              const typedPresetKey = presetKey as DatabasePoolPresetKey;
+                              const active = settingDrafts.DB_POOL_MODE === preset.values.DB_POOL_MODE;
                               return (
-                                <div className="admin-model-stage-card" key={stage.modelKey}>
-                                  <div className="admin-model-stage-title">
-                                    <Typography.Text strong>{stage.title}</Typography.Text>
-                                    <Typography.Text type="secondary">{stage.description}</Typography.Text>
-                                  </div>
-                                  <div className="admin-model-stage-summary">
-                                    <div className="admin-model-stage-model">
-                                      <span>当前模型</span>
-                                      <Tag color={modelTagColor}>{modelValue}</Tag>
-                                    </div>
-                                    <Button size="small" onClick={() => setEditingAiStageKey(stage.modelKey)}>
-                                      编辑模型
-                                    </Button>
-                                  </div>
-                                </div>
+                                <Button
+                                  key={presetKey}
+                                  type={active ? 'primary' : 'default'}
+                                  loading={savingDatabasePoolPreset === typedPresetKey}
+                                  onClick={() => void applyDatabasePoolPreset(typedPresetKey)}
+                                >
+                                  <span>{preset.label}</span>
+                                  <small>{preset.description}</small>
+                                </Button>
                               );
                             })}
                           </div>
                         ) : null}
-                        {(category === 'ai' ? [] : groupSettings).map((setting) => {
+                        {groupSettings.map((setting) => {
                           const settingSecretEditing = Boolean(secretEditingKeys[setting.key]);
                           const settingSecretDraft = settingDrafts[setting.key] ?? '';
                           const settingSecretDisplay = setting.maskedValue || '';
@@ -1718,7 +2407,8 @@ export function AdminPage() {
                         })}
                       </div>
                     ),
-                  }))]}
+                    })),
+                  ]}
                 />
               </Card>
             ),
@@ -1727,173 +2417,495 @@ export function AdminPage() {
       />
 
       <Modal
-        title={editingAiStage ? `${editingAiStage.title}模型配置` : '模型配置'}
-        open={Boolean(editingAiStage)}
-        okText="保存模型"
+        title={aiGatewayEditor.channel?.id ? '编辑渠道' : '新增渠道'}
+        open={Boolean(aiGatewayEditor.channel)}
+        okText="保存渠道"
         cancelText="关闭"
-        confirmLoading={savingSettings}
-        onOk={async () => {
-          await saveSettings();
-          setEditingAiStageKey(null);
-        }}
-        onCancel={() => setEditingAiStageKey(null)}
+        confirmLoading={savingAiGateway}
+        onOk={() => void saveAiGatewayChannelEditor()}
+        onCancel={() => setAiGatewayEditor({})}
+        width={760}
       >
-        {editingAiStage ? (
-          <div className="admin-stage-config-modal">
-            <div className="admin-stage-config-head">
-              <Typography.Text type="secondary">{editingAiStage.description}</Typography.Text>
-            </div>
-            <label className="admin-stage-config-field">
-              <span>模型名称</span>
+        {aiGatewayEditor.channel ? (
+          <div className="admin-ai-gateway-form">
+            <label>
+              <span>渠道名称</span>
               <Input
-                placeholder={editingStageFallbackModelValue || 'gpt-5.5'}
-                value={editingStageModelDraft}
+                value={aiGatewayEditor.channel.name}
                 onChange={(event) =>
-                  setSettingDrafts((current) => ({
+                  setAiGatewayEditor((current) => ({
                     ...current,
-                    [editingAiStage.modelKey]: event.target.value,
+                    channel: { ...current.channel, name: event.target.value },
                   }))
                 }
               />
             </label>
+            <label>
+              <span>接口地址</span>
+              <Input
+                placeholder="https://example.com/v1"
+                value={aiGatewayEditor.channel.baseUrl}
+                onChange={(event) =>
+                  setAiGatewayEditor((current) => ({
+                    ...current,
+                    channel: { ...current.channel, baseUrl: event.target.value },
+                  }))
+                }
+              />
+            </label>
+            <div className="admin-ai-gateway-form-grid">
+              <label>
+                <span>Provider 类型</span>
+                <Select
+                  value={aiGatewayEditor.channel.providerType || 'openai_compatible'}
+                  options={[{ value: 'openai_compatible', label: 'OpenAI 兼容' }]}
+                  onChange={(value) =>
+                    setAiGatewayEditor((current) => ({
+                      ...current,
+                      channel: { ...current.channel, providerType: value },
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>能力</span>
+                <Select
+                  mode="multiple"
+                  value={aiGatewayEditor.channel.capabilities || ['chat']}
+                  options={[
+                    { value: 'chat', label: '文本/视觉理解' },
+                    { value: 'image', label: '图片生成' },
+                  ]}
+                  onChange={(value) =>
+                    setAiGatewayEditor((current) => ({
+                      ...current,
+                      channel: { ...current.channel, capabilities: value },
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>文本模型</span>
+                <Input
+                  value={aiGatewayEditor.channel.textModel}
+                  onChange={(event) =>
+                    setAiGatewayEditor((current) => ({
+                      ...current,
+                      channel: { ...current.channel, textModel: event.target.value },
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>图片模型</span>
+                <Input
+                  value={aiGatewayEditor.channel.imageModel}
+                  onChange={(event) =>
+                    setAiGatewayEditor((current) => ({
+                      ...current,
+                      channel: { ...current.channel, imageModel: event.target.value },
+                    }))
+                  }
+                />
+              </label>
+              <div className="admin-ai-gateway-template-grid">
+                <div className="admin-ai-gateway-template-title">
+                  <Typography.Text strong>阶段模型模板</Typography.Text>
+                  <Typography.Text type="secondary">留空时使用上面的默认文本/图片模型</Typography.Text>
+                </div>
+                {aiGateway.routes.map((route) => (
+                  <label key={route.stage}>
+                    <span>{route.title}</span>
+                    <Input
+                      placeholder={
+                        route.modelType === 'image'
+                          ? aiGatewayEditor.channel?.imageModel
+                          : aiGatewayEditor.channel?.textModel
+                      }
+                      value={(aiGatewayEditor.channel?.modelTemplates || {})[route.stage] || ''}
+                      onChange={(event) =>
+                        setAiGatewayEditor((current) => {
+                          const templates = { ...(current.channel?.modelTemplates || {}) };
+                          const nextValue = event.target.value.trim();
+                          if (nextValue) {
+                            templates[route.stage] = nextValue;
+                          } else {
+                            delete templates[route.stage];
+                          }
+                          return {
+                            ...current,
+                            channel: { ...current.channel, modelTemplates: templates },
+                          };
+                        })
+                      }
+                    />
+                  </label>
+                ))}
+              </div>
+              <label>
+                <span>优先级</span>
+                <InputNumber
+                  min={1}
+                  value={aiGatewayEditor.channel.priority}
+                  onChange={(value) =>
+                    setAiGatewayEditor((current) => ({
+                      ...current,
+                      channel: { ...current.channel, priority: Number(value || 100) },
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>启用</span>
+                <Switch
+                  checked={aiGatewayEditor.channel.enabled !== false}
+                  onChange={(enabled) =>
+                    setAiGatewayEditor((current) => ({
+                      ...current,
+                      channel: { ...current.channel, enabled },
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>连接超时秒</span>
+                <InputNumber
+                  min={1}
+                  value={aiGatewayEditor.channel.connectTimeoutSeconds}
+                  onChange={(value) =>
+                    setAiGatewayEditor((current) => ({
+                      ...current,
+                      channel: { ...current.channel, connectTimeoutSeconds: Number(value || 10) },
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>读取超时秒</span>
+                <InputNumber
+                  min={1}
+                  value={aiGatewayEditor.channel.readTimeoutSeconds}
+                  onChange={(value) =>
+                    setAiGatewayEditor((current) => ({
+                      ...current,
+                      channel: { ...current.channel, readTimeoutSeconds: Number(value || 60) },
+                    }))
+                  }
+                />
+              </label>
+            </div>
           </div>
         ) : null}
       </Modal>
 
       <Modal
-        title={`成员 API 配置：${memberCredentialState.user?.displayName || memberCredentialState.user?.username || ''}`}
-        open={Boolean(memberCredentialState.user)}
-        okText="保存成员配置"
+        title={aiGatewayEditor.credential?.id ? '编辑 Key' : '新增 Key'}
+        open={Boolean(aiGatewayEditor.credential)}
+        okText="保存 Key"
         cancelText="关闭"
-        width={980}
-        confirmLoading={memberCredentialState.saving}
-        onOk={() => void saveMemberApiCredentials()}
-        onCancel={() => setMemberCredentialState({ credentials: [], drafts: {}, loading: false, saving: false })}
+        confirmLoading={savingAiGateway}
+        onOk={() => void saveAiGatewayCredentialEditor()}
+        onCancel={() => setAiGatewayEditor({})}
+        width={760}
       >
-        <div className="admin-api-member-credentials">
-          <Typography.Text type="secondary">
-            管理员代管成员 API 密钥。成员调用 AI 时优先使用这里启用的渠道，成员本人不可修改密钥。
-          </Typography.Text>
-          {memberCredentialState.loading ? (
-            <Card loading />
-          ) : (
-            <div className="admin-api-channel-grid">
-              {memberCredentialState.credentials.map((credential) => {
-                const draft = memberCredentialState.drafts[credential.channelId] || {
-                  enabled: credential.enabled,
-                  apiKey: '',
-                  baseUrl: credential.baseUrl,
-                };
-                return (
-                  <div className="admin-api-channel-card" key={credential.channelId}>
-                    <div className="admin-api-channel-title">
-                      <Typography.Text strong>{credential.name}</Typography.Text>
-                      <Switch
-                        checked={draft.enabled}
-                        onChange={(enabled) =>
-                          setMemberCredentialState((current) => {
-                            const nextDrafts = Object.fromEntries(
-                              Object.entries(current.drafts).map(([channelId, value]) => [
-                                channelId,
-                                {
-                                  ...value,
-                                  enabled: enabled ? channelId === credential.channelId : false,
-                                },
-                              ]),
-                            );
-                            return {
-                              ...current,
-                              drafts: {
-                                ...nextDrafts,
-                                [credential.channelId]: {
-                                  ...draft,
-                                  enabled,
-                                },
-                              },
-                            };
-                          })
-                        }
-                      />
-                    </div>
-                    <Typography.Text type="secondary">{credential.description}</Typography.Text>
-                    <Space size={6} wrap>
-                      <Tag color={draft.enabled ? 'green' : 'default'}>{draft.enabled ? '启用' : '停用'}</Tag>
-                      <Tag color={credential.apiKeyConfigured && !draft.clearApiKey ? 'green' : 'gold'}>
-                        {credential.apiKeyConfigured && !draft.clearApiKey
-                          ? credential.maskedApiKey || '密钥已配置'
-                          : '密钥待配置'}
-                      </Tag>
-                    </Space>
-                    <div className="admin-api-channel-fields">
-                      <label>
-                        <span>API 密钥</span>
-                        <Input.Password
-                          placeholder={credential.apiKeyConfigured ? '输入新密钥才会替换' : '输入 API 密钥'}
-                          value={draft.apiKey}
-                          onChange={(event) =>
-                            setMemberCredentialState((current) => ({
-                              ...current,
-                              drafts: {
-                                ...current.drafts,
-                                [credential.channelId]: {
-                                  ...draft,
-                                  apiKey: event.target.value,
-                                  clearApiKey: false,
-                                },
-                              },
-                            }))
-                          }
-                        />
-                      </label>
-                      <label>
-                        <span>接口地址</span>
-                        <Input
-                          value={draft.baseUrl}
-                          onChange={(event) =>
-                            setMemberCredentialState((current) => ({
-                              ...current,
-                              drafts: {
-                                ...current.drafts,
-                                [credential.channelId]: {
-                                  ...draft,
-                                  baseUrl: event.target.value,
-                                },
-                              },
-                            }))
-                          }
-                        />
-                      </label>
-                    </div>
-                    <Button
-                      danger
-                      disabled={!credential.apiKeyConfigured && !draft.apiKey}
-                      size="small"
-                      onClick={() =>
-                        setMemberCredentialState((current) => ({
-                          ...current,
-                          drafts: {
-                            ...current.drafts,
-                            [credential.channelId]: {
-                              ...draft,
-                              apiKey: '',
-                              clearApiKey: true,
-                            },
-                          },
-                        }))
-                      }
-                    >
-                      清除 Key
-                    </Button>
-                  </div>
-                );
-              })}
+        {aiGatewayEditor.credential ? (
+          <div className="admin-ai-gateway-form">
+            <div className="admin-ai-gateway-form-grid">
+              <label>
+                <span>所属渠道</span>
+                <Select
+                  value={aiGatewayEditor.credential.channelId}
+                  options={aiGatewayChannelOptions}
+                  onChange={(value) =>
+                    setAiGatewayEditor((current) => ({
+                      ...current,
+                      credential: { ...current.credential, channelId: value },
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>Key 名称</span>
+                <Input
+                  value={aiGatewayEditor.credential.name}
+                  onChange={(event) =>
+                    setAiGatewayEditor((current) => ({
+                      ...current,
+                      credential: { ...current.credential, name: event.target.value },
+                    }))
+                  }
+                />
+              </label>
             </div>
-          )}
-        </div>
+            <label>
+              <span>API Key</span>
+              <Input.Password
+                placeholder={aiGatewayEditor.credential.id ? '输入新 Key 才会替换' : '输入 API Key'}
+                value={aiGatewayEditor.credential.apiKey}
+                onChange={(event) =>
+                  setAiGatewayEditor((current) => ({
+                    ...current,
+                    credential: { ...current.credential, apiKey: event.target.value, clearApiKey: false },
+                  }))
+                }
+              />
+            </label>
+            <div className="admin-ai-gateway-form-grid">
+              <label>
+                <span>启用</span>
+                <Switch
+                  checked={aiGatewayEditor.credential.enabled !== false}
+                  onChange={(enabled) =>
+                    setAiGatewayEditor((current) => ({
+                      ...current,
+                      credential: { ...current.credential, enabled },
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>优先级</span>
+                <InputNumber
+                  min={1}
+                  value={aiGatewayEditor.credential.priority}
+                  onChange={(value) =>
+                    setAiGatewayEditor((current) => ({
+                      ...current,
+                      credential: { ...current.credential, priority: Number(value || 100) },
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>权重</span>
+                <InputNumber
+                  min={1}
+                  value={aiGatewayEditor.credential.weight}
+                  onChange={(value) =>
+                    setAiGatewayEditor((current) => ({
+                      ...current,
+                      credential: { ...current.credential, weight: Number(value || 1) },
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>最大并发</span>
+                <InputNumber
+                  min={0}
+                  value={aiGatewayEditor.credential.maxConcurrency}
+                  onChange={(value) =>
+                    setAiGatewayEditor((current) => ({
+                      ...current,
+                      credential: { ...current.credential, maxConcurrency: Number(value || 0) },
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>RPM 限制</span>
+                <InputNumber
+                  min={0}
+                  value={aiGatewayEditor.credential.rpmLimit}
+                  onChange={(value) =>
+                    setAiGatewayEditor((current) => ({
+                      ...current,
+                      credential: { ...current.credential, rpmLimit: Number(value || 0) },
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>每日限制</span>
+                <InputNumber
+                  min={0}
+                  value={aiGatewayEditor.credential.dailyLimit}
+                  onChange={(value) =>
+                    setAiGatewayEditor((current) => ({
+                      ...current,
+                      credential: { ...current.credential, dailyLimit: Number(value || 0) },
+                    }))
+                  }
+                />
+              </label>
+            </div>
+          </div>
+        ) : null}
       </Modal>
 
       <Modal
-        title={`用量额度：${usageLimitState.user?.displayName || usageLimitState.user?.username || ''}`}
+        title={activeKeyManagerChannel ? `?? Key ${activeKeyManagerChannel.name}` : '?? Key'}
+        open={Boolean(aiGatewayEditor.keyManagerChannel)}
+        footer={
+          <Space>
+            <Button onClick={() => setAiGatewayEditor({})}>关闭</Button>
+            {activeKeyManagerChannel ? (
+              <Button
+                type="primary"
+                onClick={() =>
+                  setAiGatewayEditor({
+                    credential: {
+                      channelId: activeKeyManagerChannel.id,
+                      name: '',
+                      enabled: true,
+                      priority: 100,
+                      weight: 1,
+                      maxConcurrency: 2,
+                    },
+                    keyManagerChannel: activeKeyManagerChannel,
+                  })
+                }
+              >
+                新增 Key
+              </Button>
+            ) : null}
+          </Space>
+        }
+        onCancel={() => setAiGatewayEditor({})}
+        width={980}
+      >
+        {activeKeyManagerChannel ? (
+          <div className="admin-ai-gateway-key-manager">
+            <div className="admin-ai-gateway-key-manager-head">
+              <Space size={6} wrap>
+                <Tag>{activeKeyManagerChannel.providerType}</Tag>
+                {activeKeyManagerChannel.capabilities.map((capability) => (
+                  <Tag color={capability === 'image' ? 'purple' : 'blue'} key={capability}>
+                    {capability}
+                  </Tag>
+                ))}
+              </Space>
+              <Typography.Text type="secondary">{activeKeyManagerChannel.baseUrl || '未配置接口地址'}</Typography.Text>
+            </div>
+            <Table<AiGatewayCredential>
+              rowKey="id"
+              columns={aiGatewayCredentialColumns}
+              dataSource={activeKeyManagerChannel.credentials}
+              locale={{ emptyText: '还没有 Key，点击右下角新增 Key' }}
+              pagination={false}
+              size="middle"
+            />
+          </div>
+        ) : null}
+      </Modal>
+
+      <Modal
+        title={aiGatewayEditor.route ? `路由策略 ${aiGatewayEditor.route.title}` : '路由策略'}
+        open={Boolean(aiGatewayEditor.route)}
+        okText="保存路由"
+        cancelText="关闭"
+        confirmLoading={savingAiGateway}
+        onOk={() => void saveAiGatewayRouteEditor()}
+        onCancel={() => setAiGatewayEditor({})}
+      >
+        {aiGatewayEditor.route ? (
+          <div className="admin-ai-gateway-form">
+            <label>
+              <span>候选渠道顺序</span>
+              <Select
+                mode="multiple"
+                value={aiGatewayEditor.route.channelOrder}
+                options={aiGatewayChannelOptions}
+                placeholder="不选择时按渠道优先级自动选择"
+                onChange={(value) =>
+                  setAiGatewayEditor((current) => ({
+                    ...current,
+                    route: current.route ? { ...current.route, channelOrder: value } : undefined,
+                  }))
+                }
+              />
+            </label>
+            <div className="admin-ai-gateway-form-grid">
+              <label>
+                <span>Key 选择策略</span>
+                <Select
+                  value={aiGatewayEditor.route.keySelectionPolicy}
+                  options={[{ value: 'least_in_flight_weighted', label: '最少并发 + 权重' }]}
+                  onChange={(value) =>
+                    setAiGatewayEditor((current) => ({
+                      ...current,
+                      route: current.route ? { ...current.route, keySelectionPolicy: value } : undefined,
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>最多尝试渠道</span>
+                <InputNumber
+                  min={1}
+                  value={aiGatewayEditor.route.maxChannelAttempts}
+                  onChange={(value) =>
+                    setAiGatewayEditor((current) => ({
+                      ...current,
+                      route: current.route ? { ...current.route, maxChannelAttempts: Number(value || 1) } : undefined,
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>跨渠道兜底</span>
+                <Switch
+                  checked={aiGatewayEditor.route.allowCrossChannelFallback}
+                  onChange={(allowCrossChannelFallback) =>
+                    setAiGatewayEditor((current) => ({
+                      ...current,
+                      route: current.route ? { ...current.route, allowCrossChannelFallback } : undefined,
+                    }))
+                  }
+                />
+              </label>
+              <label>
+                <span>启用</span>
+                <Switch
+                  checked={aiGatewayEditor.route.enabled}
+                  onChange={(enabled) =>
+                    setAiGatewayEditor((current) => ({
+                      ...current,
+                      route: current.route ? { ...current.route, enabled } : undefined,
+                    }))
+                  }
+                />
+              </label>
+            </div>
+          </div>
+        ) : null}
+      </Modal>
+
+      <Modal
+        title="路由干跑结果"
+        open={Boolean(aiGatewayEditor.dryRun)}
+        footer={<Button onClick={() => setAiGatewayEditor({})}>关闭</Button>}
+        onCancel={() => setAiGatewayEditor({})}
+      >
+        {aiGatewayEditor.dryRun ? (
+          <div className="admin-ai-gateway-dry-run">
+            <Space direction="vertical" size={8}>
+              <Typography.Text strong>
+                {aiGatewayEditor.dryRun.selected
+                  ? `将使用 ${aiGatewayEditor.dryRun.selected.channel.name} / ${aiGatewayEditor.dryRun.selected.credential.name}`
+                  : '当前没有可用渠道'}
+              </Typography.Text>
+              {aiGatewayEditor.dryRun.selected ? (
+                <Tag color="blue">模型 {aiGatewayEditor.dryRun.selected.model || '未配置'}</Tag>
+              ) : null}
+            </Space>
+            <div className="admin-ai-gateway-dry-run-list">
+              {aiGatewayEditor.dryRun.attempts.map((attempt, index) => (
+                <div className="admin-ai-gateway-dry-run-item" key={`${attempt.channelId}-${index}`}>
+                  <Tag color={attempt.status === 'selected' ? 'green' : 'default'}>
+                    {attempt.status === 'selected' ? '选中' : '跳过'}
+                  </Tag>
+                  <Typography.Text>{attempt.channelName || attempt.channelId}</Typography.Text>
+                  <Typography.Text type="secondary">{attempt.reason}</Typography.Text>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
+      </Modal>
+
+      <Modal
+        title={`用量额度 ${usageLimitState.user?.displayName || usageLimitState.user?.username || ''}`}
         open={Boolean(usageLimitState.user)}
         okText="保存额度"
         cancelText="关闭"
@@ -1941,7 +2953,7 @@ export function AdminPage() {
       </Modal>
 
       <Modal
-        title={`重置密码：${passwordReset.user?.username || ''}`}
+        title={`重置密码 ${passwordReset.user?.username || ''}`}
         open={Boolean(passwordReset.user)}
         okText="确认重置"
         cancelText="取消"
@@ -1957,3 +2969,5 @@ export function AdminPage() {
     </div>
   );
 }
+
+

@@ -14,12 +14,27 @@ from app.modules.visual_generation.clients import (
     get_ai_stage_settings,
     image_file_to_data_url,
     image_file_to_upload,
+    parse_json_from_text,
     request_generated_image,
     request_json,
 )
 
 
 class VisualGenerationClientImageTest(unittest.TestCase):
+    def test_parse_json_from_text_uses_first_complete_object_when_model_appends_extra_json(self):
+        text = '{"productUnderstanding": {"title": "bun toy"}}\n{"notes": "extra model commentary"}'
+
+        result = parse_json_from_text(text)
+
+        self.assertEqual(result, {"productUnderstanding": {"title": "bun toy"}})
+
+    def test_parse_json_from_text_handles_fenced_json_with_trailing_text(self):
+        text = '```json\n{"visualTaskPlan": {"modules": []}}\n```\nThe plan is ready.'
+
+        result = parse_json_from_text(text)
+
+        self.assertEqual(result, {"visualTaskPlan": {"modules": []}})
+
     def test_member_without_api_key_does_not_inherit_admin_channel_key(self):
         with patch("app.modules.visual_generation.clients.get_enabled_user_api_credential", return_value=None):
             with patch("app.modules.visual_generation.clients.get_user_role", return_value="user"):
@@ -117,6 +132,43 @@ class VisualGenerationClientImageTest(unittest.TestCase):
 
         self.assertEqual(image_bytes, b"image-bytes")
         self.assertEqual(captured["timeout"], 900)
+
+    def test_generated_image_polls_async_image_task_until_image_ready(self):
+        responses = [
+            {
+                "id": "sync-edit-123",
+                "object": "image.task",
+                "status": "pending",
+                "poll_url": "/api/image-tasks?ids=sync-edit-123",
+                "message": "Image task accepted.",
+            },
+            {"status": "completed", "data": [{"b64_json": base64.b64encode(b"ready-image").decode("ascii")}]},
+        ]
+        poll_urls: list[str] = []
+
+        def fake_request_json(*_args, **_kwargs):
+            return responses.pop(0)
+
+        def fake_request_image_task_status(poll_url, *_args, **_kwargs):
+            poll_urls.append(poll_url)
+            return responses.pop(0)
+
+        with patch("app.modules.visual_generation.clients.request_json", side_effect=fake_request_json):
+            with patch(
+                "app.modules.visual_generation.clients.request_image_task_status",
+                side_effect=fake_request_image_task_status,
+            ):
+                with patch("app.modules.visual_generation.clients.time.sleep"):
+                    image_bytes = request_generated_image(
+                        api_url="https://api.aicoming.top/v1/images/generations",
+                        api_key="sk-test",
+                        model="gpt-image-2-1k",
+                        size="",
+                        prompt="test prompt",
+                    )
+
+        self.assertEqual(image_bytes, b"ready-image")
+        self.assertEqual(poll_urls, ["https://api.aicoming.top/api/image-tasks?ids=sync-edit-123"])
 
     def test_image_edits_uploads_multiple_reference_images(self):
         captured: dict[str, object] = {}

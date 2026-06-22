@@ -1,4 +1,4 @@
-import {
+﻿import {
   Alert,
   Button,
   Card,
@@ -31,7 +31,7 @@ import {
   SyncOutlined,
   WarningOutlined,
 } from '@ant-design/icons';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Key } from 'react';
 import type { SortOrder } from 'antd/es/table/interface';
 import {
@@ -41,6 +41,7 @@ import {
   deleteDianxiaomiExportTask,
   createVisualGenerationTask,
   deleteVisualGenerationTask,
+  deleteVisualGenerationTasks,
   deleteProduct as deleteBackendProduct,
   deleteLinkListRecord,
   downloadDianxiaomiExportTask,
@@ -139,7 +140,21 @@ type VisualQueueItem = {
   statusColor: string;
   backendTaskId?: string;
   backendStatus?: string;
+  progressState?: string | null;
+  activeCredentialName?: string | null;
+  activeCredentialId?: string | null;
+  activeModel?: string | null;
+  timeoutSeconds?: number | string | null;
+  switchingErrorType?: string | null;
+  lastSwitchCredentialName?: string | null;
+  lastSwitchCredentialId?: string | null;
+  lastSwitchModel?: string | null;
+  lastSwitchErrorType?: string | null;
+  lastSwitchError?: string | null;
   errorMessage?: string;
+  retryCount?: number | null;
+  nextRetryAt?: number | string | null;
+  retryErrorMessage?: string | null;
   analysis?: Record<string, unknown>;
   promptText?: string;
   motherImageUrl?: string;
@@ -242,6 +257,14 @@ function formatRecordTime(value: string) {
     : cleanValue;
   const date = new Date(normalizedValue);
   if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString('zh-CN', { hour12: false });
+}
+
+function formatRetryTime(value?: number | string | null) {
+  if (value === undefined || value === null || value === '') return '';
+  const numericValue = typeof value === 'number' ? value : Number(value);
+  const date = Number.isFinite(numericValue) ? new Date(numericValue * 1000) : new Date(String(value));
+  if (Number.isNaN(date.getTime())) return '';
   return date.toLocaleString('zh-CN', { hour12: false });
 }
 
@@ -2272,12 +2295,16 @@ function getVisualPublishModeFromApiMode(mode?: string): VisualPublishMode {
 }
 
 function getVisualQueueStatusFromBackend(task: VisualGenerationTask, completedCount: number) {
-  if (task.status === 'failed') return { label: '\u6267\u884c\u5931\u8d25', color: 'red' };
+  if (task.progressState === 'switching_key') return { label: '本 key 超时，正在切换 key', color: 'gold' };
+  if (task.progressState === 'waiting_upstream') return { label: '等待第三方响应', color: 'blue' };
+  if (task.status === 'failed') return { label: '最终失败', color: 'red' };
   if (task.status === 'completed' || task.status === 'split') {
     return { label: completedCount > 0 ? '\u5df2\u56de\u5199' : '\u5df2\u5b8c\u6210', color: completedCount > 0 ? 'green' : 'gold' };
   }
+  if (task.status === 'retry_waiting') return { label: '本次调用失败，等待重试', color: 'gold' };
   if (task.status === 'queued' || task.status === 'draft') return { label: '\u6392\u961f\u4e2d', color: 'blue' };
-  if (task.status === 'running' || task.status === 'planned') return { label: '\u540e\u53f0\u6267\u884c\u4e2d', color: 'processing' };
+  if (task.status === 'planned') return { label: '\u5df2\u89c4\u5212', color: 'geekblue' };
+  if (task.status === 'running') return { label: '后台执行中', color: 'blue' };
   return { label: '\u5f85\u6267\u884c', color: 'blue' };
 }
 
@@ -2329,6 +2356,17 @@ function createVisualQueueItemFromBackendTask(
     id: embeddedRecord.visualQueueMeta.queueItemId || `queue-${task.id}`,
     backendTaskId: task.id,
     backendStatus: task.status,
+    progressState: task.progressState,
+    activeCredentialName: task.activeCredentialName || undefined,
+    activeCredentialId: task.activeCredentialId || undefined,
+    activeModel: task.activeModel || undefined,
+    timeoutSeconds: task.timeoutSeconds ?? undefined,
+    switchingErrorType: task.switchingErrorType || undefined,
+    lastSwitchCredentialName: task.lastSwitchCredentialName || undefined,
+    lastSwitchCredentialId: task.lastSwitchCredentialId || undefined,
+    lastSwitchModel: task.lastSwitchModel || undefined,
+    lastSwitchErrorType: task.lastSwitchErrorType || undefined,
+    lastSwitchError: task.lastSwitchError || undefined,
     createdAt: task.createdAt || baseItem.createdAt,
     completedCount,
     statusLabel: statusMeta.label,
@@ -2339,6 +2377,9 @@ function createVisualQueueItemFromBackendTask(
     motherImagePath: task.motherImagePath || undefined,
     manifest: task.manifest,
     errorMessage: task.errorMessage || undefined,
+    retryCount: task.retryCount ?? undefined,
+    nextRetryAt: task.nextRetryAt ?? undefined,
+    retryErrorMessage: task.retryErrorMessage || undefined,
     modules: baseItem.modules.map((module, index) => {
       const backendModule = modulesByPanel.get(index + 1);
       const resultUrl = backendModule ? getVisualTaskResultUrl(backendModule) : undefined;
@@ -2360,6 +2401,11 @@ function isRemoteImageUrl(url?: string) {
 }
 
 function getVisualQueueProgress(item: VisualQueueItem) {
+  const backendStatus = String(item.backendStatus || '').toLowerCase();
+  if (backendStatus === 'failed' || item.statusColor === 'red') return 100;
+  if (backendStatus === 'completed' || backendStatus === 'split') return 100;
+  if (backendStatus === 'retry_waiting') return item.promptText ? 58 : 24;
+  if (backendStatus === 'queued' || backendStatus === 'draft') return 18;
   if (item.completedCount > 0) {
     const total = Math.max(1, item.moduleCount || item.requestedCount || item.completedCount);
     return Math.min(100, Math.max(80, Math.round(78 + (item.completedCount / total) * 22)));
@@ -2369,6 +2415,45 @@ function getVisualQueueProgress(item: VisualQueueItem) {
   if (hasVisualDetail(item.analysis)) return 42;
   if (item.backendTaskId) return 24;
   return 8;
+}
+
+function getVisualQueueFailureNotice(item: VisualQueueItem) {
+  const backendStatus = String(item.backendStatus || '').toLowerCase();
+  const errorMessage = item.retryErrorMessage || item.errorMessage;
+  if (item.progressState === 'switching_key' || item.lastSwitchError) {
+    const keyLabel =
+      item.progressState === 'switching_key'
+        ? item.activeCredentialName || item.activeCredentialId || '当前 key'
+        : item.lastSwitchCredentialName || item.lastSwitchCredentialId || '上一 key';
+    return {
+      tone: 'warning' as const,
+      title: '本 key 超时，正在切换 key',
+      detail: item.lastSwitchError || errorMessage,
+      meta: `${keyLabel}${item.lastSwitchModel || item.activeModel ? ` · ${item.lastSwitchModel || item.activeModel}` : ''}`,
+    };
+  }
+  if (backendStatus === 'retry_waiting') {
+    const retryTime = formatRetryTime(item.nextRetryAt);
+    const retryMeta = [
+      item.retryCount ? `第 ${item.retryCount} 次重试` : '',
+      retryTime ? `下次重试 ${retryTime}` : '',
+    ].filter(Boolean);
+    return {
+      tone: 'warning' as const,
+      title: '本次调用失败，正在等待重试',
+      detail: errorMessage,
+      meta: retryMeta.join(' · '),
+    };
+  }
+  if (backendStatus === 'failed' || item.statusColor === 'red') {
+    return {
+      tone: 'error' as const,
+      title: '最终失败',
+      detail: errorMessage,
+      meta: '',
+    };
+  }
+  return undefined;
 }
 
 function isVisualQueueItemCompleted(item: VisualQueueItem) {
@@ -2794,6 +2879,22 @@ function waitForMs(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+class VisualTaskStillActiveError extends Error {
+  task: VisualGenerationTask;
+
+  constructor(task: VisualGenerationTask) {
+    const retryTime = task.nextRetryAt ? formatRetryTime(task.nextRetryAt) : '';
+    const retryReason = task.retryErrorMessage || task.errorMessage || '第三方 API 暂时不可用';
+    const message =
+      task.status === 'retry_waiting'
+        ? `本次调用失败，正在等待重试：${retryReason}${retryTime ? `，下次重试 ${retryTime}` : ''}`
+        : '生图任务仍在后台执行，请稍后打开任务队列查看';
+    super(message);
+    this.name = 'VisualTaskStillActiveError';
+    this.task = task;
+  }
+}
+
 async function waitForVisualGenerationTask(
   taskId: string,
   maxAttempts = 180,
@@ -2809,6 +2910,9 @@ async function waitForVisualGenerationTask(
       throw new Error(task.errorMessage || '生图任务执行失败');
     }
     await waitForMs(3000);
+  }
+  if (lastTask && ACTIVE_VISUAL_BACKEND_STATUSES.has(String(lastTask.status || '').toLowerCase())) {
+    throw new VisualTaskStillActiveError(lastTask);
   }
   throw new Error(lastTask?.errorMessage || '生图任务仍在执行，请稍后打开任务队列查看');
 }
@@ -2895,6 +2999,8 @@ function LinkListPanel({
   const [activeVisualQueueItemId, setActiveVisualQueueItemId] = useState<string>();
   const [expandedVisualQueueItemIds, setExpandedVisualQueueItemIds] = useState<string[]>([]);
   const [visualWorkflowStageByItemId, setVisualWorkflowStageByItemId] = useState<Record<string, number>>({});
+  const pendingVisualQueueDeleteIdsRef = useRef(new Set<string>());
+  const retryWarningShownTaskIdsRef = useRef(new Set<string>());
   const [exportQueueTasks, setExportQueueTasks] = useState<DianxiaomiExportTask[]>([]);
   const [visualQueueFilter, setVisualQueueFilter] = useState<QueueTaskFilter>('all');
   const exportQueuePendingCount = useMemo(
@@ -3164,7 +3270,8 @@ function LinkListPanel({
     const tasks = await fetchVisualGenerationTasks();
     const restoredItems = tasks
       .map((task) => createVisualQueueItemFromBackendTask(task, records))
-      .filter((item): item is VisualQueueItem => Boolean(item));
+      .filter((item): item is VisualQueueItem => Boolean(item))
+      .filter((item) => !pendingVisualQueueDeleteIdsRef.current.has(item.id) && !pendingVisualQueueDeleteIdsRef.current.has(item.backendTaskId || ''))
 
     setVisualQueueItems((current) => {
       const restoredIds = new Set(restoredItems.map((item) => item.id));
@@ -3225,14 +3332,28 @@ function LinkListPanel({
   useEffect(() => {
     if (!visualQueueOpen) return undefined;
     const refresh = () => {
+      void refreshVisualQueueTasks().catch((error) => {
+        console.warn('Failed to refresh visual queue tasks', error);
+      });
       void refreshExportQueueTasks().catch((error) => {
         console.warn('Failed to refresh export queue tasks', error);
       });
+      void refreshVisualQueueSummary().catch((error) => {
+        console.warn('Failed to refresh visual queue summary', error);
+      });
     };
     refresh();
-    const timer = window.setInterval(refresh, exportQueuePendingCount > 0 ? 3000 : 8000);
+    const hasActiveVisualTasks = visualQueueItems.some(isVisualQueueItemActive);
+    const timer = window.setInterval(refresh, exportQueuePendingCount > 0 || hasActiveVisualTasks ? 3000 : 8000);
     return () => window.clearInterval(timer);
-  }, [exportQueuePendingCount, refreshExportQueueTasks, visualQueueOpen]);
+  }, [
+    exportQueuePendingCount,
+    refreshExportQueueTasks,
+    refreshVisualQueueSummary,
+    refreshVisualQueueTasks,
+    visualQueueItems,
+    visualQueueOpen,
+  ]);
 
   const cancelExportQueueTask = useCallback(async (task: DianxiaomiExportTask) => {
     try {
@@ -3521,40 +3642,70 @@ function LinkListPanel({
     const referenceImageRefs = getVisualReferenceImageRefs(draftItem);
     const primaryReferenceImageUrl = referenceImageRefs[0]?.url || draftItem.referenceImageUrl;
 
+    const optimisticItem: VisualQueueItem = {
+      ...draftItem,
+      backendStatus: 'creating',
+      statusLabel: '创建中',
+      statusColor: 'processing',
+      modules: draftItem.modules.map((module) => ({
+        ...module,
+        statusLabel: '等待入队',
+        statusColor: 'processing',
+      })),
+    };
+    setVisualQueueItems((current) => [optimisticItem, ...current.filter((candidate) => candidate.id !== optimisticItem.id)]);
+    setActiveVisualQueueItemId(optimisticItem.id);
+    setExpandedVisualQueueItemIds((current) => [optimisticItem.id, ...current.filter((id) => id !== optimisticItem.id)]);
+    if (options.openQueue !== false) setVisualQueueOpen(true);
+
     try {
       const created = await createVisualGenerationTask({
-        record: getVisualTaskRecordWithQueueMeta(record, draftItem),
+        record: getVisualTaskRecordWithQueueMeta(record, optimisticItem),
         linkRecordId: record.id,
         productId: record.productId,
-        mode: getVisualTaskApiMode(draftItem.mode),
-        layout: getVisualTaskLayout(draftItem.requestedCount),
-        requestedCount: draftItem.requestedCount,
+        mode: getVisualTaskApiMode(optimisticItem.mode),
+        layout: getVisualTaskLayout(optimisticItem.requestedCount),
+        requestedCount: optimisticItem.requestedCount,
         sourceImageRef: primaryReferenceImageUrl,
         referenceImageRefs,
       });
       const item: VisualQueueItem = {
-        ...draftItem,
-        id: `queue-${created.id}`,
+        ...optimisticItem,
         backendTaskId: created.id,
         backendStatus: created.status,
-        createdAt: created.createdAt || draftItem.createdAt,
+        statusLabel: '排队中',
+        statusColor: 'blue',
+        createdAt: created.createdAt || optimisticItem.createdAt,
+        modules: optimisticItem.modules.map((module) => ({
+          ...module,
+          statusLabel: '待执行',
+          statusColor: 'blue',
+        })),
       };
-      setVisualQueueItems((current) => [item, ...current.filter((candidate) => candidate.backendTaskId !== created.id)]);
+      setVisualQueueItems((current) => [
+        item,
+        ...current.filter((candidate) => candidate.id !== optimisticItem.id && candidate.backendTaskId !== created.id),
+      ]);
       setActiveVisualQueueItemId(item.id);
       setExpandedVisualQueueItemIds((current) => [item.id, ...current.filter((id) => id !== item.id)]);
       if (options.autoRun) {
-        message.success('\u5df2\u521b\u5efa\u751f\u56fe\u4efb\u52a1\uff0c\u6b63\u5728\u81ea\u52a8\u6267\u884c');
+        message.success('已创建生图任务，正在自动执行');
         window.setTimeout(() => {
           const recordMap = new Map(records.map((candidate) => [candidate.id, candidate]));
           setVisualQueueExecuting(true);
           void executeVisualQueueItem(item, recordMap)
             .then(() => {
-              message.success('\u751f\u56fe\u4efb\u52a1\u5df2\u5b8c\u6210\uff0c\u7ed3\u679c\u5df2\u56de\u5199\u5230\u94fe\u63a5\u5217\u8868');
+              message.success('生图任务已完成，结果已回写到链接列表');
             })
             .catch((error) => {
-              const errorMessage = error instanceof Error ? error.message : '\u751f\u56fe\u4efb\u52a1\u6267\u884c\u5931\u8d25';
+              const errorMessage = error instanceof Error ? error.message : '生图任务执行失败';
+              if (error instanceof VisualTaskStillActiveError) {
+                keepVisualQueueItemActiveFromBackend(item.id, error.task);
+                message.warning(errorMessage);
+                return;
+              }
               failVisualQueueItemToTail(item.id, errorMessage);
-              message.warning(`生图任务执行失败，已移到队尾：${errorMessage}`);
+              message.error(`生图任务最终失败：${errorMessage}`);
             })
             .finally(() => {
               setVisualQueueExecuting(false);
@@ -3562,10 +3713,11 @@ function LinkListPanel({
         }, 0);
         return;
       }
-      if (options.openQueue !== false) setVisualQueueOpen(true);
-      message.success('\u5df2\u52a0\u5165\u7edf\u4e00\u4efb\u52a1\u961f\u5217');
+      message.success('已加入统一任务队列');
     } catch (error) {
-      message.error(error instanceof Error ? error.message : '\u4efb\u52a1\u961f\u5217\u521b\u5efa\u5931\u8d25');
+      const errorMessage = error instanceof Error ? error.message : '任务队列创建失败';
+      failVisualQueueItemToTail(optimisticItem.id, errorMessage);
+      message.error(errorMessage);
     }
   };
 
@@ -3656,16 +3808,11 @@ function LinkListPanel({
     });
   };
 
-  const removeVisualQueueItem = async (queueItemId: string) => {
+  const removeVisualQueueItem = (queueItemId: string) => {
     const item = visualQueueItems.find((candidate) => candidate.id === queueItemId);
-    if (item?.backendTaskId) {
-      try {
-        await deleteVisualGenerationTask(item.backendTaskId);
-      } catch (error) {
-        message.error(error instanceof Error ? error.message : '\u5220\u9664\u540e\u7aef\u4efb\u52a1\u5931\u8d25');
-        return;
-      }
-    }
+    pendingVisualQueueDeleteIdsRef.current.add(queueItemId);
+    if (item?.backendTaskId) pendingVisualQueueDeleteIdsRef.current.add(item.backendTaskId);
+
     setVisualQueueItems((current) => current.filter((candidate) => candidate.id !== queueItemId));
     setExpandedVisualQueueItemIds((current) => current.filter((id) => id !== queueItemId));
     setVisualWorkflowStageByItemId((current) => {
@@ -3673,21 +3820,38 @@ function LinkListPanel({
       delete next[queueItemId];
       return next;
     });
+    setActiveVisualQueueItemId((current) => (current === queueItemId ? undefined : current));
+
+    if (item?.backendTaskId) {
+      void deleteVisualGenerationTask(item.backendTaskId)
+        .catch((error) => {
+          message.error(error instanceof Error ? error.message : '\u5220\u9664\u540e\u7aef\u4efb\u52a1\u5931\u8d25');
+          void refreshVisualQueueTasks().catch((refreshError) => {
+            console.warn('Failed to refresh visual queue after delete failure', refreshError);
+          });
+        })
+        .finally(() => {
+          pendingVisualQueueDeleteIdsRef.current.delete(queueItemId);
+          pendingVisualQueueDeleteIdsRef.current.delete(item.backendTaskId || '');
+        });
+    } else {
+      pendingVisualQueueDeleteIdsRef.current.delete(queueItemId);
+    }
   };
 
   const clearVisualQueue = async () => {
     const backendTaskIds = visualQueueItems.map((item) => item.backendTaskId).filter((id): id is string => Boolean(id));
-    const results = await Promise.allSettled(backendTaskIds.map((taskId) => deleteVisualGenerationTask(taskId)));
-    const failedCount = results.filter((result) => result.status === 'rejected').length;
-    if (failedCount > 0) {
-      message.warning(`\u6709 ${failedCount} \u4e2a\u540e\u7aef\u4efb\u52a1\u5220\u9664\u5931\u8d25\uff0c\u5df2\u4fdd\u7559\u5728\u961f\u5217\u4e2d`);
-      const failedIds = new Set(
-        results
-          .map((result, index) => (result.status === 'rejected' ? backendTaskIds[index] : undefined))
-          .filter((id): id is string => Boolean(id)),
-      );
-      setVisualQueueItems((current) => current.filter((item) => item.backendTaskId && failedIds.has(item.backendTaskId)));
-      return;
+    if (backendTaskIds.length > 0) {
+      try {
+        const result = await deleteVisualGenerationTasks(backendTaskIds);
+        const missingIds = new Set(result.missingIds || []);
+        if (missingIds.size > 0) {
+          message.info(`\u6709 ${missingIds.size} \u4e2a\u540e\u7aef\u4efb\u52a1\u5df2\u4e0d\u5b58\u5728\uff0c\u5df2\u4ece\u961f\u5217\u540c\u6b65\u79fb\u9664`);
+        }
+      } catch (error) {
+        message.error(error instanceof Error ? error.message : '\u6e05\u7a7a\u540e\u7aef\u751f\u56fe\u4efb\u52a1\u5931\u8d25');
+        return;
+      }
     }
     setVisualQueueItems([]);
     setExpandedVisualQueueItemIds([]);
@@ -3703,13 +3867,60 @@ function LinkListPanel({
     );
   };
 
+  const keepVisualQueueItemActiveFromBackend = (queueItemId: string, task: VisualGenerationTask) => {
+    const completedCount = task.modules.filter((module) => getVisualTaskResultUrl(module)).length;
+    const statusMeta = getVisualQueueStatusFromBackend(task, completedCount);
+    patchVisualQueueItem(queueItemId, (current) => ({
+      backendTaskId: task.id,
+      backendStatus: task.status,
+      progressState: task.progressState,
+      activeCredentialName: task.activeCredentialName || current.activeCredentialName,
+      activeCredentialId: task.activeCredentialId || current.activeCredentialId,
+      activeModel: task.activeModel || current.activeModel,
+      timeoutSeconds: task.timeoutSeconds ?? current.timeoutSeconds,
+      switchingErrorType: task.switchingErrorType || current.switchingErrorType,
+      lastSwitchCredentialName: task.lastSwitchCredentialName || current.lastSwitchCredentialName,
+      lastSwitchCredentialId: task.lastSwitchCredentialId || current.lastSwitchCredentialId,
+      lastSwitchModel: task.lastSwitchModel || current.lastSwitchModel,
+      lastSwitchErrorType: task.lastSwitchErrorType || current.lastSwitchErrorType,
+      lastSwitchError: task.lastSwitchError || current.lastSwitchError,
+      statusLabel: statusMeta.label,
+      statusColor: statusMeta.color,
+      completedCount,
+      analysis: hasVisualDetail(task.analysis) ? task.analysis : current.analysis,
+      promptText: task.promptText || current.promptText,
+      motherImageUrl: task.motherImageUrl || current.motherImageUrl,
+      motherImagePath: task.motherImagePath || current.motherImagePath,
+      manifest: task.manifest || current.manifest,
+      retryCount: task.retryCount ?? current.retryCount,
+      nextRetryAt: task.nextRetryAt ?? current.nextRetryAt,
+      retryErrorMessage: task.retryErrorMessage || current.retryErrorMessage,
+      errorMessage:
+        task.status === 'retry_waiting'
+          ? task.retryErrorMessage || task.errorMessage || current.errorMessage
+          : current.errorMessage,
+      modules: current.modules.map((module, index) => {
+        const backendModule = task.modules[index];
+        const resultUrl = backendModule ? getVisualTaskResultUrl(backendModule) : undefined;
+        return {
+          ...module,
+          outputUrl: backendModule?.outputUrl || module.outputUrl,
+          outputPath: backendModule?.outputPath || module.outputPath,
+          imageUrl: resultUrl || module.imageUrl,
+          statusLabel: resultUrl ? '已回写' : statusMeta.label,
+          statusColor: resultUrl ? 'green' : statusMeta.color,
+        };
+      }),
+    }));
+  };
+
   const failVisualQueueItemToTail = (queueItemId: string, errorMessage: string) => {
     setVisualQueueItems((current) => {
       const failedItem = current.find((item) => item.id === queueItemId);
       if (!failedItem) return current;
       const nextFailedItem: VisualQueueItem = {
         ...failedItem,
-        statusLabel: '执行失败',
+        statusLabel: '最终失败',
         statusColor: 'red',
         backendStatus: 'failed',
         errorMessage,
@@ -3742,7 +3953,21 @@ function LinkListPanel({
       statusLabel: '创建中',
       statusColor: 'processing',
       backendStatus: 'creating',
+      progressState: undefined,
+      activeCredentialName: undefined,
+      activeCredentialId: undefined,
+      activeModel: undefined,
+      timeoutSeconds: undefined,
+      switchingErrorType: undefined,
+      lastSwitchCredentialName: undefined,
+      lastSwitchCredentialId: undefined,
+      lastSwitchModel: undefined,
+      lastSwitchErrorType: undefined,
+      lastSwitchError: undefined,
       errorMessage: undefined,
+      retryCount: undefined,
+      nextRetryAt: undefined,
+      retryErrorMessage: undefined,
       modules: markModules('排队中', 'processing'),
     }));
 
@@ -3800,24 +4025,87 @@ function LinkListPanel({
     patchVisualQueueItem(item.id, () => ({
       backendTaskId: created.id,
       backendStatus: runResult.item.status || (waitingForConcurrency ? 'queued' : 'running'),
-      statusLabel: waitingForConcurrency ? '\u6392\u961f\u7b49\u5f85' : '\u751f\u6210\u4e2d',
-      statusColor: waitingForConcurrency ? 'blue' : 'processing',
+      progressState: undefined,
+      statusLabel: waitingForConcurrency ? '\u6392\u961f\u7b49\u5f85' : '后台执行中',
+      statusColor: 'blue',
       errorMessage: undefined,
-      modules: markModules(waitingForConcurrency ? '\u7b49\u5f85\u7a7a\u4f4d' : '\u751f\u6210\u4e2d', waitingForConcurrency ? 'blue' : 'processing'),
+      retryCount: undefined,
+      nextRetryAt: undefined,
+      retryErrorMessage: undefined,
+      modules: markModules(waitingForConcurrency ? '\u7b49\u5f85\u7a7a\u4f4d' : '后台执行中', 'blue'),
     }));
 
     const generated = await waitForVisualGenerationTask(created.id, waitingForConcurrency ? 7200 : 180, (progressTask) => {
       const hasAnalysis = hasVisualDetail(progressTask.analysis);
-      if (!hasAnalysis && !progressTask.promptText) return;
+      const completedCount = progressTask.modules.filter((module) => getVisualTaskResultUrl(module)).length;
+      const statusMeta = getVisualQueueStatusFromBackend(progressTask, completedCount);
+      if (progressTask.status === 'retry_waiting') {
+        const warningKey = `${progressTask.id}:${progressTask.retryCount ?? 0}:${progressTask.retryErrorMessage || progressTask.errorMessage || ''}`;
+        if (!retryWarningShownTaskIdsRef.current.has(warningKey)) {
+          retryWarningShownTaskIdsRef.current.add(warningKey);
+          const retryTime = formatRetryTime(progressTask.nextRetryAt);
+          message.warning(
+            `本次调用失败，正在等待重试：${progressTask.retryErrorMessage || progressTask.errorMessage || '第三方 API 暂时不可用'}${
+              retryTime ? `，下次重试 ${retryTime}` : ''
+            }`,
+          );
+        }
+      }
+      if (progressTask.progressState === 'switching_key' || progressTask.lastSwitchError) {
+        const switchError = progressTask.lastSwitchError || progressTask.errorMessage || '第三方 API 暂时不可用';
+        const switchKeyLabel =
+          progressTask.lastSwitchCredentialName ||
+          progressTask.lastSwitchCredentialId ||
+          progressTask.activeCredentialName ||
+          progressTask.activeCredentialId ||
+          '当前 key';
+        const warningKey = `${progressTask.id}:switch:${switchKeyLabel}:${switchError}`;
+        if (!retryWarningShownTaskIdsRef.current.has(warningKey)) {
+          retryWarningShownTaskIdsRef.current.add(warningKey);
+          message.warning(`本 key 调用失败，正在切换 key：${switchKeyLabel}，原因：${switchError}`);
+        }
+      }
       patchVisualQueueItem(item.id, (current) => ({
         backendTaskId: created.id,
         backendStatus: progressTask.status,
+        progressState: progressTask.progressState,
+        activeCredentialName: progressTask.activeCredentialName || current.activeCredentialName,
+        activeCredentialId: progressTask.activeCredentialId || current.activeCredentialId,
+        activeModel: progressTask.activeModel || current.activeModel,
+        timeoutSeconds: progressTask.timeoutSeconds ?? current.timeoutSeconds,
+        switchingErrorType: progressTask.switchingErrorType || current.switchingErrorType,
+        lastSwitchCredentialName: progressTask.lastSwitchCredentialName || current.lastSwitchCredentialName,
+        lastSwitchCredentialId: progressTask.lastSwitchCredentialId || current.lastSwitchCredentialId,
+        lastSwitchModel: progressTask.lastSwitchModel || current.lastSwitchModel,
+        lastSwitchErrorType: progressTask.lastSwitchErrorType || current.lastSwitchErrorType,
+        lastSwitchError: progressTask.lastSwitchError || current.lastSwitchError,
+        statusLabel: statusMeta.label,
+        statusColor: statusMeta.color,
+        completedCount,
         analysis: hasAnalysis ? progressTask.analysis : current.analysis,
         promptText: progressTask.promptText || current.promptText,
         motherImageUrl: progressTask.motherImageUrl || current.motherImageUrl,
         motherImagePath: progressTask.motherImagePath || current.motherImagePath,
         manifest: progressTask.manifest || current.manifest,
-        errorMessage: progressTask.status === 'failed' ? progressTask.errorMessage || current.errorMessage : undefined,
+        retryCount: progressTask.retryCount ?? current.retryCount,
+        nextRetryAt: progressTask.nextRetryAt ?? current.nextRetryAt,
+        retryErrorMessage: progressTask.retryErrorMessage || current.retryErrorMessage,
+        errorMessage:
+          progressTask.status === 'failed' || progressTask.status === 'retry_waiting'
+            ? progressTask.retryErrorMessage || progressTask.errorMessage || current.errorMessage
+            : undefined,
+        modules: current.modules.map((module, index) => {
+          const backendModule = progressTask.modules[index];
+          const resultUrl = backendModule ? getVisualTaskResultUrl(backendModule) : undefined;
+          return {
+            ...module,
+            outputUrl: backendModule?.outputUrl || module.outputUrl,
+            outputPath: backendModule?.outputPath || module.outputPath,
+            imageUrl: resultUrl || module.imageUrl,
+            statusLabel: resultUrl ? '\u5df2\u56de\u5199' : statusMeta.label,
+            statusColor: resultUrl ? 'green' : statusMeta.color,
+          };
+        }),
       }));
     });
     const itemWithBackendId = { ...item, backendTaskId: created.id };
@@ -3850,6 +4138,11 @@ function LinkListPanel({
       motherImageUrl: generated.motherImageUrl || undefined,
       motherImagePath: generated.motherImagePath || undefined,
       manifest: generated.manifest,
+      progressState: undefined,
+      switchingErrorType: undefined,
+      retryCount: undefined,
+      nextRetryAt: undefined,
+      retryErrorMessage: undefined,
       errorMessage: generated.status === 'failed' ? generated.errorMessage || undefined : undefined,
       modules: item.modules.map((module, index) => {
         const generatedModule = generatedModules[index];
@@ -3891,12 +4184,9 @@ function LinkListPanel({
 
       const fallbackLimit = Math.min(pendingItems.length, LOCAL_VISUAL_QUEUE_FALLBACK_WORKERS);
       const userLimit = Number(latestSummary?.userConcurrencyLimit || 0);
-      const teamLimit = Number(latestSummary?.teamConcurrencyLimit || 0);
       const userRunning = Number(latestSummary?.runningCount ?? latestSummary?.activeCount ?? 0);
-      const teamRunning = Number(latestSummary?.teamRunningCount ?? latestSummary?.teamActiveCount ?? 0);
       const userAvailable = userLimit > 0 ? Math.max(0, userLimit - userRunning) : fallbackLimit;
-      const teamAvailable = teamLimit > 0 ? Math.max(0, teamLimit - teamRunning) : fallbackLimit;
-      const workerCount = Math.max(1, Math.min(pendingItems.length, userAvailable || 1, teamAvailable || 1));
+      const workerCount = Math.max(1, Math.min(pendingItems.length, userAvailable || 1));
       const itemQueue = [...pendingItems];
       const attemptByItemId = new Map<string, number>();
       let successCount = 0;
@@ -3915,6 +4205,11 @@ function LinkListPanel({
             successCount += 1;
           } catch (error) {
             const errorMessage = error instanceof Error ? error.message : '生图任务执行失败';
+            if (error instanceof VisualTaskStillActiveError) {
+              keepVisualQueueItemActiveFromBackend(item.id, error.task);
+              message.warning(errorMessage);
+              continue;
+            }
             failVisualQueueItemToTail(item.id, errorMessage);
             if (attempt < LOCAL_VISUAL_QUEUE_MAX_ATTEMPTS_PER_CLICK) {
               retryCount += 1;
@@ -3924,7 +4219,7 @@ function LinkListPanel({
               itemQueue.push(item);
             } else {
               failedCount += 1;
-              message.warning(`任务执行失败，已达到本轮重试上限：${errorMessage}`);
+              message.error(`任务最终失败：${errorMessage}`);
             }
           }
         }
@@ -3936,7 +4231,7 @@ function LinkListPanel({
         message.success(`已执行 ${successCount} 个生图任务，结果已回写到链接列表`);
       }
       if (failedCount > 0) {
-        message.warning(`${failedCount} 个生图任务本轮仍失败，已保留在队尾，可稍后再次执行`);
+        message.error(`${failedCount} 个生图任务最终失败，请查看队列红色错误原因`);
       }
       if (retryCount > 0) {
         message.info(`本轮已自动补位重试 ${retryCount} 次`);
@@ -4562,13 +4857,6 @@ function LinkListPanel({
                   <strong>{visualQueueSummary.counts.retry_waiting || 0}</strong>
                 </div>
                 <div>
-                  <span>{'\u56e2\u961f\u8fd0\u884c/\u4e0a\u9650'}</span>
-                  <strong>
-                    {visualQueueSummary.teamRunningCount ?? (visualQueueSummary.teamActiveCount || 0)}/
-                    {visualQueueSummary.teamConcurrencyLimit || '\u4e0d\u9650'}
-                  </strong>
-                </div>
-                <div>
                   <span>Redis length</span>
                   <strong>{visualQueueSummary.redisQueueLength ?? '-'}</strong>
                 </div>
@@ -4643,6 +4931,7 @@ function LinkListPanel({
               {visibleVisualQueueItems.map((item) => {
                 const active = activeVisualQueueItem?.id === item.id;
                 const progress = getVisualQueueProgress(item);
+                const failureNotice = getVisualQueueFailureNotice(item);
                 const referencePreviewRefs = getVisualReferenceImageRefs(item);
                 const visibleReferencePreviewRefs = referencePreviewRefs.slice(0, 3);
                 return (
@@ -4696,6 +4985,10 @@ function LinkListPanel({
                           <Tag color={referencePreviewRefs.length > 1 ? 'cyan' : 'default'}>
                             参考图 {referencePreviewRefs.length || 0}
                           </Tag>
+                          {item.activeCredentialName || item.activeCredentialId ? (
+                            <Tag color="geekblue">{item.activeCredentialName || item.activeCredentialId}</Tag>
+                          ) : null}
+                          {item.activeModel ? <Tag color="default">{item.activeModel}</Tag> : null}
                           <span>{item.requestedCount} 张</span>
                           <span>{getVisualQueueLayoutLabel(item.requestedCount)}</span>
                           <span>{item.backendTaskId || item.backendStatus || '待创建'}</span>
@@ -4725,7 +5018,17 @@ function LinkListPanel({
                         <div><span>请求数量</span><strong>{item.requestedCount}</strong></div>
                         <div><span>组批策略</span><strong>{item.mixPolicy}</strong></div>
                       </div>
-                      {item.errorMessage ? <div className="visual-queue-panel-error">{item.errorMessage}</div> : null}
+                      {failureNotice ? (
+                        <div
+                          className={`visual-queue-panel-error ${
+                            failureNotice.tone === 'warning' ? 'visual-queue-panel-error-warning' : ''
+                          }`}
+                        >
+                          <strong>{failureNotice.title}</strong>
+                          {failureNotice.meta ? <span>{failureNotice.meta}</span> : null}
+                          {failureNotice.detail ? <code>{failureNotice.detail}</code> : null}
+                        </div>
+                      ) : null}
                       {renderVisualQueueWorkflow(item)}
                     </div>
                   </details>
@@ -5621,6 +5924,7 @@ function DataDeskPanel({
       nextFilters: Filters | string = filters,
       nextPriceSortOrder = priceSortOrder,
       nextGmvSortOrder = gmvSortOrder,
+      includeTotal = true,
     ) => {
       const normalizedFilters = typeof nextFilters === 'string' ? { keyword: nextFilters } : nextFilters;
       setLoading(true);
@@ -5631,11 +5935,12 @@ function DataDeskPanel({
           scope: 'all',
           sortBy: nextPriceSortOrder ? 'price' : nextGmvSortOrder ? 'gmv' : undefined,
           sortOrder: toBackendPriceSortOrder(nextPriceSortOrder || nextGmvSortOrder),
+          includeTotal,
           ...normalizedFilters,
           keyword: normalizedFilters.keyword?.trim() || undefined,
         });
         setProducts(response.items.map(mapBackendProduct));
-        setTotal(response.total);
+        if (response.total !== null) setTotal(response.total);
       } catch (error) {
         message.error(error instanceof Error ? error.message : '数据台读取失败');
       } finally {
@@ -5796,9 +6101,10 @@ function DataDeskPanel({
           selectedRowKeys={selectedRowKeys}
           onSelectedRowKeysChange={setSelectedRowKeys}
           onPageChange={(nextPage, nextPageSize) => {
+            const shouldRefreshTotal = nextPageSize !== pageSize;
             setPage(nextPage);
             setPageSize(nextPageSize);
-            void loadDataDeskProducts(nextPage, nextPageSize, filters);
+            void loadDataDeskProducts(nextPage, nextPageSize, filters, priceSortOrder, gmvSortOrder, shouldRefreshTotal);
           }}
           priceSortOrder={priceSortOrder}
           onPriceSortChange={(order) => {
@@ -5861,6 +6167,7 @@ export function SelectProductPage({
       nextFilters = filters,
       nextPriceSortOrder = priceSortOrder,
       nextGmvSortOrder = gmvSortOrder,
+      includeTotal = true,
     ) => {
       setLoadingProducts(true);
       try {
@@ -5870,10 +6177,11 @@ export function SelectProductPage({
           pageSize: nextPageSize,
           sortBy: nextPriceSortOrder ? 'price' : nextGmvSortOrder ? 'gmv' : undefined,
           sortOrder: toBackendPriceSortOrder(nextPriceSortOrder || nextGmvSortOrder),
+          includeTotal,
           ...requestFilters,
         });
         setProducts(response.items.map(mapBackendProduct));
-        setProductTotal(response.total);
+        if (response.total !== null) setProductTotal(response.total);
         setBackendReady(true);
       } catch {
         setBackendReady(false);
@@ -6149,7 +6457,7 @@ export function SelectProductPage({
       if (!routedProduct) return;
 
       setProducts(routedProducts);
-      setProductTotal(response.total);
+      if (response.total !== null) setProductTotal(response.total);
       setCurrentPage(1);
       setBackendReady(true);
       openProduct(routedProduct, { syncUrl: false });
@@ -6382,9 +6690,10 @@ export function SelectProductPage({
               selectedRowKeys={selectedRowKeys}
               onSelectedRowKeysChange={setSelectedRowKeys}
               onPageChange={(page, nextPageSize) => {
+                const shouldRefreshTotal = nextPageSize !== pageSize;
                 setCurrentPage(page);
                 setPageSize(nextPageSize);
-                void loadProducts(page, nextPageSize, filters);
+                void loadProducts(page, nextPageSize, filters, priceSortOrder, gmvSortOrder, shouldRefreshTotal);
               }}
               priceSortOrder={priceSortOrder}
               onPriceSortChange={(order) => {
@@ -6456,3 +6765,4 @@ export function SelectProductPage({
     </Layout>
   );
 }
+

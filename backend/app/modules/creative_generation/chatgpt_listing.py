@@ -4,18 +4,15 @@ import base64
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
-from app.core.config import OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_IMAGE_MODEL, OPENAI_IMAGE_QUALITY, OPENAI_TEXT_MODEL
-from app.core.database import (
+from app.modules.admin_config.postgres_store import (
     assert_user_api_usage_allowed,
     get_app_setting_value,
-    get_enabled_admin_api_channel_credential,
-    get_enabled_user_api_credential,
-    get_user_role,
     record_api_usage_safe,
 )
+from app.modules.ai_gateway import scheduler as ai_gateway_scheduler
 from app.modules.creative_generation.safety import find_sensitive_terms, sanitize_marketplace_text
 from app.modules.exports.dianxiaomi_temu import normalize_english_title
 from app.modules.image_storage.aliyun_oss import ImageStorageError, upload_image_bytes
@@ -78,6 +75,10 @@ class OpenAISettings:
     image_model: str
     image_quality: str
     channel_id: str = ""
+    credential_id: str = ""
+    credential_name: str = ""
+    gateway_stage: str = ""
+    gateway_candidate: dict[str, Any] = field(default_factory=dict)
 
 
 def generate_listing_package(record: dict[str, Any], *, generate_images: bool = True, user_id: str | None = None) -> dict[str, Any]:
@@ -113,7 +114,7 @@ def generate_listing_package(record: dict[str, Any], *, generate_images: bool = 
         }
 
     if not image_settings.api_key:
-        raise CreativeGenerationError("缺少 OPENAI_API_KEY，无法调用 ChatGPT 生图。已支持生成规划，请先配置 OpenAI API Key。")
+        raise CreativeGenerationError("API 中枢没有可用生图渠道，请先在 API 中枢配置可用 Key。")
 
     generated_images = []
     product_id = clean_key_part(record.get("productId") or record.get("id") or "product")
@@ -170,86 +171,25 @@ def generate_listing_package(record: dict[str, Any], *, generate_images: bool = 
 
 
 def get_openai_settings(stage: str | None = None, *, user_id: str | None = None) -> OpenAISettings:
-    user_credential = get_enabled_user_api_credential(user_id)
-    has_user_credential = bool(user_credential and user_credential.get("apiKey"))
-    user_role = get_user_role(user_id)
-    requires_member_credential = bool(str(user_id or "").strip()) and user_role != "admin"
-    if requires_member_credential and not has_user_credential:
-        raise CreativeGenerationError("当前成员未配置可用 API Key，请管理员在后台为该成员配置 API Key 后再执行。")
-
-    admin_credential = None if has_user_credential or requires_member_credential else get_enabled_admin_api_channel_credential()
-    has_admin_credential = bool(admin_credential and admin_credential.get("apiKey"))
-    common_api_key = (
-        str(user_credential.get("apiKey") or "").strip()
-        if has_user_credential
-        else str(admin_credential.get("apiKey") or "").strip()
-        if has_admin_credential
-        else get_runtime_setting("OPENAI_API_KEY", OPENAI_API_KEY).strip()
-    )
-    common_base_url = (
-        str(user_credential.get("baseUrl") or "").strip().rstrip("/")
-        if has_user_credential
-        else str(admin_credential.get("baseUrl") or "").strip().rstrip("/")
-        if has_admin_credential
-        else get_runtime_setting("OPENAI_BASE_URL", OPENAI_BASE_URL).strip().rstrip("/")
-    )
-    credential_text_model = (
-        str(user_credential.get("textModel") or "").strip()
-        if has_user_credential
-        else str(admin_credential.get("textModel") or "").strip()
-        if has_admin_credential
-        else ""
-    )
-    credential_image_model = (
-        str(user_credential.get("imageModel") or "").strip()
-        if has_user_credential
-        else str(admin_credential.get("imageModel") or "").strip()
-        if has_admin_credential
-        else ""
-    )
-    common_text_model = credential_text_model or get_runtime_setting("OPENAI_TEXT_MODEL", OPENAI_TEXT_MODEL).strip() or "gpt-5.5"
-    common_image_model = credential_image_model or get_runtime_setting("OPENAI_IMAGE_MODEL", OPENAI_IMAGE_MODEL).strip() or "gpt-image-2"
-    stage_prefixes = {
-        "title": "OPENAI_TITLE",
-        "title_split": "OPENAI_TITLE_SPLIT",
-        "recommendation": "OPENAI_RECOMMENDATION",
-        "product_attribute": "OPENAI_PRODUCT_ATTRIBUTE",
-        "visual_analysis": "OPENAI_VISUAL_ANALYSIS",
-        "visual_prompt": "OPENAI_VISUAL_PROMPT",
-        "image": "OPENAI_IMAGE",
-    }
+    _ = user_id
     stage_key = clean_text(stage).lower().replace("-", "_")
-    prefix = stage_prefixes.get(stage_key)
-    if prefix:
-        text_model = get_runtime_setting(f"{prefix}_MODEL", "").strip() or common_text_model
-        image_model = get_runtime_setting("OPENAI_IMAGE_MODEL", OPENAI_IMAGE_MODEL).strip() or common_image_model
-        if stage_key == "image":
-            image_model = get_runtime_setting("OPENAI_IMAGE_MODEL", "").strip() or common_image_model
-    else:
-        text_model = common_text_model
-        image_model = common_image_model
-    if has_user_credential or has_admin_credential:
-        api_key = common_api_key
-        base_url = common_base_url
-    elif prefix:
-        api_key = get_runtime_setting(f"{prefix}_API_KEY", "").strip() or common_api_key
-        base_url = get_runtime_setting(f"{prefix}_BASE_URL", "").strip().rstrip("/") or common_base_url
-    else:
-        api_key = common_api_key
-        base_url = common_base_url
+    gateway_candidates = ai_gateway_scheduler.resolve_candidates(stage_key)
+    if not gateway_candidates:
+        raise CreativeGenerationError(f"API 中枢没有可用渠道：{stage_key}")
+    candidate = gateway_candidates[0]
+    model = str(candidate.get("model") or "").strip()
+    model_type = str(candidate.get("modelType") or "").strip()
     return OpenAISettings(
-        api_key=api_key,
-        base_url=base_url,
-        text_model=text_model,
-        image_model=image_model,
-        image_quality=get_runtime_setting("OPENAI_IMAGE_QUALITY", OPENAI_IMAGE_QUALITY).strip() or "medium",
-        channel_id=(
-            str(user_credential.get("channelId") or "")
-            if has_user_credential
-            else str(admin_credential.get("channelId") or "")
-            if has_admin_credential
-            else ""
-        ),
+        api_key=str(candidate.get("apiKey") or "").strip(),
+        base_url=str(candidate.get("baseUrl") or "").strip().rstrip("/"),
+        text_model=model or "gpt-5.5",
+        image_model=model if model_type == "image" else "gpt-image-2-1k",
+        image_quality=get_runtime_setting("OPENAI_IMAGE_QUALITY", "medium").strip() or "medium",
+        channel_id=str(candidate.get("channelId") or ""),
+        credential_id=str(candidate.get("credentialId") or ""),
+        credential_name=str(candidate.get("credentialName") or candidate.get("credentialId") or ""),
+        gateway_stage=stage_key,
+        gateway_candidate=dict(candidate),
     )
 
 
@@ -273,6 +213,10 @@ def generate_safe_english_title(
         return trim_title(fallback)
 
     assert_user_api_usage_allowed(user_id)
+    candidate = settings.gateway_candidate if settings.gateway_stage and settings.credential_id else None
+    started = time.monotonic()
+    if candidate:
+        ai_gateway_scheduler.begin_attempt(candidate)
     try:
         from openai import OpenAI
 
@@ -311,8 +255,16 @@ def generate_safe_english_title(
             model=settings.text_model,
             user_id=user_id,
             channel_id=settings.channel_id,
+            credential_id=settings.credential_id,
+            credential_name=settings.credential_name,
             status="success",
         )
+        if candidate:
+            ai_gateway_scheduler.finish_attempt(
+                candidate,
+                success=True,
+                latency_ms=int((time.monotonic() - started) * 1000),
+            )
     except Exception as exc:
         record_api_usage_safe(
             provider="openai-compatible",
@@ -321,9 +273,18 @@ def generate_safe_english_title(
             model=settings.text_model,
             user_id=user_id,
             channel_id=settings.channel_id,
+            credential_id=settings.credential_id,
+            credential_name=settings.credential_name,
             status="failed",
             error_message=str(exc),
         )
+        if candidate:
+            ai_gateway_scheduler.finish_attempt(
+                candidate,
+                success=False,
+                error_message=str(exc),
+                latency_ms=int((time.monotonic() - started) * 1000),
+            )
         title = fallback
 
     safe_title, _ = sanitize_marketplace_text(title)
@@ -507,15 +468,67 @@ def generate_image_bytes(prompt: str, settings: OpenAISettings, *, user_id: str 
     except ImportError as exc:
         raise CreativeGenerationError("缺少 Python 依赖 openai；请先执行 pip install -r backend/requirements.txt") from exc
 
-    client = build_openai_client(settings)
+    if settings.gateway_stage:
+        attempt_limit = ai_gateway_scheduler.resolve_attempt_limit(settings.gateway_stage)
+        excluded_credential_ids: set[str] = set()
+        last_error: BaseException | None = None
+        for _attempt in range(attempt_limit):
+            candidate = ai_gateway_scheduler.acquire_candidate(
+                settings.gateway_stage,
+                task_type="image",
+                excluded_credential_ids=excluded_credential_ids,
+            )
+            if not candidate:
+                break
+            excluded_credential_ids.add(str(candidate.get("credentialId") or ""))
+            trial_settings = replace_settings_from_gateway_candidate(settings, candidate)
+            started = time.monotonic()
+            try:
+                image_bytes = generate_image_bytes_once(prompt, trial_settings)
+                ai_gateway_scheduler.finish_attempt(
+                    candidate,
+                    success=True,
+                    latency_ms=int((time.monotonic() - started) * 1000),
+                )
+                record_api_usage_safe(
+                    provider="openai-compatible",
+                    api_type="image",
+                    stage="image",
+                    model=trial_settings.image_model,
+                    user_id=user_id,
+                    channel_id=trial_settings.channel_id,
+                    credential_id=trial_settings.credential_id,
+                    credential_name=trial_settings.credential_name,
+                    status="success",
+                )
+                return image_bytes
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                ai_gateway_scheduler.finish_attempt(
+                    candidate,
+                    success=False,
+                    error_message=str(exc),
+                    latency_ms=int((time.monotonic() - started) * 1000),
+                )
+                record_api_usage_safe(
+                    provider="openai-compatible",
+                    api_type="image",
+                    stage="image",
+                    model=trial_settings.image_model,
+                    user_id=user_id,
+                    channel_id=trial_settings.channel_id,
+                    credential_id=trial_settings.credential_id,
+                    credential_name=trial_settings.credential_name,
+                    status="failed",
+                    error_message=str(exc),
+                )
+                continue
+        if last_error is None:
+            raise CreativeGenerationError(f"API 中枢没有可用生图渠道：{settings.gateway_stage}")
+        raise CreativeGenerationError(f"所有 API 中枢生图候选都失败：{last_error}") from last_error
+
     try:
-        response = client.images.generate(
-            model=settings.image_model,
-            prompt=prompt,
-            size=IMAGE_SIZE,
-            quality=settings.image_quality,
-            n=1,
-        )
+        image_bytes = generate_image_bytes_once(prompt, settings)
         record_api_usage_safe(
             provider="openai-compatible",
             api_type="image",
@@ -523,6 +536,8 @@ def generate_image_bytes(prompt: str, settings: OpenAISettings, *, user_id: str 
             model=settings.image_model,
             user_id=user_id,
             channel_id=settings.channel_id,
+            credential_id=settings.credential_id,
+            credential_name=settings.credential_name,
             status="success",
         )
     except Exception as exc:
@@ -533,14 +548,44 @@ def generate_image_bytes(prompt: str, settings: OpenAISettings, *, user_id: str 
             model=settings.image_model,
             user_id=user_id,
             channel_id=settings.channel_id,
+            credential_id=settings.credential_id,
+            credential_name=settings.credential_name,
             status="failed",
             error_message=str(exc),
         )
         raise
+    return image_bytes
+
+
+def generate_image_bytes_once(prompt: str, settings: OpenAISettings) -> bytes:
+    client = build_openai_client(settings)
+    response = client.images.generate(
+        model=settings.image_model,
+        prompt=prompt,
+        size=IMAGE_SIZE,
+        quality=settings.image_quality,
+        n=1,
+    )
     b64_json = response.data[0].b64_json
     if not b64_json:
         raise CreativeGenerationError("OpenAI 图片接口没有返回图片数据")
     return base64.b64decode(b64_json)
+
+
+def replace_settings_from_gateway_candidate(settings: OpenAISettings, candidate: dict[str, Any]) -> OpenAISettings:
+    model = str(candidate.get("model") or "").strip()
+    return OpenAISettings(
+        api_key=str(candidate.get("apiKey") or "").strip(),
+        base_url=str(candidate.get("baseUrl") or settings.base_url).strip().rstrip("/"),
+        text_model=model or settings.text_model,
+        image_model=model if str(candidate.get("modelType") or "") == "image" else settings.image_model,
+        image_quality=settings.image_quality,
+        channel_id=str(candidate.get("channelId") or ""),
+        credential_id=str(candidate.get("credentialId") or ""),
+        credential_name=str(candidate.get("credentialName") or candidate.get("credentialId") or ""),
+        gateway_stage=str(candidate.get("stage") or settings.gateway_stage),
+        gateway_candidate=dict(candidate),
+    )
 
 
 def build_openai_client(settings: OpenAISettings):

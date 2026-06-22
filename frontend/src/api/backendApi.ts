@@ -1,4 +1,4 @@
-import type { Product } from '../types/product';
+﻿import type { Product } from '../types/product';
 import type { LinkListRecord } from '../types/linkList';
 
 function resolveApiBaseUrl() {
@@ -15,6 +15,17 @@ function resolveApiBaseUrl() {
 
 export const API_BASE_URL = resolveApiBaseUrl();
 const LEGACY_AUTH_TOKEN_STORAGE_KEY = 'temuListingWorkbenchAuthToken';
+const SESSION_RESTORE_TIMEOUT_MS = 2500;
+
+async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
 
 export type CurrentUser = {
   id: string;
@@ -66,6 +77,8 @@ export type AdminApiUsageItem = {
   id: string;
   userId?: string;
   channelId?: string;
+  credentialId?: string;
+  credentialName?: string;
   provider: string;
   apiType: string;
   stage: string;
@@ -91,6 +104,8 @@ export type AdminApiUsageGroup = {
   adminUserId?: string;
   adminName?: string;
   channelId?: string;
+  credentialId?: string;
+  credentialName?: string;
   userCount?: number;
   callCount: number;
   successCount: number;
@@ -102,6 +117,51 @@ export type AdminApiUsageGroup = {
   usageStatus?: 'unlimited' | 'ok' | 'warning' | 'exceeded' | string;
   periodStart?: string;
   lastCalledAt?: string | null;
+  children?: AdminApiUsageGroup[];
+};
+
+export type AdminApiUsageKeyStat = {
+  id: string;
+  channelId?: string;
+  credentialId?: string;
+  credentialName?: string;
+  provider: string;
+  apiType: string;
+  stage: string;
+  model: string;
+  callCount: number;
+  successCount: number;
+  failedCount: number;
+  lastCalledAt?: string | null;
+  lastErrorMessage?: string;
+};
+
+export type AdminApiUsageLog = {
+  id: string;
+  userId?: string;
+  channelId?: string;
+  credentialId?: string;
+  credentialName?: string;
+  provider: string;
+  apiType: string;
+  stage: string;
+  model: string;
+  callCount: number;
+  status: 'success' | 'failed' | string;
+  source: string;
+  relatedId?: string | null;
+  errorMessage?: string | null;
+  metadata?: Record<string, unknown>;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+};
+
+export type AdminApiUsageFilters = {
+  timeRange?: '1h' | '24h' | '7d' | 'all';
+  channelId?: string;
+  credentialId?: string;
+  stage?: string;
+  status?: 'success' | 'failed' | '';
 };
 
 export type AdminApiUsageSummary = {
@@ -112,37 +172,9 @@ export type AdminApiUsageSummary = {
   byUser: AdminApiUsageGroup[];
   byTeam: AdminApiUsageGroup[];
   byChannel: AdminApiUsageGroup[];
-};
-
-export type AdminApiChannel = {
-  id: string;
-  name: string;
-  description: string;
-  enabled: boolean;
-  baseUrl: string;
-  textModel: string;
-  imageModel: string;
-  apiKeyConfigured: boolean;
-  maskedApiKey: string;
-  isCommon: boolean;
-};
-
-export type AdminApiRoute = {
-  stage: string;
-  title: string;
-  description: string;
-  modelType: 'text' | 'image' | string;
-  channelId: string;
-  channelName: string;
-  model: string;
-  baseUrl: string;
-  apiKeyConfigured: boolean;
-  isInherited: boolean;
-};
-
-export type AdminApiChannelBundle = {
-  channels: AdminApiChannel[];
-  routes: AdminApiRoute[];
+  byCredential: AdminApiUsageGroup[];
+  keyStats: AdminApiUsageKeyStat[];
+  recentLogs: AdminApiUsageLog[];
 };
 
 export type AdminPromptConfig = {
@@ -156,42 +188,10 @@ export type AdminPromptConfig = {
   outputTo: string;
   variables: string[];
   content: string;
+  defaultContent?: string;
+  overridden?: boolean;
+  settingKey?: string;
   readOnly: boolean;
-};
-
-export type AdminApiChannelUpdateItem = {
-  id: string;
-  name?: string;
-  enabled?: boolean;
-  apiKey?: string;
-  clearApiKey?: boolean;
-  baseUrl?: string;
-  textModel?: string;
-  imageModel?: string;
-};
-
-export type AdminUserApiCredential = {
-  userId: string;
-  channelId: string;
-  name: string;
-  description: string;
-  enabled: boolean;
-  baseUrl: string;
-  textModel: string;
-  imageModel: string;
-  apiKeyConfigured: boolean;
-  maskedApiKey: string;
-  updatedAt?: string | null;
-};
-
-export type AdminUserApiCredentialUpdateItem = {
-  channelId: string;
-  enabled?: boolean;
-  apiKey?: string;
-  clearApiKey?: boolean;
-  baseUrl?: string;
-  textModel?: string;
-  imageModel?: string;
 };
 
 export type AdminUserUsageLimit = {
@@ -203,6 +203,156 @@ export type AdminUserUsageLimit = {
   usageStatus: 'unlimited' | 'ok' | 'warning' | 'exceeded' | string;
   periodStart: string;
   updatedAt?: string | null;
+};
+
+export type AiGatewayCredential = {
+  id: string;
+  channelId: string;
+  name: string;
+  enabled: boolean;
+  priority: number;
+  weight: number;
+  maxConcurrency: number;
+  rpmLimit: number;
+  dailyLimit: number;
+  monthlyLimit: number;
+  apiKeyConfigured: boolean;
+  maskedApiKey: string;
+  notes: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type AiGatewayChannel = {
+  id: string;
+  name: string;
+  providerType: string;
+  baseUrl: string;
+  textModel: string;
+  imageModel: string;
+  modelTemplates: Record<string, string>;
+  capabilities: string[];
+  enabled: boolean;
+  priority: number;
+  connectTimeoutSeconds: number;
+  readTimeoutSeconds: number;
+  notes: string;
+  createdAt: string;
+  updatedAt: string;
+  credentials: AiGatewayCredential[];
+};
+
+export type AiGatewayRoute = {
+  stage: string;
+  title: string;
+  modelType: 'text' | 'image' | string;
+  channelOrder: string[];
+  keySelectionPolicy: string;
+  maxChannelAttempts: number;
+  allowCrossChannelFallback: boolean;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type AiGatewayCircuit = {
+  id: string;
+  scopeType: 'channel' | 'credential' | 'model' | string;
+  scopeId: string;
+  stage: string;
+  model: string;
+  state: 'closed' | 'open' | 'half_open' | string;
+  failureCount: number;
+  successCount: number;
+  openedUntil?: string | null;
+  lastErrorType: string;
+  lastErrorMessage: string;
+  lastHttpStatus?: number | null;
+  lastLatencyMs?: number | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type AiGatewayBundle = {
+  channels: AiGatewayChannel[];
+  routes: AiGatewayRoute[];
+  circuits: AiGatewayCircuit[];
+  scheduler?: AiGatewaySchedulerSnapshot;
+};
+
+export type AiGatewaySchedulerState = {
+  inFlight: number;
+  healthScore: number;
+  consecutiveFailures: number;
+  recentFailureCount: number;
+  recentTotalCount: number;
+  recentStartCount?: number;
+  openUntil: number;
+  lastError: string;
+};
+
+export type AiGatewaySchedulerSnapshot = {
+  credentials: Record<string, AiGatewaySchedulerState>;
+  channels: Record<string, AiGatewaySchedulerState>;
+};
+
+export type AiGatewayChannelPayload = {
+  id?: string;
+  name: string;
+  providerType?: string;
+  baseUrl?: string;
+  textModel?: string;
+  imageModel?: string;
+  modelTemplates?: Record<string, string>;
+  capabilities?: string[];
+  enabled?: boolean;
+  priority?: number;
+  connectTimeoutSeconds?: number;
+  readTimeoutSeconds?: number;
+  notes?: string;
+};
+
+export type AiGatewayCredentialPayload = {
+  id?: string;
+  channelId: string;
+  name: string;
+  apiKey?: string;
+  clearApiKey?: boolean;
+  enabled?: boolean;
+  priority?: number;
+  weight?: number;
+  maxConcurrency?: number;
+  rpmLimit?: number;
+  dailyLimit?: number;
+  monthlyLimit?: number;
+  notes?: string;
+};
+
+export type AiGatewayRoutePayload = {
+  title?: string;
+  modelType?: string;
+  channelOrder?: string[];
+  keySelectionPolicy?: string;
+  maxChannelAttempts?: number;
+  allowCrossChannelFallback?: boolean;
+  enabled?: boolean;
+};
+
+export type AiGatewayDryRun = {
+  route: AiGatewayRoute;
+  selected?: {
+    channel: AiGatewayChannel;
+    credential: AiGatewayCredential;
+    model: string;
+  } | null;
+  attempts: Array<{
+    channelId: string;
+    channelName?: string;
+    credentialId?: string;
+    credentialName?: string;
+    status: string;
+    reason: string;
+  }>;
 };
 
 export function clearLegacyAuthToken() {
@@ -246,7 +396,8 @@ export type BackendProduct = {
 
 export type ProductListResponse = {
   items: BackendProduct[];
-  total: number;
+  total: number | null;
+  total_included?: boolean;
   page: number;
   page_size: number;
 };
@@ -265,6 +416,7 @@ export type ProductListParams = {
   scope?: 'pool' | 'all';
   sortBy?: 'price' | 'gmv';
   sortOrder?: 'asc' | 'desc';
+  includeTotal?: boolean;
 };
 
 export type ProductStats = {
@@ -490,6 +642,23 @@ export type VisualGenerationTask = {
   manifest?: Record<string, unknown>;
   modules: VisualGenerationModule[];
   errorMessage?: string | null;
+  progressState?: string | null;
+  progressMessage?: string | null;
+  activeChannelId?: string | null;
+  activeCredentialId?: string | null;
+  activeCredentialName?: string | null;
+  activeModel?: string | null;
+  timeoutSeconds?: number | string | null;
+  switchingErrorType?: string | null;
+  lastSwitchChannelId?: string | null;
+  lastSwitchCredentialId?: string | null;
+  lastSwitchCredentialName?: string | null;
+  lastSwitchModel?: string | null;
+  lastSwitchErrorType?: string | null;
+  lastSwitchError?: string | null;
+  retryCount?: number | null;
+  nextRetryAt?: number | string | null;
+  retryErrorMessage?: string | null;
   createdAt: string;
   updatedAt: string;
 };
@@ -499,11 +668,7 @@ export type VisualQueueSummary = {
   activeCount: number;
   runningCount?: number;
   queuedCount?: number;
-  teamActiveCount: number;
-  teamRunningCount?: number;
   userConcurrencyLimit: number;
-  teamConcurrencyLimit: number;
-  team?: Record<string, string>;
   redisEnabled: boolean;
   redisQueueName: string;
   redisQueueLength?: number | null;
@@ -656,9 +821,13 @@ export async function registerUser(username: string, password: string, displayNa
 }
 
 export async function fetchCurrentUser(): Promise<CurrentUser> {
-  const response = await fetch(`${API_BASE_URL}/api/auth/me`, withSession({
-    headers: authHeaders(),
-  }));
+  const response = await fetchWithTimeout(
+    `${API_BASE_URL}/api/auth/me`,
+    withSession({
+      headers: authHeaders(),
+    }),
+    SESSION_RESTORE_TIMEOUT_MS,
+  );
   if (!response.ok) {
     if (response.status === 401) clearLegacyAuthToken();
     throw new Error(await readErrorMessage(response));
@@ -745,6 +914,7 @@ export async function fetchProducts(params: ProductListParams): Promise<ProductL
   if (params.scope) search.set('scope', params.scope);
   if (params.sortBy) search.set('sort_by', params.sortBy);
   if (params.sortOrder) search.set('sort_order', params.sortOrder);
+  if (params.includeTotal === false) search.set('include_total', 'false');
   if (params.poolAddedStart) search.set('pool_added_start', params.poolAddedStart);
   if (params.poolAddedEnd) search.set('pool_added_end', params.poolAddedEnd);
   appendRangeParams(search, 'price', params.priceRange);
@@ -1270,6 +1440,22 @@ export async function deleteVisualGenerationTask(taskId: string): Promise<void> 
     throw new Error(await readErrorMessage(response));
   }
 }
+
+export async function deleteVisualGenerationTasks(taskIds: string[]): Promise<{ deletedCount: number; missingIds: string[] }> {
+  const response = await fetch(`${API_BASE_URL}/api/visual/tasks/batch-delete`, withSession({
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ taskIds }),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+  const body = await response.json();
+  return {
+    deletedCount: body.deletedCount || 0,
+    missingIds: body.missingIds || [],
+  };
+}
 export async function planVisualGenerationTask(
   taskId: string,
   payload: VisualTaskPlanPayload = {},
@@ -1474,8 +1660,17 @@ export async function fetchAdminSettings(): Promise<AdminSetting[]> {
   return body.items || [];
 }
 
-export async function fetchAdminApiUsage(): Promise<AdminApiUsageSummary> {
-  const response = await fetch(`${API_BASE_URL}/api/admin/api-usage`, withSession({
+export async function fetchAdminApiUsage(
+  scope: 'all' | 'models' | 'groups' = 'all',
+  filters: AdminApiUsageFilters = {},
+): Promise<AdminApiUsageSummary> {
+  const search = new URLSearchParams({ scope });
+  if (filters.timeRange) search.set('timeRange', filters.timeRange);
+  if (filters.channelId) search.set('channelId', filters.channelId);
+  if (filters.credentialId) search.set('credentialId', filters.credentialId);
+  if (filters.stage) search.set('stage', filters.stage);
+  if (filters.status) search.set('status', filters.status);
+  const response = await fetch(`${API_BASE_URL}/api/admin/api-usage?${search}`, withSession({
     headers: authHeaders(),
   }));
   if (!response.ok) {
@@ -1491,21 +1686,9 @@ export async function fetchAdminApiUsage(): Promise<AdminApiUsageSummary> {
     byUser: body.byUser || [],
     byTeam: body.byTeam || [],
     byChannel: body.byChannel || [],
-  };
-}
-
-export async function fetchAdminApiChannels(): Promise<AdminApiChannelBundle> {
-  const response = await fetch(`${API_BASE_URL}/api/admin/api-channels`, withSession({
-    headers: authHeaders(),
-  }));
-  if (!response.ok) {
-    throw new Error(await readErrorMessage(response));
-  }
-
-  const body = await response.json();
-  return {
-    channels: body.channels || [],
-    routes: body.routes || [],
+    byCredential: body.byCredential || [],
+    keyStats: body.keyStats || [],
+    recentLogs: body.recentLogs || [],
   };
 }
 
@@ -1521,25 +1704,23 @@ export async function fetchAdminPromptConfigs(): Promise<AdminPromptConfig[]> {
   return body.items || [];
 }
 
-export async function updateAdminApiChannels(items: AdminApiChannelUpdateItem[]): Promise<AdminApiChannelBundle> {
-  const response = await fetch(`${API_BASE_URL}/api/admin/api-channels`, withSession({
+export async function updateAdminPromptConfig(id: string, content: string): Promise<AdminPromptConfig> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/prompt-configs/${encodeURIComponent(id)}`, withSession({
     method: 'PUT',
     headers: authHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify({ items }),
+    body: JSON.stringify({ content }),
   }));
   if (!response.ok) {
     throw new Error(await readErrorMessage(response));
   }
 
   const body = await response.json();
-  return {
-    channels: body.channels || [],
-    routes: body.routes || [],
-  };
+  return body.item;
 }
 
-export async function fetchAdminUserApiCredentials(userId: string): Promise<AdminUserApiCredential[]> {
-  const response = await fetch(`${API_BASE_URL}/api/admin/users/${encodeURIComponent(userId)}/api-credentials`, withSession({
+export async function restoreAdminPromptConfig(id: string): Promise<AdminPromptConfig> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/prompt-configs/${encodeURIComponent(id)}/restore`, withSession({
+    method: 'POST',
     headers: authHeaders(),
   }));
   if (!response.ok) {
@@ -1547,66 +1728,7 @@ export async function fetchAdminUserApiCredentials(userId: string): Promise<Admi
   }
 
   const body = await response.json();
-  return body.items || [];
-}
-
-export async function updateAdminUserApiCredentials(
-  userId: string,
-  items: AdminUserApiCredentialUpdateItem[],
-): Promise<AdminUserApiCredential[]> {
-  const response = await fetch(`${API_BASE_URL}/api/admin/users/${encodeURIComponent(userId)}/api-credentials`, withSession({
-    method: 'PUT',
-    headers: authHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify({ items }),
-  }));
-  if (!response.ok) {
-    throw new Error(await readErrorMessage(response));
-  }
-
-  const body = await response.json();
-  return body.items || [];
-}
-
-export async function applyAdminApiRoute(payload: {
-  stage: string;
-  channelId: string;
-  model?: string;
-}): Promise<AdminApiChannelBundle> {
-  const response = await fetch(`${API_BASE_URL}/api/admin/api-channels/apply`, withSession({
-    method: 'POST',
-    headers: authHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify(payload),
-  }));
-  if (!response.ok) {
-    throw new Error(await readErrorMessage(response));
-  }
-
-  const body = await response.json();
-  return {
-    channels: body.channels || [],
-    routes: body.routes || [],
-  };
-}
-
-export async function applyAdminApiRoutesToAll(payload: {
-  channelId: string;
-  textModel?: string;
-  imageModel?: string;
-}): Promise<AdminApiChannelBundle> {
-  const response = await fetch(`${API_BASE_URL}/api/admin/api-channels/apply-all`, withSession({
-    method: 'POST',
-    headers: authHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify(payload),
-  }));
-  if (!response.ok) {
-    throw new Error(await readErrorMessage(response));
-  }
-
-  const body = await response.json();
-  return {
-    channels: body.channels || [],
-    routes: body.routes || [],
-  };
+  return body.item;
 }
 
 export async function updateAdminSettings(items: AdminSettingsUpdateItem[]): Promise<AdminSetting[]> {
@@ -1621,6 +1743,135 @@ export async function updateAdminSettings(items: AdminSettingsUpdateItem[]): Pro
 
   const body = await response.json();
   return body.items || [];
+}
+
+export async function fetchAiGatewayBundle(): Promise<AiGatewayBundle> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/ai-gateway`, withSession({
+    headers: authHeaders(),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return {
+    channels: body.channels || [],
+    routes: body.routes || [],
+    circuits: body.circuits || [],
+    scheduler: body.scheduler,
+  };
+}
+
+export async function saveAiGatewayChannel(payload: AiGatewayChannelPayload): Promise<AiGatewayChannel> {
+  const method = payload.id ? 'PATCH' : 'POST';
+  const suffix = payload.id ? `/${encodeURIComponent(payload.id)}` : '';
+  const response = await fetch(`${API_BASE_URL}/api/admin/ai-gateway/channels${suffix}`, withSession({
+    method,
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.channel;
+}
+
+export async function deleteAiGatewayChannel(channelId: string): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/ai-gateway/channels/${encodeURIComponent(channelId)}`, withSession({
+    method: 'DELETE',
+    headers: authHeaders(),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+}
+
+export async function saveAiGatewayCredential(payload: AiGatewayCredentialPayload): Promise<AiGatewayCredential> {
+  const method = payload.id ? 'PATCH' : 'POST';
+  const suffix = payload.id ? `/${encodeURIComponent(payload.id)}` : '';
+  const response = await fetch(`${API_BASE_URL}/api/admin/ai-gateway/credentials${suffix}`, withSession({
+    method,
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.credential;
+}
+
+export async function deleteAiGatewayCredential(credentialId: string): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/ai-gateway/credentials/${encodeURIComponent(credentialId)}`, withSession({
+    method: 'DELETE',
+    headers: authHeaders(),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+}
+
+export async function saveAiGatewayRoute(stage: string, payload: AiGatewayRoutePayload): Promise<AiGatewayRoute> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/ai-gateway/routes/${encodeURIComponent(stage)}`, withSession({
+    method: 'PUT',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.route;
+}
+
+export async function dryRunAiGatewayRoute(stage: string): Promise<AiGatewayDryRun> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/ai-gateway/routes/${encodeURIComponent(stage)}/dry-run`, withSession({
+    method: 'POST',
+    headers: authHeaders(),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  return response.json();
+}
+
+export async function setAiGatewayCircuit(payload: {
+  scopeType: string;
+  scopeId: string;
+  state: string;
+  stage?: string;
+  model?: string;
+  errorMessage?: string;
+}): Promise<AiGatewayCircuit> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/ai-gateway/circuits`, withSession({
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.circuit;
+}
+
+export async function resetAiGatewayCircuit(circuitId: string): Promise<AiGatewayCircuit> {
+  const response = await fetch(`${API_BASE_URL}/api/admin/ai-gateway/circuits/${encodeURIComponent(circuitId)}/reset`, withSession({
+    method: 'POST',
+    headers: authHeaders(),
+  }));
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response));
+  }
+
+  const body = await response.json();
+  return body.circuit;
 }
 
 export function mapBackendProduct(product: BackendProduct): Product {
@@ -1711,3 +1962,4 @@ function toOptionalNumber(value?: string): number | undefined {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : undefined;
 }
+

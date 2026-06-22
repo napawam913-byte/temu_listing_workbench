@@ -20,10 +20,14 @@ from app.modules.visual_generation.queue import (
     set_visual_progress,
 )
 from app.modules.visual_generation.service import (
+    TASK_STATUS_CANCELLED,
     TASK_STATUS_FAILED,
     TASK_STATUS_QUEUED,
     TASK_STATUS_RUNNING,
+    VisualTaskCancelled,
     VisualTaskError,
+    VisualTaskNonRetryableError,
+    assert_visual_task_not_cancelled,
     assert_visual_concurrency_available,
     count_running_visual_tasks_global,
     mark_task_failed,
@@ -95,13 +99,28 @@ def run_visual_job(job: dict[str, Any]) -> None:
     if not task_id or not user_id:
         raise ValueError("visual job requires taskId and userId")
 
-    slot_ready, wait_reason = reserve_visual_run_slot(task_id, user_id, job_id=job.get("jobId"))
-    if not slot_ready:
-        if enqueue_visual_deferred(job, reason=wait_reason, delay_seconds=CONCURRENCY_WAIT_POLL_SECONDS):
-            return
-        waited_for_slot = wait_for_visual_run_slot(task_id, user_id, job_id=job.get("jobId"))
-    else:
-        waited_for_slot = False
+    try:
+        assert_visual_task_not_cancelled(task_id, user_id)
+    except VisualTaskCancelled as exc:
+        set_visual_progress(
+            task_id,
+            {"state": TASK_STATUS_CANCELLED, "jobId": job.get("jobId"), "message": str(exc)},
+        )
+        return
+    try:
+        slot_ready, wait_reason = reserve_visual_run_slot(task_id, user_id, job_id=job.get("jobId"))
+        if not slot_ready:
+            if enqueue_visual_deferred(job, reason=wait_reason, delay_seconds=CONCURRENCY_WAIT_POLL_SECONDS):
+                return
+            waited_for_slot = wait_for_visual_run_slot(task_id, user_id, job_id=job.get("jobId"))
+        else:
+            waited_for_slot = False
+    except VisualTaskCancelled as exc:
+        set_visual_progress(
+            task_id,
+            {"state": TASK_STATUS_CANCELLED, "jobId": job.get("jobId"), "message": str(exc)},
+        )
+        return
     try:
         run_visual_task_pipeline(
             task_id=task_id,
@@ -119,12 +138,27 @@ def run_visual_job(job: dict[str, Any]) -> None:
             apply_to_link_record=bool(job.get("applyToLinkRecord", True)),
             reuse_existing_outputs=bool(job.get("reuseExistingOutputs") or visual_job_retry_count(job) > 0),
         )
+        assert_visual_task_not_cancelled(task_id, user_id)
         set_visual_progress(
             task_id,
             {"state": "completed", "jobId": job.get("jobId"), "waitedForConcurrency": waited_for_slot},
         )
+    except VisualTaskCancelled as exc:
+        set_visual_progress(
+            task_id,
+            {"state": TASK_STATUS_CANCELLED, "jobId": job.get("jobId"), "message": str(exc)},
+        )
+        return
     except Exception as exc:
-        if should_retry_visual_job(job):
+        try:
+            assert_visual_task_not_cancelled(task_id, user_id)
+        except VisualTaskCancelled as cancelled_exc:
+            set_visual_progress(
+                task_id,
+                {"state": TASK_STATUS_CANCELLED, "jobId": job.get("jobId"), "message": str(cancelled_exc)},
+            )
+            return
+        if not isinstance(exc, VisualTaskNonRetryableError) and should_retry_visual_job(job):
             retry_delay = default_retry_delay_seconds()
             mark_task_retry_waiting(task_id, user_id, str(exc))
             if enqueue_visual_retry(job, error_message=str(exc), delay_seconds=retry_delay):
@@ -143,9 +177,13 @@ def wait_for_visual_run_slot(task_id: str, user_id: str, *, job_id: Any = None) 
     waited = False
     wait_reason = ""
     while True:
+        assert_visual_task_not_cancelled(task_id, user_id)
         with _VISUAL_RUN_SLOT_LOCK:
             try:
+                assert_visual_task_not_cancelled(task_id, user_id)
                 assert_visual_concurrency_available(user_id, exclude_task_id=task_id)
+            except VisualTaskCancelled:
+                raise
             except VisualTaskError as exc:
                 wait_reason = str(exc)
             else:
@@ -171,9 +209,13 @@ def wait_for_visual_run_slot(task_id: str, user_id: str, *, job_id: Any = None) 
 
 
 def reserve_visual_run_slot(task_id: str, user_id: str, *, job_id: Any = None) -> tuple[bool, str]:
+    assert_visual_task_not_cancelled(task_id, user_id)
     with _VISUAL_RUN_SLOT_LOCK:
         try:
+            assert_visual_task_not_cancelled(task_id, user_id)
             assert_visual_concurrency_available(user_id, exclude_task_id=task_id)
+        except VisualTaskCancelled:
+            raise
         except VisualTaskError as exc:
             reason = str(exc)
             update_task_status(task_id, user_id, TASK_STATUS_QUEUED, clear_error=True)

@@ -50,7 +50,7 @@ def sanitize_marketplace_text(text: Any) -> tuple[str, list[str]]:
 
 def get_sensitive_term_rules() -> list[dict[str, Any]]:
     try:
-        from app.core.database import list_enabled_sensitive_terms
+        from app.modules.admin_config.postgres_store import list_enabled_sensitive_terms
 
         rules = list_enabled_sensitive_terms()
         if rules:

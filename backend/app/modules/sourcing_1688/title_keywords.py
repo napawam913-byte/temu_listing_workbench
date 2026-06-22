@@ -4,9 +4,11 @@ import json
 import re
 from typing import Any
 
-from app.core.database import assert_user_api_usage_allowed, record_api_usage_safe
+from app.modules.admin_config.postgres_store import assert_user_api_usage_allowed, record_api_usage_safe
+from app.modules.ai_gateway import scheduler as ai_gateway_scheduler
 from app.modules.creative_generation.chatgpt_listing import build_openai_client, get_openai_settings
 from app.modules.creative_generation.safety import sanitize_marketplace_text
+from app.modules.prompt_templates import render_prompt_template
 from app.modules.sourcing_1688.ai_response import contains_cjk, parse_ai_response_json
 from app.modules.sourcing_1688.search_url import build_1688_search_url
 
@@ -72,17 +74,23 @@ def split_title_for_1688_search(title: str, category: str = "", *, user_id: str 
     if settings.api_key:
         assert_user_api_usage_allowed(user_id)
         try:
-            result = split_title_with_gpt(title=clean_title, category=clean_category, settings=settings)
+            result, usage_settings = split_title_with_gateway_fallback(
+                title=clean_title,
+                category=clean_category,
+                settings=settings,
+            )
             record_api_usage_safe(
                 provider="openai-compatible",
                 api_type="chat",
                 stage=TITLE_SPLIT_STAGE,
-                model=settings.text_model,
+                model=usage_settings.text_model,
                 user_id=user_id,
-                channel_id=settings.channel_id,
+                channel_id=usage_settings.channel_id,
+                credential_id=getattr(usage_settings, "credential_id", ""),
+                credential_name=getattr(usage_settings, "credential_name", ""),
                 status="success",
             )
-            return {**result, "source": "gpt", "model": settings.text_model}
+            return {**result, "source": "gpt", "model": usage_settings.text_model}
         except Exception as exc:  # noqa: BLE001
             record_api_usage_safe(
                 provider="openai-compatible",
@@ -91,6 +99,8 @@ def split_title_for_1688_search(title: str, category: str = "", *, user_id: str 
                 model=settings.text_model,
                 user_id=user_id,
                 channel_id=settings.channel_id,
+                credential_id=getattr(settings, "credential_id", ""),
+                credential_name=getattr(settings, "credential_name", ""),
                 status="failed",
                 error_message=str(exc),
             )
@@ -98,6 +108,57 @@ def split_title_for_1688_search(title: str, category: str = "", *, user_id: str 
 
     fallback = build_fallback_title_keywords(clean_title, clean_category)
     return {**fallback, "source": "rule-fallback", "model": "rule-fallback"}
+
+
+def split_title_with_gateway_fallback(
+    *,
+    title: str,
+    category: str,
+    settings: Any,
+) -> tuple[dict[str, Any], Any]:
+    attempt_limit = ai_gateway_scheduler.resolve_attempt_limit(TITLE_SPLIT_STAGE)
+    excluded_credential_ids: set[str] = set()
+    first_candidate = ai_gateway_scheduler.acquire_candidate(
+        TITLE_SPLIT_STAGE,
+        task_type="api",
+        excluded_credential_ids=excluded_credential_ids,
+    )
+    if not first_candidate:
+        return split_title_with_gpt(title=title, category=category, settings=settings), settings
+    last_error: BaseException | None = None
+    candidate: dict[str, Any] | None = first_candidate
+    for attempt_index in range(attempt_limit):
+        if not candidate:
+            break
+        excluded_credential_ids.add(str(candidate.get("credentialId") or ""))
+        trial_settings = replace_settings_from_gateway_candidate(settings, candidate)
+        try:
+            result = split_title_with_gpt(title=title, category=category, settings=trial_settings)
+            ai_gateway_scheduler.finish_attempt(candidate, success=True)
+            return result, trial_settings
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            ai_gateway_scheduler.finish_attempt(candidate, success=False, error_message=str(exc))
+            if attempt_index < attempt_limit - 1:
+                candidate = ai_gateway_scheduler.acquire_candidate(
+                    TITLE_SPLIT_STAGE,
+                    task_type="api",
+                    excluded_credential_ids=excluded_credential_ids,
+                )
+    raise last_error or ValueError("API 中枢没有可用标题拆分渠道")
+
+
+def replace_settings_from_gateway_candidate(settings: Any, candidate: dict[str, Any]) -> Any:
+    return type(settings)(
+        api_key=str(candidate.get("apiKey") or ""),
+        base_url=str(candidate.get("baseUrl") or ""),
+        text_model=str(candidate.get("model") or getattr(settings, "text_model", "")),
+        image_model=getattr(settings, "image_model", ""),
+        image_quality=getattr(settings, "image_quality", "medium"),
+        channel_id=str(candidate.get("channelId") or ""),
+        credential_id=str(candidate.get("credentialId") or ""),
+        credential_name=str(candidate.get("credentialName") or candidate.get("credentialId") or ""),
+    )
 
 
 def split_title_with_gpt(title: str, category: str, settings: Any) -> dict[str, Any]:
@@ -272,6 +333,25 @@ def compact_cjk_around_noun(title: str, noun: str) -> str:
 
 def keyword_item(keyword: str, intent: str, reason: str) -> dict[str, str]:
     return {"keyword": keyword, "intent": intent, "reason": reason}
+
+
+def split_title_with_gpt(title: str, category: str, settings: Any) -> dict[str, Any]:
+    client = build_openai_client(settings)
+    instruction = render_prompt_template(
+        "title_split",
+        {
+            "productTitle": title,
+            "category": category,
+        },
+    )
+    response = client.chat.completions.create(
+        model=settings.text_model,
+        messages=[{"role": "system", "content": instruction}],
+    )
+    result = normalize_title_keyword_response(parse_ai_response_json(response), title, category)
+    if not contains_cjk(result.get("primary_keyword")):
+        raise ValueError("模型没有返回中文 1688 搜索词")
+    return result
 
 
 def unique_keyword_items(items: list[dict[str, str]]) -> list[dict[str, str]]:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-import sqlite3
 import uuid
 from typing import Any
 
@@ -120,7 +119,7 @@ STOP_TERMS = {
 }
 
 
-def ensure_recommendation_schema(conn: sqlite3.Connection) -> None:
+def ensure_recommendation_schema(conn: Any) -> None:
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS product_keywords (
@@ -157,7 +156,7 @@ def ensure_recommendation_schema(conn: sqlite3.Connection) -> None:
 
 
 def replace_product_keyword_index(
-    conn: sqlite3.Connection,
+    conn: Any,
     products: list[dict[str, Any]],
     *,
     now: str,
@@ -178,11 +177,16 @@ def replace_product_keyword_index(
 
     conn.executemany(
         """
-        INSERT OR REPLACE INTO product_keywords (
+        INSERT INTO product_keywords (
             id, product_id, keyword, keyword_type, weight, source, created_at, updated_at
         ) VALUES (
             :id, :product_id, :keyword, :keyword_type, :weight, :source, :created_at, :updated_at
         )
+        ON CONFLICT (product_id, keyword, keyword_type) DO UPDATE SET
+            id = excluded.id,
+            weight = excluded.weight,
+            source = excluded.source,
+            updated_at = excluded.updated_at
         """,
         records,
     )
@@ -190,7 +194,8 @@ def replace_product_keyword_index(
 
 
 def rebuild_all_product_keyword_index() -> dict[str, int]:
-    from app.core.database import get_connection, utc_now_text
+    from app.core.database import utc_now_text
+    from app.modules.exports.postgres_store import get_export_connection as get_connection
 
     now = utc_now_text()
     with get_connection() as conn:
@@ -338,7 +343,7 @@ def to_string_list(value: Any) -> list[str]:
     return []
 
 
-def row_to_product_dict(row: sqlite3.Row) -> dict[str, Any]:
+def row_to_product_dict(row: Any) -> dict[str, Any]:
     return {
         "id": row["id"],
         "title": row["title"],

@@ -9,4 +9,5 @@ python-multipart>=0.0.9,<0.0.10
 oss2>=2.18.0,<3.0.0
 openai>=1.93.0,<2.0.0
 redis>=5.0.8,<6.0.0
-psycopg[binary]>=3.2.3,<3.3.0
+psycopg[pool,binary]>=3.2.3,<3.3.0
+cryptography>=42.0.0,<50.0.0

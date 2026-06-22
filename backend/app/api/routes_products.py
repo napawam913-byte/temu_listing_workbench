@@ -31,6 +31,7 @@ def get_products(
     scope: str = Query("pool", pattern="^(pool|all)$"),
     sort_by: str | None = Query(None, pattern="^(price|gmv)$"),
     sort_order: str | None = Query(None, pattern="^(asc|desc)$"),
+    include_total: bool = True,
     current_user: dict[str, Any] = Depends(require_current_user),
 ):
     return postgres_store.list_products(
@@ -50,6 +51,7 @@ def get_products(
         scope=scope,
         sort_by=sort_by,
         sort_order=sort_order,
+        include_total=include_total,
         user_id=current_user["id"],
     )
 

@@ -18,16 +18,19 @@ from app.modules.recommendation.keyword_index import ensure_recommendation_schem
 
 from . import config as app_config
 from .config import (
+    ALLOW_LOCAL_SQLITE,
     DATABASE_PATH,
     UPLOADS_DIR,
     WORKBENCH_DEFAULT_PASSWORD,
     WORKBENCH_DEFAULT_USERNAME,
     WORKBENCH_SESSION_COOKIE_MAX_AGE_SECONDS,
+    cloud_database_enabled,
     ensure_runtime_dirs,
 )
 
 
 DEFAULT_USER_ID = "default-user"
+_sqlite_wal_configured = False
 CANONICAL_CATEGORY_PROVIDER = "dxm_temu"
 PRODUCT_CATALOG_SCOPE_ADMIN = "admin_catalog"
 PRODUCT_CATALOG_SCOPE_POOL_ONLY = "pool_only"
@@ -231,11 +234,28 @@ def utc_now_text() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat(sep=" ")
 
 
+def assert_local_sqlite_allowed() -> None:
+    if cloud_database_enabled() and not ALLOW_LOCAL_SQLITE:
+        raise RuntimeError(
+            "Local SQLite is disabled because a cloud PostgreSQL database is configured. "
+            "Move this runtime path to a PostgreSQL store, or set TEMU_WORKBENCH_ALLOW_LOCAL_SQLITE=1 for local-only debugging."
+        )
+
+
 @contextmanager
 def get_connection() -> Iterator[sqlite3.Connection]:
+    global _sqlite_wal_configured
+    assert_local_sqlite_allowed()
     ensure_runtime_dirs()
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = sqlite3.connect(DATABASE_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")
+    if not _sqlite_wal_configured:
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+            _sqlite_wal_configured = True
+        except sqlite3.OperationalError:
+            pass
     try:
         yield conn
         conn.commit()
@@ -496,6 +516,7 @@ def init_db() -> None:
         seed_product_pool_from_legacy_flag(conn)
         seed_product_pool_memberships_from_legacy(conn)
         ensure_recommendation_schema(conn)
+        ensure_ai_gateway_schema(conn)
         seed_default_sensitive_terms(conn)
 
 
@@ -505,6 +526,92 @@ def ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, d
         conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {ddl}")
 
 
+def ensure_ai_gateway_schema(conn: sqlite3.Connection) -> None:
+    from app.modules.ai_gateway.store import seed_default_routes
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS ai_gateway_channels (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            provider_type TEXT NOT NULL DEFAULT 'openai_compatible',
+            base_url TEXT NOT NULL DEFAULT '',
+            text_model TEXT NOT NULL DEFAULT '',
+            image_model TEXT NOT NULL DEFAULT '',
+            capabilities_json TEXT NOT NULL DEFAULT '["chat"]',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            priority INTEGER NOT NULL DEFAULT 100,
+            connect_timeout_seconds INTEGER NOT NULL DEFAULT 10,
+            read_timeout_seconds INTEGER NOT NULL DEFAULT 60,
+            notes TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            updated_by TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS ai_gateway_credentials (
+            id TEXT PRIMARY KEY,
+            channel_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            api_key TEXT NOT NULL DEFAULT '',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            priority INTEGER NOT NULL DEFAULT 100,
+            weight INTEGER NOT NULL DEFAULT 1,
+            max_concurrency INTEGER NOT NULL DEFAULT 2,
+            rpm_limit INTEGER NOT NULL DEFAULT 0,
+            daily_limit INTEGER NOT NULL DEFAULT 0,
+            monthly_limit INTEGER NOT NULL DEFAULT 0,
+            notes TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            updated_by TEXT,
+            FOREIGN KEY(channel_id) REFERENCES ai_gateway_channels(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_ai_gateway_credentials_channel
+            ON ai_gateway_credentials(channel_id, enabled);
+
+        CREATE TABLE IF NOT EXISTS ai_gateway_route_policies (
+            stage TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT '',
+            model_type TEXT NOT NULL DEFAULT 'text',
+            channel_order_json TEXT NOT NULL DEFAULT '[]',
+            key_selection_policy TEXT NOT NULL DEFAULT 'least_in_flight_weighted',
+            max_channel_attempts INTEGER NOT NULL DEFAULT 3,
+            allow_cross_channel_fallback INTEGER NOT NULL DEFAULT 1,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            updated_by TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS ai_gateway_circuit_states (
+            id TEXT PRIMARY KEY,
+            scope_type TEXT NOT NULL,
+            scope_id TEXT NOT NULL,
+            stage TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL DEFAULT 'closed',
+            failure_count INTEGER NOT NULL DEFAULT 0,
+            success_count INTEGER NOT NULL DEFAULT 0,
+            opened_until TEXT,
+            last_error_type TEXT NOT NULL DEFAULT '',
+            last_error_message TEXT NOT NULL DEFAULT '',
+            last_http_status INTEGER,
+            last_latency_ms INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            updated_by TEXT,
+            UNIQUE(scope_type, scope_id, stage, model)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_ai_gateway_circuit_lookup
+            ON ai_gateway_circuit_states(scope_type, scope_id, state);
+        """
+    )
+    seed_default_routes(conn)
+
+
 def ensure_api_usage_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
@@ -512,6 +619,8 @@ def ensure_api_usage_schema(conn: sqlite3.Connection) -> None:
             id TEXT PRIMARY KEY,
             user_id TEXT,
             channel_id TEXT,
+            credential_id TEXT NOT NULL DEFAULT '',
+            credential_name TEXT NOT NULL DEFAULT '',
             provider TEXT NOT NULL DEFAULT '',
             api_type TEXT NOT NULL DEFAULT '',
             stage TEXT NOT NULL DEFAULT '',
@@ -534,10 +643,18 @@ def ensure_api_usage_schema(conn: sqlite3.Connection) -> None:
         """
     )
     ensure_column(conn, "api_usage_logs", "channel_id", "channel_id TEXT")
+    ensure_column(conn, "api_usage_logs", "credential_id", "credential_id TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "api_usage_logs", "credential_name", "credential_name TEXT NOT NULL DEFAULT ''")
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_api_usage_logs_user_channel
             ON api_usage_logs(user_id, channel_id, created_at)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_api_usage_logs_credential
+            ON api_usage_logs(credential_id, user_id, created_at)
         """
     )
 
@@ -895,6 +1012,8 @@ def record_api_usage(
     model: str,
     user_id: str | None = None,
     channel_id: str | None = None,
+    credential_id: str | None = None,
+    credential_name: str | None = None,
     call_count: int = 1,
     status: str = "success",
     source: str = "runtime-log",
@@ -911,6 +1030,8 @@ def record_api_usage(
         model=model,
         user_id=user_id,
         channel_id=channel_id,
+        credential_id=credential_id,
+        credential_name=credential_name,
         call_count=call_count,
         status=status,
         source=source,
@@ -929,14 +1050,16 @@ def record_api_usage(
         conn.execute(
             """
             INSERT INTO api_usage_logs (
-                id, user_id, channel_id, provider, api_type, stage, model, call_count, status, source,
+                id, user_id, channel_id, credential_id, credential_name, provider, api_type, stage, model, call_count, status, source,
                 related_id, error_message, metadata_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 usage_id,
                 clean_text(user_id),
                 clean_text(channel_id),
+                clean_text(credential_id),
+                clean_text(credential_name),
                 clean_text(provider),
                 clean_text(api_type),
                 clean_text(stage),
@@ -1050,7 +1173,9 @@ def upsert_user_api_credential(
             (clean_user_id, clean_channel_id),
         ).fetchone()
 
-        next_api_key = str(existing["api_key"] or "") if existing else ""
+        from app.core.secrets import decrypt_secret_value, encrypt_secret_value
+
+        next_api_key = decrypt_secret_value(str(existing["api_key"] or "")) if existing else ""
         if api_key is not None and clean_text(api_key):
             next_api_key = str(api_key or "").strip()
         elif clear_api_key:
@@ -1088,7 +1213,7 @@ def upsert_user_api_credential(
                 WHERE user_id = ? AND channel_id = ?
                 """,
                 (
-                    next_api_key,
+                    encrypt_secret_value(next_api_key, enabled=True),
                     next_base_url,
                     next_text_model,
                     next_image_model,
@@ -1111,7 +1236,7 @@ def upsert_user_api_credential(
                     uuid.uuid4().hex,
                     clean_user_id,
                     clean_channel_id,
-                    next_api_key,
+                    encrypt_secret_value(next_api_key, enabled=True),
                     next_base_url,
                     next_text_model,
                     next_image_model,
@@ -1142,6 +1267,8 @@ def get_api_usage_summary() -> dict[str, Any]:
             SELECT
                 user_id,
                 channel_id,
+                credential_id,
+                credential_name,
                 provider,
                 api_type,
                 stage,
@@ -1152,7 +1279,7 @@ def get_api_usage_summary() -> dict[str, Any]:
                 SUM(CASE WHEN status = 'failed' THEN call_count ELSE 0 END) AS failed_count,
                 MAX(updated_at) AS last_called_at
             FROM api_usage_logs
-            GROUP BY user_id, channel_id, provider, api_type, stage, model, source
+            GROUP BY user_id, channel_id, credential_id, credential_name, provider, api_type, stage, model, source
             """
         ).fetchall()
         items = [api_usage_summary_row_to_api(row, is_inferred=False) for row in exact_rows]
@@ -1160,6 +1287,7 @@ def get_api_usage_summary() -> dict[str, Any]:
         by_user = summarize_api_usage_by_user_with_limits(conn)
         by_team = summarize_api_usage_by_team(conn)
         by_channel = summarize_api_usage_by_channel(conn)
+        by_credential = summarize_api_usage_by_credential(conn)
 
     merged = merge_api_usage_items(items)
     total_calls = sum(int(item["callCount"] or 0) for item in merged)
@@ -1173,6 +1301,7 @@ def get_api_usage_summary() -> dict[str, Any]:
         "byUser": by_user,
         "byTeam": by_team,
         "byChannel": by_channel,
+        "byCredential": by_credential,
     }
 
 
@@ -1364,6 +1493,90 @@ def summarize_api_usage_by_channel(conn: sqlite3.Connection) -> list[dict[str, A
     ]
 
 
+def summarize_api_usage_by_credential(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    parent_rows = conn.execute(
+        """
+        SELECT
+            credential_id,
+            credential_name,
+            channel_id,
+            SUM(call_count) AS call_count,
+            SUM(CASE WHEN status = 'success' THEN call_count ELSE 0 END) AS success_count,
+            SUM(CASE WHEN status = 'failed' THEN call_count ELSE 0 END) AS failed_count,
+            COUNT(DISTINCT NULLIF(user_id, '')) AS user_count,
+            MAX(updated_at) AS last_called_at
+        FROM api_usage_logs
+        WHERE COALESCE(credential_id, '') != ''
+        GROUP BY credential_id, credential_name, channel_id
+        ORDER BY call_count DESC
+        """
+    ).fetchall()
+    user_rows = conn.execute(
+        """
+        SELECT
+            logs.credential_id,
+            logs.credential_name,
+            logs.channel_id,
+            logs.user_id,
+            users.username,
+            users.display_name,
+            users.role,
+            SUM(logs.call_count) AS call_count,
+            SUM(CASE WHEN logs.status = 'success' THEN logs.call_count ELSE 0 END) AS success_count,
+            SUM(CASE WHEN logs.status = 'failed' THEN logs.call_count ELSE 0 END) AS failed_count,
+            MAX(logs.updated_at) AS last_called_at
+        FROM api_usage_logs AS logs
+        LEFT JOIN users ON users.id = logs.user_id
+        WHERE COALESCE(logs.credential_id, '') != ''
+        GROUP BY
+            logs.credential_id,
+            logs.credential_name,
+            logs.channel_id,
+            logs.user_id,
+            users.username,
+            users.display_name,
+            users.role
+        ORDER BY call_count DESC
+        """
+    ).fetchall()
+    children_by_credential: dict[str, list[dict[str, Any]]] = {}
+    for row in user_rows:
+        credential_id = clean_text(row["credential_id"])
+        if not credential_id:
+            continue
+        children_by_credential.setdefault(credential_id, []).append(
+            {
+                "credentialId": credential_id,
+                "credentialName": clean_text(row["credential_name"]) or credential_id,
+                "channelId": clean_text(row["channel_id"]) or "global",
+                "userId": clean_text(row["user_id"]) or "system",
+                "username": clean_text(row["username"]) or clean_text(row["user_id"]) or "system",
+                "displayName": clean_text(row["display_name"]) or clean_text(row["username"]) or clean_text(row["user_id"]) or "System",
+                "role": clean_text(row["role"]),
+                "userCount": 1 if clean_text(row["user_id"]) else 0,
+                "callCount": int(row["call_count"] or 0),
+                "successCount": int(row["success_count"] or 0),
+                "failedCount": int(row["failed_count"] or 0),
+                "lastCalledAt": row["last_called_at"],
+            }
+        )
+
+    return [
+        {
+            "credentialId": clean_text(row["credential_id"]),
+            "credentialName": clean_text(row["credential_name"]) or clean_text(row["credential_id"]),
+            "channelId": clean_text(row["channel_id"]) or "global",
+            "userCount": int(row["user_count"] or 0),
+            "callCount": int(row["call_count"] or 0),
+            "successCount": int(row["success_count"] or 0),
+            "failedCount": int(row["failed_count"] or 0),
+            "lastCalledAt": row["last_called_at"],
+            "children": children_by_credential.get(clean_text(row["credential_id"])) or [],
+        }
+        for row in parent_rows
+    ]
+
+
 def infer_api_usage_summary(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     if sqlite_table_exists(conn, "product_ai_analysis_cache"):
@@ -1454,11 +1667,12 @@ def add_inferred_usage_count(
 
 
 def merge_api_usage_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    merged: dict[tuple[str, str, str, str, str, str, str], dict[str, Any]] = {}
+    merged: dict[tuple[str, str, str, str, str, str, str, str], dict[str, Any]] = {}
     for item in items:
         key = (
             item.get("userId", ""),
             item.get("channelId", ""),
+            item.get("credentialId", ""),
             item["provider"],
             item["apiType"],
             item["stage"],
@@ -1486,6 +1700,8 @@ def api_usage_log_row_to_api(row: sqlite3.Row) -> dict[str, Any]:
         "id": row["id"],
         "userId": row["user_id"],
         "channelId": row["channel_id"] if "channel_id" in row.keys() else "",
+        "credentialId": row["credential_id"] if "credential_id" in row.keys() else "",
+        "credentialName": row["credential_name"] if "credential_name" in row.keys() else "",
         "provider": row["provider"],
         "apiType": row["api_type"],
         "stage": row["stage"],
@@ -1502,11 +1718,13 @@ def api_usage_log_row_to_api(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def user_api_credential_row_to_api(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    from app.core.secrets import decrypt_secret_value
+
     return {
         "id": row["id"],
         "userId": row["user_id"],
         "channelId": row["channel_id"],
-        "apiKey": row["api_key"],
+        "apiKey": decrypt_secret_value(str(row["api_key"] or "")),
         "baseUrl": row["base_url"],
         "textModel": row["text_model"],
         "imageModel": row["image_model"],
@@ -1521,6 +1739,8 @@ def api_usage_summary_row_to_api(row: sqlite3.Row, *, is_inferred: bool) -> dict
     return make_api_usage_summary_item(
         user_id=row["user_id"] if row_has_key(row, "user_id") else "",
         channel_id=row["channel_id"] if row_has_key(row, "channel_id") else "",
+        credential_id=row["credential_id"] if row_has_key(row, "credential_id") else "",
+        credential_name=row["credential_name"] if row_has_key(row, "credential_name") else "",
         provider=row["provider"],
         api_type=row["api_type"],
         stage=row["stage"],
@@ -1538,6 +1758,8 @@ def make_api_usage_summary_item(
     *,
     user_id: str = "",
     channel_id: str = "",
+    credential_id: str = "",
+    credential_name: str = "",
     provider: str,
     api_type: str,
     stage: str,
@@ -1554,6 +1776,7 @@ def make_api_usage_summary_item(
         "id": "|".join([
             user_id or "all-users",
             channel_id or "global",
+            credential_id or "all-keys",
             provider or "unknown",
             api_type or "unknown",
             stage or "unknown",
@@ -1562,6 +1785,8 @@ def make_api_usage_summary_item(
         ]),
         "userId": user_id,
         "channelId": channel_id,
+        "credentialId": credential_id,
+        "credentialName": credential_name,
         "provider": provider or "unknown",
         "apiType": api_type or "unknown",
         "stage": stage or "unknown",

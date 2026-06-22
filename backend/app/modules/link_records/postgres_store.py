@@ -21,6 +21,7 @@ from app.core.database import (
     scoped_link_record_id,
     utc_now_text,
 )
+from app.core.postgres_pool import get_postgres_connection
 
 
 def is_enabled() -> bool:
@@ -44,7 +45,7 @@ def get_pg_connection() -> Iterator[Any]:
         raise RuntimeError(
             "Link records PostgreSQL backend requires LINK_RECORDS_DATABASE_URL, POSTGRES_DATABASE_URL, or DATABASE_URL"
         )
-    with psycopg.connect(url, row_factory=dict_row) as conn:
+    with get_postgres_connection(url) as conn:
         yield conn
 
 

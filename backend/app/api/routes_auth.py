@@ -12,7 +12,7 @@ from app.core.config import (
     WORKBENCH_SESSION_COOKIE_SAMESITE,
     WORKBENCH_SESSION_COOKIE_SECURE,
 )
-from app.core.database import authenticate_user, create_user, create_user_session, revoke_user_session
+from app.modules.identity.postgres_store import authenticate_user, create_user, create_user_session, revoke_user_session
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 

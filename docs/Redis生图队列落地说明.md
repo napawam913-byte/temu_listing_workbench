@@ -16,7 +16,6 @@ VISUAL_QUEUE_POP_TIMEOUT_SECONDS=1
 VISUAL_QUEUE_MAX_RETRIES=2
 VISUAL_QUEUE_RETRY_DELAY_SECONDS=30
 VISUAL_USER_CONCURRENCY_LIMIT=5
-VISUAL_TEAM_CONCURRENCY_LIMIT=5
 ```
 
 `VISUAL_QUEUE_REDIS_ENABLED=0` 或 Redis 不可用时，系统会回退到 FastAPI `BackgroundTasks`。小规模上线建议一定打开 Redis，并单独启动 worker。
@@ -67,9 +66,7 @@ GET /api/visual/queue/summary
 返回内容包含：
 
 - 当前用户各状态任务数
-- 团队 active 任务数
 - 用户并发上限
-- 团队并发上限
 - Redis 主队列长度
 - Redis 延迟重试队列长度
 - Redis 死信队列长度

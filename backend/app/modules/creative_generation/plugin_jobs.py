@@ -3,11 +3,10 @@ from __future__ import annotations
 import base64
 import json
 import re
-import sqlite3
 import uuid
 from typing import Any
 
-from app.core.database import get_connection, utc_now_text
+from app.core.database import utc_now_text
 from app.modules.creative_generation.chatgpt_listing import (
     IMAGE_COUNT,
     build_image_plan,
@@ -15,6 +14,7 @@ from app.modules.creative_generation.chatgpt_listing import (
     build_sku_image_prompt,
 )
 from app.modules.creative_generation.safety import sanitize_marketplace_text
+from app.modules.exports.postgres_store import get_export_connection as get_connection
 from app.modules.exports.dianxiaomi_temu import normalize_english_title
 from app.modules.image_storage.aliyun_oss import ImageStorageError, mirror_export_image, upload_image_bytes
 
@@ -29,7 +29,7 @@ class CreativePluginJobError(Exception):
     pass
 
 
-def ensure_creative_jobs_schema(conn: sqlite3.Connection) -> None:
+def ensure_creative_jobs_schema(conn: Any) -> None:
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS creative_image_jobs (
@@ -68,13 +68,23 @@ def ensure_creative_jobs_schema(conn: sqlite3.Connection) -> None:
     ensure_creative_job_column(conn, "analysis_text", "analysis_text TEXT")
 
 
-def ensure_creative_job_column(conn: sqlite3.Connection, column_name: str, ddl: str) -> None:
-    columns = {row["name"] for row in conn.execute("PRAGMA table_info(creative_image_jobs)").fetchall()}
+def ensure_creative_job_column(conn: Any, column_name: str, ddl: str) -> None:
+    columns = {
+        row["column_name"]
+        for row in conn.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = ?
+            """,
+            ("creative_image_jobs",),
+        ).fetchall()
+    }
     if column_name not in columns:
         conn.execute(f"ALTER TABLE creative_image_jobs ADD COLUMN {ddl}")
 
 
-def upsert_creative_job(conn: sqlite3.Connection, job: dict[str, Any]) -> None:
+def upsert_creative_job(conn: Any, job: dict[str, Any]) -> None:
     conn.execute(
         """
         INSERT INTO creative_image_jobs (
@@ -519,7 +529,7 @@ def list_plugin_jobs(
 
 
 def list_creative_jobs(
-    conn: sqlite3.Connection,
+    conn: Any,
     *,
     provider: str,
     record_ids: list[str] | None = None,
@@ -553,7 +563,7 @@ def list_creative_jobs(
 
 
 def delete_stale_product_jobs(
-    conn: sqlite3.Connection,
+    conn: Any,
     provider: str,
     record_id: str,
     valid_image_kinds: set[str],
@@ -703,7 +713,7 @@ def apply_completed_sku_jobs_to_record(record: dict[str, Any], completed_jobs: l
     return record
 
 
-def upload_generated_result(row: sqlite3.Row, *, image_data_url: str | None, image_url: str | None) -> dict[str, str]:
+def upload_generated_result(row: Any, *, image_data_url: str | None, image_url: str | None) -> dict[str, str]:
     key_hint = f"products/{clean_key_part(row['product_id'] or row['record_id'])}/plugin/{row['image_kind']}"
     data_url = clean_text(image_data_url)
     if data_url:
@@ -790,7 +800,7 @@ def pick_sku_input_image(record: dict[str, Any], sku_entry: dict[str, Any]) -> s
     return first_non_empty(*candidates, pick_record_input_image(record))
 
 
-def creative_job_row_to_api(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+def creative_job_row_to_api(row: Any | dict[str, Any]) -> dict[str, Any]:
     return {
         "id": row["id"],
         "provider": row["provider"],

@@ -6,9 +6,13 @@ import re
 from typing import Any
 from urllib.parse import quote
 
-from app.core.database import assert_user_api_usage_allowed, get_connection, record_api_usage_safe
+from app.core.database import utc_now_text
+from app.modules.admin_config.postgres_store import assert_user_api_usage_allowed, record_api_usage_safe
+from app.modules.exports.postgres_store import get_export_connection as get_connection
+from app.modules.ai_gateway import scheduler as ai_gateway_scheduler
 from app.modules.creative_generation.chatgpt_listing import build_openai_client, get_openai_settings
 from app.modules.creative_generation.safety import sanitize_marketplace_text
+from app.modules.prompt_templates import render_prompt_template
 from app.modules.recommendation.keyword_index import ensure_recommendation_schema
 from app.modules.sourcing_1688.ai_response import contains_cjk, parse_ai_response_json
 from app.modules.sourcing_1688.search_url import build_1688_search_url
@@ -231,17 +235,24 @@ def analyze_product_for_1688(product: dict[str, Any], *, user_id: str | None = N
     if settings.api_key:
         assert_user_api_usage_allowed(user_id)
         try:
-            analysis = analyze_with_chatgpt(title=title, category=category, main_image_url=main_image_url, settings=settings)
+            analysis, usage_settings = analyze_with_gateway_fallback(
+                title=title,
+                category=category,
+                main_image_url=main_image_url,
+                settings=settings,
+            )
             record_api_usage_safe(
                 provider="openai-compatible",
                 api_type="chat",
                 stage="recommendation",
-                model=settings.text_model,
+                model=usage_settings.text_model,
                 user_id=user_id,
-                channel_id=settings.channel_id,
+                channel_id=usage_settings.channel_id,
+                credential_id=getattr(usage_settings, "credential_id", ""),
+                credential_name=getattr(usage_settings, "credential_name", ""),
                 status="success",
             )
-            save_cached_analysis(cache_key, title_hash, analysis, model=settings.text_model)
+            save_cached_analysis(cache_key, title_hash, analysis, model=usage_settings.text_model)
             return {**analysis, "cache": {"hit": False, "key": cache_key}}
         except Exception as exc:
             record_api_usage_safe(
@@ -251,6 +262,8 @@ def analyze_product_for_1688(product: dict[str, Any], *, user_id: str | None = N
                 model=settings.text_model,
                 user_id=user_id,
                 channel_id=settings.channel_id,
+                credential_id=getattr(settings, "credential_id", ""),
+                credential_name=getattr(settings, "credential_name", ""),
                 status="failed",
                 error_message=str(exc),
             )
@@ -265,6 +278,62 @@ def analyze_product_for_1688(product: dict[str, Any], *, user_id: str | None = N
     analysis = build_fallback_analysis(title, category)
     save_cached_analysis(cache_key, title_hash, analysis, model="rule-fallback")
     return {**analysis, "source": "rule-fallback", "cache": {"hit": False, "key": cache_key}}
+
+
+def analyze_with_gateway_fallback(
+    *,
+    title: str,
+    category: str,
+    main_image_url: str,
+    settings: Any,
+) -> tuple[dict[str, Any], Any]:
+    attempt_limit = ai_gateway_scheduler.resolve_attempt_limit("recommendation")
+    excluded_credential_ids: set[str] = set()
+    candidate = ai_gateway_scheduler.acquire_candidate(
+        "recommendation",
+        task_type="api",
+        excluded_credential_ids=excluded_credential_ids,
+    )
+    if not candidate:
+        return analyze_with_chatgpt(title=title, category=category, main_image_url=main_image_url, settings=settings), settings
+    last_error: BaseException | None = None
+    for attempt_index in range(attempt_limit):
+        if not candidate:
+            break
+        excluded_credential_ids.add(str(candidate.get("credentialId") or ""))
+        trial_settings = replace_settings_from_gateway_candidate(settings, candidate)
+        try:
+            result = analyze_with_chatgpt(
+                title=title,
+                category=category,
+                main_image_url=main_image_url,
+                settings=trial_settings,
+            )
+            ai_gateway_scheduler.finish_attempt(candidate, success=True)
+            return result, trial_settings
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            ai_gateway_scheduler.finish_attempt(candidate, success=False, error_message=str(exc))
+            if attempt_index < attempt_limit - 1:
+                candidate = ai_gateway_scheduler.acquire_candidate(
+                    "recommendation",
+                    task_type="api",
+                    excluded_credential_ids=excluded_credential_ids,
+                )
+    raise last_error or ValueError("API 中枢没有可用推荐渠道")
+
+
+def replace_settings_from_gateway_candidate(settings: Any, candidate: dict[str, Any]) -> Any:
+    return type(settings)(
+        api_key=str(candidate.get("apiKey") or ""),
+        base_url=str(candidate.get("baseUrl") or ""),
+        text_model=str(candidate.get("model") or getattr(settings, "text_model", "")),
+        image_model=getattr(settings, "image_model", ""),
+        image_quality=getattr(settings, "image_quality", "medium"),
+        channel_id=str(candidate.get("channelId") or ""),
+        credential_id=str(candidate.get("credentialId") or ""),
+        credential_name=str(candidate.get("credentialName") or candidate.get("credentialId") or ""),
+    )
 
 
 def build_analysis_cache_key(product: dict[str, Any], *, title: str, category: str, main_image_url: str) -> str:
@@ -332,7 +401,7 @@ def save_cached_analysis(cache_key: str, title_hash: str, analysis: dict[str, An
     }
     with get_connection() as conn:
         ensure_recommendation_schema(conn)
-        now = conn.execute("SELECT datetime('now') AS now").fetchone()["now"]
+        now = utc_now_text()
         conn.execute(
             """
             INSERT INTO product_ai_analysis_cache (
@@ -461,6 +530,23 @@ def build_fallback_analysis(title: str, category: str) -> dict[str, Any]:
     )
 
 
+def analyze_with_chatgpt(*, title: str, category: str, main_image_url: str, settings: Any) -> dict[str, Any]:
+    client = build_openai_client(settings)
+    instruction = render_prompt_template(
+        "recommendation",
+        {
+            "title": title,
+            "category": category,
+            "mainImageUrl": main_image_url,
+        },
+    )
+    response = client.chat.completions.create(
+        model=settings.text_model,
+        messages=[{"role": "system", "content": instruction}],
+    )
+    return normalize_analysis(parse_ai_response_json(response), title, category)
+
+
 def normalize_analysis(raw: dict[str, Any], title: str, category: str) -> dict[str, Any]:
     core_product_name, _ = sanitize_marketplace_text(clean_text(raw.get("core_product_name")))
     removed_noise_terms = [
@@ -570,7 +656,7 @@ def list_local_product_sources(product: dict[str, Any], keywords: list[dict[str,
                     p.category_path, p.category_level1, p.category_level2, p.price_usd,
                     p.weekly_sales, p.gmv_usd, p.review_count, p.listing_time,
                     SUM(pk.weight) AS keyword_score,
-                    GROUP_CONCAT(DISTINCT pk.keyword) AS matched_keywords
+                    STRING_AGG(DISTINCT pk.keyword, ',') AS matched_keywords
                 FROM product_keywords pk
                 JOIN products p ON p.id = pk.product_id
                 WHERE p.status != 'deleted'
@@ -581,8 +667,8 @@ def list_local_product_sources(product: dict[str, Any], keywords: list[dict[str,
                     CASE WHEN p.source_type = '1688' THEN 0 ELSE 1 END,
                     p.weekly_sales DESC,
                     p.gmv_usd DESC,
-                    datetime(p.listing_time) DESC,
-                    datetime(p.updated_at) DESC
+                    NULLIF(p.listing_time, '') DESC,
+                    NULLIF(p.updated_at, '') DESC
                 LIMIT 600
                 """,
                 [*exact_terms, *like_terms],
@@ -603,8 +689,8 @@ def list_local_product_sources(product: dict[str, Any], keywords: list[dict[str,
                     CASE WHEN source_type = '1688' THEN 0 ELSE 1 END,
                     weekly_sales DESC,
                     gmv_usd DESC,
-                    datetime(listing_time) DESC,
-                    datetime(updated_at) DESC
+                    NULLIF(listing_time, '') DESC,
+                    NULLIF(updated_at, '') DESC
                 LIMIT 800
                 """
             ).fetchall()
